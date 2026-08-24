@@ -11,7 +11,7 @@ VPN-**клиент и сервер** с обходом DPI-блокировок 
 
 Полностью userspace-реализация -- не требует kernel module, работает на любой версии ядра.
 
-**Протокол: AmneziaWG 3.0** (демон `amneziawg-go v3.0.3`, начиная с аддона 1.5.9; впервые — в 1.5.0). Поддерживаются все параметры обфускации 1.5/2.0 (`Jc/Jmin/Jmax`, `S1-S4`, `H1-H4`, `I1-I5`) плюс новые из 3.0: `HeaderProtectionKey` (шифрование заголовков пакетов общим ключом), `ContentPaddingAddition` и настраиваемые тайминги `RekeyAfterTime` / `RekeyTimeout` / `RejectAfterTime` / `KeepaliveTimeout` / `MaxHandshakeAttempts`. Параметры-диапазоны принимают как одно число, так и `lo-hi`; `PersistentKeepalive` тоже. Старые конфиги 2.0 продолжают работать без изменений. Работает на всех поддерживаемых архитектурах, включая пакет `armv7-2.6` для старых ARM32-роутеров с ядром 2.6.3x — проверено на живом RT-AC66U_B1 (ядро 2.6.36.4).
+**Протокол: AmneziaWG 3.1** (демон `amneziawg-go v3.1.20260814`, начиная с аддона 1.5.20; 3.0 — с 1.5.9, впервые — в 1.5.0). Поддерживаются все параметры обфускации 1.5/2.0 (`Jc/Jmin/Jmax`, `S1-S4`, `H1-H4`, `I1-I5`), параметры 3.0: `HeaderProtectionKey` (шифрование заголовков пакетов общим ключом), `ContentPaddingAddition` и настраиваемые тайминги `RekeyAfterTime` / `RekeyTimeout` / `RejectAfterTime` / `KeepaliveTimeout` / `MaxHandshakeAttempts`, — и новые из 3.1: `RandomTrailers` (случайный «хвост» у пакетов рукопожатия — маскировка размера; симметричный, должен совпадать на обеих сторонах) и `DisableCookies` (не отправлять cookie-ответы — служебное сообщение, заметное для DPI). Параметры-диапазоны принимают как одно число, так и `lo-hi`; `PersistentKeepalive` тоже. Старые конфиги 2.0/3.0 продолжают работать без изменений. Работает на всех поддерживаемых архитектурах, включая пакет `armv7-2.6` для старых ARM32-роутеров с ядром 2.6.3x — проверено на живом RT-AC66U_B1 (ядро 2.6.36.4).
 
 > **О проекте:** изначально форк [r0otx/asuswrt-merlin-amneziawg](https://github.com/r0otx/asuswrt-merlin-amneziawg), но с момента ответвления проект очень сильно переработан и развивается самостоятельно. Спасибо r0otx за прекрасную основу.
 
@@ -64,7 +64,7 @@ VPN-**клиент и сервер** с обходом DPI-блокировок 
 
 ## Возможности
 
-- **Протокол AmneziaWG 3.0** -- WireGuard с обфускацией DPI: Jc, Jmin, Jmax, S1-S4, H1-H4, длинные I1-I5 (AWG 2.x) + параметры 3.0 — header protection (шифрование заголовков общим ключом), ContentPaddingAddition и настраиваемые тайминги
+- **Протокол AmneziaWG 3.1** -- WireGuard с обфускацией DPI: Jc, Jmin, Jmax, S1-S4, H1-H4, длинные I1-I5 (AWG 2.x) + параметры 3.0 — header protection (шифрование заголовков общим ключом), ContentPaddingAddition и настраиваемые тайминги + параметры 3.1 — RandomTrailers (маскировка размера рукопожатий) и DisableCookies
 - **Userspace-демон** -- на базе [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go), без kernel module; работает даже на старых ARM32-роутерах с ядром 2.6.x (RT-AC68U) — для них собирается отдельный legacy-демон
 - **Веб-интерфейс** -- страница-аддон в стиле ROG (VPN > AmneziaWG), **двуязычный RU/EN** (язык подхватывается из прошивки), плюс **виджет статуса в шапке** всех страниц роутера с быстрым запуском/остановкой туннеля
 - **Импорт конфига** -- загрузка `.conf` файла из клиента Amnezia VPN
@@ -237,7 +237,7 @@ youtube,google,discord,netflix,spotify,instagram
 
 ### Режим сервера — входящие подключения (v1.3.0)
 
-Роутер может работать не только клиентом, но и **AmneziaWG-сервером**: устройство (телефон, ноутбук, второй роутер) из любой точки подключается к дому — получает доступ к домашней сети (NAS, камеры, RDP) и, по желанию, выходит в интернет через ваш дом. Всё с обфускацией AmneziaWG, поэтому проходит там, где обычный WireGuard блокируется DPI. Целевые клиенты — официальные приложения **AmneziaWG** (Android/iOS/Windows/macOS). Параметры 3.0 (включая header protection) попадают в конфиги пиров и QR — для них нужен клиент с поддержкой AmneziaWG 3.0.
+Роутер может работать не только клиентом, но и **AmneziaWG-сервером**: устройство (телефон, ноутбук, второй роутер) из любой точки подключается к дому — получает доступ к домашней сети (NAS, камеры, RDP) и, по желанию, выходит в интернет через ваш дом. Всё с обфускацией AmneziaWG, поэтому проходит там, где обычный WireGuard блокируется DPI. Целевые клиенты — официальные приложения **AmneziaWG** (Android/iOS/Windows/macOS). Параметры 3.0 (включая header protection) попадают в конфиги пиров и QR — для них нужен клиент с поддержкой AmneziaWG 3.0; включённый `RandomTrailers` (3.1) тоже записывается в конфиги пиров и требует клиента с AmneziaWG 3.1+.
 
 Отдельная страница **VPN > AmneziaWG Server** (клиентская часть не затрагивается, обе роли можно держать включёнными одновременно):
 
@@ -270,13 +270,14 @@ CLI: `/opt/etc/init.d/S99amneziawg server {start|stop|status|restart|diag}`. А�
 
 > **Демон собирается из нашего форка [`william-aqn/amneziawg-go`](https://github.com/william-aqn/amneziawg-go), а не из upstream.** Причина — два фикса, критичных для роутеров, которые ещё не приняты в upstream (пока они висят в PR, сборка идёт из форка):
 > - **[PR #152](https://github.com/amnezia-vpn/amneziawg-go/pull/152)** — ограниченный буферный пул (`PreallocatedBuffersPerPool`) с настройкой через переменную окружения `WG_PREALLOCATED_BUFFERS_PER_POOL`: лекарство от `runtime: out of memory` под нагрузкой. Дефолт сборки — 1024, и лимит намеренно действует на **всех** роутерах: это flow control — без него медленное плечо отдачи раздувает кучу демона до OOM даже на боксах с 2GB RAM (полевой случай 1.3.13→1.3.14). Переменная оставлена для ручных экспериментов;
-> - **[PR #153](https://github.com/amnezia-vpn/amneziawg-go/pull/153)** — fallback `sendmmsg`/`recvmmsg` → пакетный `sendmsg`/`recvmsg` при `ENOSYS`: без него на ядре Linux < 3.0 (RT-AC68U / 2.6.36) демон не может отправить ни одного пакета и туннель не передаёт трафик;
-> - **[PR #161](https://github.com/amnezia-vpn/amneziawg-go/pull/161)** — классификация keepalive с паддингом S4: регрессия AmneziaWG 3.0 против конфигов 1.5/2.0 — при `S4 > 0` каждый keepalive считался данными и переустанавливал соединение на простаивающем туннеле примерно раз в 15 секунд.
+> - **[PR #153](https://github.com/amnezia-vpn/amneziawg-go/pull/153)** — fallback `sendmmsg`/`recvmmsg` → пакетный `sendmsg`/`recvmsg` при `ENOSYS`: без него на ядре Linux < 3.0 (RT-AC68U / 2.6.36) демон не может отправить ни одного пакета и туннель не передаёт трафик.
 >
-> Ветка форка **`router-build-v3`** = тег `v3.0.3` (AmneziaWG 3.0) + четыре патча отдельными коммитами; из неё собираются **все** пакеты, но у legacy-пакета `armv7-2.6` с 1.5.9 **собственные пины** (`AWG_GO_*_LEGACY`), чтобы понижение Go жило только в его шаге сборки. Ветка `router-build` (тег `v0.2.19`) — припаркованный фолбэк на AmneziaWG 2.0. **Когда PR примут в upstream**, сборка вернётся на `amnezia-vpn/amneziawg-go` — правятся две строки (`AWG_GO_REPO`/`AWG_GO_REF`) в `.github/workflows/release.yml`.
+> Третий патч форка — классификация keepalive с паддингом S4 (наш [PR #161](https://github.com/amnezia-vpn/amneziawg-go/pull/161): при `S4 > 0` каждый keepalive считался данными и переустанавливал соединение на простаивающем туннеле раз в ~15 секунд) — с версии `v3.0.20260805` **исправлен самим upstream** (флаг `isKeepalive`), поэтому ветка 3.1 наш вариант больше не несёт.
+>
+> Ветка форка **`router-build-v31`** = тег `v3.1.20260814` (AmneziaWG 3.1; именно `.14` — в `.12`/`.13` есть опечатка в `SendHandshakeCookie`, дающая панику при включённом `RandomTrailers`) + три патча отдельными коммитами; из неё собираются **все** пакеты, но у legacy-пакета `armv7-2.6` с 1.5.9 **собственные пины** (`AWG_GO_*_LEGACY`), чтобы понижение Go жило только в его шаге сборки. Ветки `router-build-v3` (тег `v3.0.3`, AmneziaWG 3.0) и `router-build` (тег `v0.2.19`, AmneziaWG 2.0) — припаркованные фолбэки. **Когда PR примут в upstream**, сборка вернётся на `amnezia-vpn/amneziawg-go` — правятся две строки (`AWG_GO_REPO`/`AWG_GO_REF`) в `.github/workflows/release.yml`.
 
 ```shell
-git clone --depth 1 --branch router-build-v3 https://github.com/william-aqn/amneziawg-go.git
+git clone --depth 1 --branch router-build-v31 https://github.com/william-aqn/amneziawg-go.git
 cd amneziawg-go
 
 # ARM64 (aarch64-3.10) — GT-AX11000, RT-AX86U, RT-AX88U
@@ -295,7 +296,7 @@ GOTOOLCHAIN=go1.23.12 CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=5 \
   go build -ldflags="-s -w" -o ../output/amneziawg-go-arm5
 ```
 
-Канонические команды (включая патч версии, чтобы `--version` показывал `v3.0.3-awg3-legacy26-poolcfg-smfix`, и жёсткие проверки наличия обоих патчей) — в `.github/workflows/release.yml`, шаг «Build amneziawg-go-arm5 (legacy Go 1.23…)».
+Канонические команды (включая патч версии, чтобы `--version` показывал `v3.1.20260814-awg3-awg31-legacy26-poolcfg-smfix`, и жёсткие проверки наличия всех патчей) — в `.github/workflows/release.yml`, шаг «Build amneziawg-go-arm5 (legacy Go 1.23…)».
 
 ### Сборка awg CLI (статический musl)
 
@@ -304,7 +305,7 @@ GOTOOLCHAIN=go1.23.12 CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=5 \
 ```shell
 docker run --rm --platform linux/arm64 -v "$PWD/output:/out" alpine:3.19 sh -c \
   'apk add --no-cache build-base linux-headers git && \
-   git clone --depth 1 --branch v3.0.20260730 https://github.com/amnezia-vpn/amneziawg-tools.git /t && \
+   git clone --depth 1 --branch v3.1.20260812 https://github.com/amnezia-vpn/amneziawg-tools.git /t && \
    cd /t/src && make LDFLAGS=-static PLATFORM_CFLAGS= && cp awg /out/awg'
 ```
 
@@ -420,7 +421,7 @@ opkg remove amneziawg
 
 **В: Поддерживается ли ARM32 (RT-AC68U)?**
 
-О: Да, есть отдельный .ipk для ARM32 (`armv7-2.6`). Начиная с **1.2.32** демон в этом пакете собирается специальным legacy-тулчейном (Go 1.23) — обычные сборки Go ≥ 1.24 не поддерживают ядро 2.6.36 этих роутеров и молча падали с `ERROR: amneziawg-go failed to create interface`. Проверить, что стоит нужная сборка: `/opt/amneziawg/amneziawg-go --version` должен показывать `v3.0.3-awg3-legacy26-poolcfg-smfix (…)` (демон собран из [форка](https://github.com/william-aqn/amneziawg-go) с двумя фиксами — см. раздел «Сборка amneziawg-go»; суффикс `-smfix` = фикс `sendmmsg`, без которого туннель на 2.6.36 не передаёт трафик).
+О: Да, есть отдельный .ipk для ARM32 (`armv7-2.6`). Начиная с **1.2.32** демон в этом пакете собирается специальным legacy-тулчейном (Go 1.23) — обычные сборки Go ≥ 1.24 не поддерживают ядро 2.6.36 этих роутеров и молча падали с `ERROR: amneziawg-go failed to create interface`. Проверить, что стоит нужная сборка: `/opt/amneziawg/amneziawg-go --version` должен показывать `v3.1.20260814-awg3-awg31-legacy26-poolcfg-smfix (…)` (демон собран из [форка](https://github.com/william-aqn/amneziawg-go) с роутерными фиксами — см. раздел «Сборка amneziawg-go»; суффикс `-smfix` = фикс `sendmmsg`, без которого туннель на 2.6.36 не передаёт трафик).
 
 **В: Туннель сам останавливается через минуту-две после запуска (или «2 минуты работает → дроп → переподключение»)?**
 

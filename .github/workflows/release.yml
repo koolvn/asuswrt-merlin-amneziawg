@@ -31,7 +31,11 @@ env:
   #   * `awg show <if> dump` gains 7 columns on the INTERFACE line (before fwmark) and prints
   #     ranges where it used to print scalars. Every addon consumer skips that line (`tail -n +2`,
   #     `awk NR==2`), so no parser breaks — do not "simplify" those skips away.
-  AWG_TOOLS_TAG: v3.0.20260730
+  # v3.1.20260812 adds the two AWG 3.1 keys (RandomTrailers / DisableCookies, both parse_bool
+  # "on"/"off") to config.c + CLI + show/showconf, and appends 2 more columns (on/off) to the
+  # `awg show <if> dump` INTERFACE line — still before fwmark, and our consumers still skip
+  # that line, so the 3.0 note above keeps holding.
+  AWG_TOOLS_TAG: v3.1.20260812
   # amneziawg-go (daemon) — built from OUR FORK, not upstream, until upstream merges the
   # patches the router build needs (all carried as real commits on the fork branch below):
   #   1. bounded buffer pool (PreallocatedBuffersPerPool, router default 1024) — the fix for
@@ -44,20 +48,22 @@ env:
   #      minutes (a slow UDP-TX leg + line-rate RX balloons the heap — the cap is FLOW CONTROL,
   #      not just low-RAM armor; reverted 1.3.14). The env stays honored for manual experiments;
   #      the compiled default stays the router-safe 1024.
-  #   4. S4 keepalive classification (upstream PR #161) — an AmneziaWG 3.0 regression against
-  #      1.5/2.0 configs: with S4 > 0 every keepalive counted as data and re-handshaked an idle
-  #      tunnel every ~15 s. See the assert (and the measurements) in the build step below.
-  # The branch is based on the v3.0.x tag (AWG_GO_TAG) — AmneziaWG 3.0, keeping the 1.5/2.0
-  # params (I1-I5, S3/S4) and adding the 3.0 ones. Reproducible, not floating master.
+  # NB the fork used to carry a 4th patch — the S4 keepalive re-classification (our PR #161):
+  # with S4 > 0 every keepalive counted as data and re-handshaked an idle tunnel every ~15 s.
+  # Upstream fixed that themselves in v3.0.20260805 ("fix: keepalives are ignored") with a
+  # different, wider shape (an explicit isKeepalive flag on the outbound element + a receive-side
+  # check), so router-build-v31 DROPS our patch instead of carrying a conflicting duplicate.
+  # The assert below now pins the upstream shape.
   #
-  # BACK ON AmneziaWG 3.0 as of 1.5.9 (1.5.7 had parked the daemon on 2.0 out of caution, with no
-  # field bug behind it). What actually changed since: the v3 `awg` CLI stopped being an unmerged
-  # branch (see AWG_TOOLS_TAG above) and upstream cut v3.0.2/v3.0.3. Those two daemon releases are
-  # functionally identical to v3.0.1 — the whole diff is Dockerfile + README + one error string in
-  # device/uapi.go — so the daemon shipped here behaves exactly like the 1.5.6 one.
-  AWG_GO_TAG: v3.0.3
+  # The branch is based on the v3.1.x tag (AWG_GO_TAG) — AmneziaWG 3.1: the 3.0 set plus
+  # RandomTrailers (random bytes appended to handshake packets; SYMMETRIC — a receiver only
+  # accepts trailered handshakes when its own flag is on) and DisableCookies (never send cookie
+  # replies; local-only). v3.1.20260814 is the one to pin: .12 introduced the features, .14 fixes
+  # a slice-cap typo in SendHandshakeCookie that runtime-panics when RandomTrailers is on and a
+  # cookie reply fires. Reproducible, not floating master.
+  AWG_GO_TAG: v3.1.20260814
   AWG_GO_REPO: https://github.com/william-aqn/amneziawg-go.git
-  AWG_GO_REF: router-build-v3
+  AWG_GO_REF: router-build-v31
   # armv7-2.6 (kernel 2.6.3x — RT-AC68U / RT-AC66U_B1 class) is pinned SEPARATELY since 1.5.9.
   # Go >= 1.24 supports only Linux >= 3.2, so that package is built by its own step with a pinned
   # Go 1.23 toolchain plus dependency downgrades and an Outline SDK drop. Giving it its own
@@ -68,10 +74,12 @@ env:
   #       failing the whole release.
   # Both tracks point at the same branch today: AmneziaWG 3.0 was verified on a real 2.6.36 kernel
   # (RT-AC66U_B1, ARMv7 with no VFP — full 3.0 handshake with header protection, no sendmmsg
-  # ENOSYS), so there is no reason to keep that package a protocol version behind.
-  AWG_GO_TAG_LEGACY: v3.0.3
+  # ENOSYS), so there is no reason to keep that package a protocol version behind. v3.1 keeps
+  # go.mod untouched, and the full legacy recipe (Outline drop + x/* downgrades + go1.23.12
+  # GOARM=5 build) was re-verified locally against router-build-v31 before moving this pin.
+  AWG_GO_TAG_LEGACY: v3.1.20260814
   AWG_GO_REPO_LEGACY: https://github.com/william-aqn/amneziawg-go.git
-  AWG_GO_REF_LEGACY: router-build-v3
+  AWG_GO_REF_LEGACY: router-build-v31
 
 jobs:
   build:
@@ -102,13 +110,16 @@ jobs:
           # a glance whether the running daemon carries them, in particular whether it honors the
           # pool env the addon launcher sets on high-RAM boxes (pre-1.3.13 daemons say -pool1024
           # here and ignore that env).
-          # The `-awg3-` marker is LOAD-BEARING, not cosmetic: awg3_supported() in
-          # addon/amneziawg.sh gates the AmneziaWG 3.0 params on that exact substring. Stamping it
-          # onto a 2.0 daemon would open the gate, the addon would emit 3.0 keys, `awg setconf`
-          # would reject them and abort the WHOLE file, and the tunnel would not come up at all.
-          # So the marker moves in the SAME commit as AWG_GO_TAG/AWG_GO_REF — never on its own,
-          # in either direction.
-          sed -i "s|^const Version = .*|const Version = \"$AWG_GO_TAG-awg3-poolcfg-smfix ($AWG_GO_COMMIT)\"|" amneziawg-go/version.go
+          # The `-awg3-` AND `-awg31-` markers are LOAD-BEARING, not cosmetic: awg3_supported()
+          # in addon/amneziawg.sh gates the AmneziaWG 3.0 params on the exact `-awg3-` substring,
+          # and awg31_supported() gates the 3.1 params (RandomTrailers/DisableCookies) on
+          # `-awg31-`. NB `*-awg3-*` does NOT match "-awg31-" (glob needs the closing dash), which
+          # is why BOTH markers are stamped: an already-installed script keeps its 3.0 verdict
+          # through the upgrade window. Stamping a marker onto a daemon that lacks the params
+          # would open the gate, the addon would emit the keys, `awg setconf` would reject them
+          # and abort the WHOLE file, and the tunnel would not come up at all. So the markers move
+          # in the SAME commit as AWG_GO_TAG/AWG_GO_REF — never on their own, in either direction.
+          sed -i "s|^const Version = .*|const Version = \"$AWG_GO_TAG-awg3-awg31-poolcfg-smfix ($AWG_GO_COMMIT)\"|" amneziawg-go/version.go
           grep '^const Version' amneziawg-go/version.go || true
           # The functional patches now ride in as COMMITS on the fork branch (see the env
           # block) rather than seds — but still HARD-assert each is present, so a bad rebase or a
@@ -135,17 +146,19 @@ jobs:
           #      batchUnsupported flag that falls back to WriteMsgUDP/ReadMsgUDP. Proven on a real
           #      RT-AC68U: handshake completes, traffic flows both ways.
           grep -q 'batchUnsupported' amneziawg-go/conn/bind_std.go
-          #   4. S4 KEEPALIVE CLASSIFICATION — an AWG 3.0 regression against 1.5/2.0 configs.
-          #      v3 moved the S4 transport padding into RoutineEncryption (it seals from
-          #      elem.buffer[:elem.padding+MessageTransportHeaderSize]), so a keepalive measures
-          #      elem.padding+MessageKeepaliveSize; RoutineSequentialSender still compared it to
-          #      the bare constant. With S4 > 0 EVERY keepalive counted as data, armed
-          #      newHandshake (~15 s) and re-handshaked an idle tunnel forever. Measured, idle,
-          #      PersistentKeepalive=5s, 75 s window: v0.2.19 = 1 handshake at any S4; v3.0.1 =
-          #      1 at S4=0 but 5 at S4=30; with the fix, 1 again. Also reproduced with a v3
-          #      client against an unmodified v0.2.19 peer — it breaks EXISTING provider configs
-          #      on upgrade, since S4 is a plain AWG 2.0 param the addon has always passed through.
-          grep -q 'int(elem.padding)+MessageKeepaliveSize' amneziawg-go/device/send.go
+          #   4. S4 KEEPALIVE CLASSIFICATION — an AWG 3.0 regression against 1.5/2.0 configs:
+          #      with S4 > 0 every keepalive counted as data, armed newHandshake (~15 s) and
+          #      re-handshaked an idle tunnel forever (measured: 5 handshakes in 75 s at S4=30).
+          #      Carried as OUR patch on router-build-v3 (PR #161); upstream fixed it themselves
+          #      in v3.0.20260805 with an explicit isKeepalive flag on the outbound element (plus
+          #      a receive-side counterpart), so router-build-v31 relies on the upstream fix.
+          #      Assert the upstream shape so a rebase onto a pre-fix base cannot ship silently:
+          grep -q 'isKeepalive' amneziawg-go/device/send.go
+          #   5. AWG 3.1 BASE — the -awg31- marker stamped above opens the addon's 3.1 gate
+          #      (RandomTrailers/DisableCookies). Stamped onto a 3.0-only daemon those keys are
+          #      EINVAL and the tunnel never starts, so prove the base really carries them:
+          grep -q 'random_trailers' amneziawg-go/device/uapi.go
+          grep -q 'disable_cookies' amneziawg-go/device/uapi.go
           mkdir -p "$GITHUB_WORKSPACE/output"
           cd amneziawg-go
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64       go build -trimpath -ldflags="-s -w" -o "$GITHUB_WORKSPACE/output/amneziawg-go"
@@ -178,10 +191,10 @@ jobs:
           cd amneziawg-go-legacy
           AWG_GO_COMMIT=$(git rev-parse --short HEAD)
           echo "amneziawg-go (legacy): $AWG_GO_REPO_LEGACY ref $AWG_GO_REF_LEGACY (based on $AWG_GO_TAG_LEGACY) commit: $AWG_GO_COMMIT"
-          # Carries the -awg3- marker like every other arch (see the marker note in the modern
-          # step): AmneziaWG 3.0 is verified working on these kernels, so there is no reason to
-          # hold the capability gate closed here.
-          sed -i "s|^const Version = .*|const Version = \"$AWG_GO_TAG_LEGACY-awg3-legacy26-poolcfg-smfix ($AWG_GO_COMMIT)\"|" version.go
+          # Carries the -awg3-/-awg31- markers like every other arch (see the marker note in the
+          # modern step): AmneziaWG 3.0 is verified working on these kernels, so there is no
+          # reason to hold the capability gates closed here.
+          sed -i "s|^const Version = .*|const Version = \"$AWG_GO_TAG_LEGACY-awg3-awg31-legacy26-poolcfg-smfix ($AWG_GO_COMMIT)\"|" version.go
           grep '^const Version' version.go
           # Same hard asserts as the modern step — this clone is independent, so it needs its own.
           # The 2.6.x fleet (RT-AC68U, 256MB!) needs the pool cap even more than 512MB boxes
@@ -191,7 +204,10 @@ jobs:
           grep -q 'var PreallocatedBuffersPerPool uint32 = 1024' device/queueconstants_default.go
           grep -q 'WG_PREALLOCATED_BUFFERS_PER_POOL' main.go
           grep -q 'batchUnsupported' conn/bind_std.go
-          grep -q 'int(elem.padding)+MessageKeepaliveSize' device/send.go
+          # S4-keepalive fix is upstream's own since v3.0.20260805 (isKeepalive flag) — see the
+          # modern step; and the -awg31- marker stamped above demands the real 3.1 base:
+          grep -q 'isKeepalive' device/send.go
+          grep -q 'random_trailers' device/uapi.go
           # AWG 3.0 moved the Outline SDK to golang.getoutline.org/sdk, which declares `go >= 1.25`
           # and is a DIRECT require — Go 1.23 refuses to load the module graph at all, before
           # compiling anything, even though the daemon never links it (only ./outline/*.go import

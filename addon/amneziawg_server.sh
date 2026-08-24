@@ -298,6 +298,24 @@ srv_generate_config(){
         fi
     fi
 
+    # --- AmneziaWG 3.1 device params (validator + gate from amneziawg.sh, lib mode) ------
+    # RandomTrailers is SYMMETRIC: with it on, the server only ACCEPTS trailered handshakes
+    # and always SENDS trailered ones — so every peer must carry `RandomTrailers = on` too
+    # (the page writes it into each generated peer config/QR) and needs an AmneziaWG 3.1+
+    # client app. DisableCookies is local: the server just never sends cookie replies.
+    local rt dc awg31=0
+    rt=$(get_setting awgs_rt)
+    dc=$(get_setting awgs_dc)
+    [ -n "$rt" ] && { validate_onoff "$rt" || { log_msg "ERROR: Invalid RandomTrailers: $rt (expected \"on\" or \"off\")"; return 1; }; }
+    [ -n "$dc" ] && { validate_onoff "$dc" || { log_msg "ERROR: Invalid DisableCookies: $dc (expected \"on\" or \"off\")"; return 1; }; }
+    if [ -n "$rt$dc" ]; then
+        if awg31_supported; then
+            awg31=1
+        else
+            log_msg "WARNING: AmneziaWG 3.1 parameters (RandomTrailers/DisableCookies) are set but this build does not support them — NOT applied"
+        fi
+    fi
+
     {
         echo "[Interface]"
         echo "PrivateKey = $privkey"
@@ -326,6 +344,10 @@ srv_generate_config(){
             [ -n "$rjt" ] && echo "RejectAfterTime = $rjt"
             [ -n "$kat" ] && echo "KeepaliveTimeout = $kat"
             [ -n "$mha" ] && echo "MaxHandshakeAttempts = $mha"
+        fi
+        if [ "$awg31" = "1" ]; then
+            [ -n "$rt" ] && echo "RandomTrailers = $rt"
+            [ -n "$dc" ] && echo "DisableCookies = $dc"
         fi
     } > "$CONF"
 
@@ -787,9 +809,14 @@ do_srv_boot_start(){
 # clear? `awg show` prints them lowercase and indented ("  header protection key: …", "  i1: …").
 # Only meaningful while the interface exists; a non-running one simply produces no output.
 # NB matches the LABELS, so it is independent of whether the CLI can round-trip them via showconf.
+# The 3.1 booleans are matched on ": on" ONLY — a v3.1 daemon reports random_trailers/
+# disable_cookies UNCONDITIONALLY over UAPI (0 or 1, no "unset" state), so a v3.1 CLI prints
+# "random trailers: off" on every plain interface; matching the bare label would flag every
+# apply as "has advanced params" and permanently bury the syncconf path. ": off" IS the
+# device's default state — there is nothing for a restart to clear.
 srv_live_has_advanced_params(){
     "$AWG_BIN" show "$IFACE" 2>/dev/null | grep -qiE \
-        '^[[:space:]]*(i[1-5]|header protection key|content padding addition|rekey after time|rekey timeout|reject after time|keepalive timeout|max handshake attempts):'
+        '^[[:space:]]*((i[1-5]|header protection key|content padding addition|rekey after time|rekey timeout|reject after time|keepalive timeout|max handshake attempts):|(random trailers|disable cookies):[[:space:]]*on)'
 }
 
 # Apply saved settings to a RUNNING server without dropping every peer when possible:
@@ -836,7 +863,7 @@ do_srv_apply(){
     # not clear them either — only tearing the interface down and recreating it does, i.e. a real
     # restart. So the server kept demanding header protection while the page said it was off, and
     # freshly generated peer configs (correctly without the key) could no longer connect.
-    if grep -qE '^(I[1-5]|HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts) ' "$CONF" 2>/dev/null \
+    if grep -qE '^(I[1-5]|HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts|RandomTrailers|DisableCookies) ' "$CONF" 2>/dev/null \
        || srv_live_has_advanced_params; then
         log_msg "Server config or live interface has I1-I5 / AmneziaWG 3.0 params — applying via restart (syncconf can neither diff nor clear those)"
         release_lock
@@ -1010,7 +1037,7 @@ srv_update_status(){
 
     rm -f "${STATUS_FILE}.tmp" "${STATUS_FILE}".[0-9]* 2>/dev/null
     cat > "${STATUS_FILE}.$$" << STATUSEOF
-{"running":${running},"starting":${starting},"stopping":${stopping},"version":"${AWG_VERSION}","lang":"${pref_lang}","port":"${port}","subnet":"${subnet}","router_ip":"${router_ip}","public_key":"${pubkey}","endpoint_hint":"${ep_hint}","wan_private":$([ "$wan_priv" = "1" ] && echo true || echo false),"port_conflict":$([ "$port_conf" = "1" ] && echo true || echo false),"nat_lan":${nat_lan},"autostart":${autostart},"awg3":$(awg3_supported && echo true || echo false),"client_running":${client_running},"xray_capture":${xray_capture},"xray_ctl":${xray_ctl},"xray_peers_uncovered":${xray_uncov},"peers":${peers_json},"log":"${log_text}"}
+{"running":${running},"starting":${starting},"stopping":${stopping},"version":"${AWG_VERSION}","lang":"${pref_lang}","port":"${port}","subnet":"${subnet}","router_ip":"${router_ip}","public_key":"${pubkey}","endpoint_hint":"${ep_hint}","wan_private":$([ "$wan_priv" = "1" ] && echo true || echo false),"port_conflict":$([ "$port_conf" = "1" ] && echo true || echo false),"nat_lan":${nat_lan},"autostart":${autostart},"awg3":$(awg3_supported && echo true || echo false),"awg31":$(awg31_supported && echo true || echo false),"client_running":${client_running},"xray_capture":${xray_capture},"xray_ctl":${xray_ctl},"xray_peers_uncovered":${xray_uncov},"peers":${peers_json},"log":"${log_text}"}
 STATUSEOF
     mv "${STATUS_FILE}.$$" "$STATUS_FILE" 2>/dev/null
 }

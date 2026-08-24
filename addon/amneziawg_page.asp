@@ -719,6 +719,10 @@ en: {
     HINT_AWG3_RJT: "A session is dropped after this. Default 180. Below RekeyAfterTime the tunnel dies before it can rekey.",
     HINT_AWG3_KAT: "Passive keepalive delay. Default 10 — this is NOT Persistent Keepalive (25).",
     HINT_AWG3_MHA: "Handshake retries before giving up. Default 18.",
+    AWG31_UNSUPPORTED: "AmneziaWG 3.1 parameters (RandomTrailers / DisableCookies) are not supported by the installed binaries — those two fields are disabled.",
+    OPT_AWG31_UNSET: "— (default: off)",
+    HINT_AWG31_RT: "Random-length tail on handshake packets (size obfuscation). SYMMETRIC: a peer without it drops OUR trailered handshakes — set only what the provider's config says. Needs AmneziaWG 3.1+ on both sides.",
+    HINT_AWG31_DC: "Never send WireGuard cookie replies (a load-protection message DPI can fingerprint). Affects this side only — safe with any peer.",
     UNIT_BYTES: "bytes",
     UNIT_SEC: "sec",
     TBL_ROUTING_POLICY: "Routing policy",
@@ -1145,6 +1149,10 @@ ru: {
     HINT_AWG3_RJT: "После этого времени сессия отбрасывается. По умолчанию 180. Меньше RekeyAfterTime — туннель умрёт, не успев перезаключиться.",
     HINT_AWG3_KAT: "Задержка пассивного keepalive. По умолчанию 10 — это НЕ Persistent Keepalive (25).",
     HINT_AWG3_MHA: "Сколько раз повторять хендшейк перед сдачей. По умолчанию 18.",
+    AWG31_UNSUPPORTED: "Параметры AmneziaWG 3.1 (RandomTrailers / DisableCookies) не поддерживаются установленными бинарниками — эти два поля отключены.",
+    OPT_AWG31_UNSET: "— (по умолчанию off)",
+    HINT_AWG31_RT: "Случайный «хвост» у пакетов рукопожатия (маскировка размера). Симметричный: пир без него отбрасывает НАШИ рукопожатия с хвостом — ставьте только то, что указано в конфиге провайдера. Нужен AmneziaWG 3.1+ с обеих сторон.",
+    HINT_AWG31_DC: "Не отправлять cookie-ответы WireGuard (служебное сообщение защиты от перегрузки, заметное для DPI). Действует только на этой стороне — совместимо с любым пиром.",
     UNIT_BYTES: "байт",
     UNIT_SEC: "сек",
     TBL_ROUTING_POLICY: "Политика маршрутизации",
@@ -1988,9 +1996,14 @@ var AWG_PF_FIELDS = ['iface_p1','address','listenport','mtu','dns',
                      // AmneziaWG 3.0 device params. Short suffixes keep the per-slot
                      // custom_settings key names (awg_pf5_rjt) well inside the length the
                      // firmware's settings store is happy with.
-                     'hpk','cpa','rat','rto','rjt','kat','mha'];
+                     'hpk','cpa','rat','rto','rjt','kat','mha',
+                     // AmneziaWG 3.1: rt = RandomTrailers, dc = DisableCookies ('' | 'on' | 'off').
+                     'rt','dc'];
 // AWG 3.0 fields, in the order the daemon documents them — DOM id is 'awg_' + suffix.
 var AWG3_FIELDS = ['hpk','cpa','rat','rto','rjt','kat','mha'];
+// AWG 3.1 fields — gated separately (status.awg31): a 3.0-capable pair must keep the seven
+// fields above usable while these two stay disabled.
+var AWG31_FIELDS = ['rt','dc'];
 
 // amneziawg-tools compares config keys with strncasecmp(), so a hand-written or
 // provider-generated .conf may spell them any way (`privatekey`, `ENDPOINT`, …) and awg
@@ -2002,6 +2015,7 @@ var AWG_CONF_KEY_CANON = (function(){
                 'I1','I2','I3','I4','I5',
                 'HeaderProtectionKey','ContentPaddingAddition','RekeyAfterTime',
                 'RekeyTimeout','RejectAfterTime','KeepaliveTimeout','MaxHandshakeAttempts',
+                'RandomTrailers','DisableCookies',
                 'PublicKey','PresharedKey','Endpoint','AllowedIPs','PersistentKeepalive'];
     var m = {};
     for(var i = 0; i < keys.length; i++) m[keys[i].toLowerCase()] = keys[i];
@@ -4037,6 +4051,7 @@ function updateStatusUI(s){
         recomputeUpdate();
     }
     applyAwg3Capability(s.awg3);
+    applyAwg31Capability(s.awg31);
     var badge = document.getElementById('awg_badge');
     var info = document.getElementById('awg_info');
     var peers = document.getElementById('awg_peers');
@@ -4473,6 +4488,30 @@ function applyAwg3Capability(cap){
     }
 }
 
+// The AmneziaWG 3.1 pair (status.awg31) — same three-state contract as applyAwg3Capability,
+// its own gate: a 3.0-capable build must keep the seven 3.0 fields editable while these two
+// go disabled.
+function applyAwg31Capability(cap){
+    var known = (cap === true || cap === false);
+    var ok = (cap !== false);
+    var note = document.getElementById('awg31_unsupported');
+    if(note) note.style.display = (known && !ok) ? '' : 'none';
+    for(var i = 0; i < AWG31_FIELDS.length; i++){
+        var el = document.getElementById('awg_' + AWG31_FIELDS[i]);
+        if(!el) continue;
+        el.disabled = !ok;
+        el.style.opacity = ok ? '' : '0.5';
+    }
+}
+
+// Canonical "on"/"off" for the AWG 3.1 booleans; anything unrecognised -> '' (unset).
+function awgNormOnOff(v){
+    v = String(v == null ? '' : v).trim().toLowerCase();
+    if(v === 'on' || v === 'true' || v === '1' || v === 'yes') return 'on';
+    if(v === 'off' || v === 'false' || v === '0' || v === 'no') return 'off';
+    return '';
+}
+
 function parseConfig(text, fileName){
     if(!text) return;
 
@@ -4490,6 +4529,7 @@ function parseConfig(text, fileName){
         'awg_h1', 'awg_h2', 'awg_h3', 'awg_h4',
         'awg_i1', 'awg_i2', 'awg_i3', 'awg_i4', 'awg_i5',
         'awg_hpk', 'awg_cpa', 'awg_rat', 'awg_rto', 'awg_rjt', 'awg_kat', 'awg_mha',
+        'awg_rt', 'awg_dc',
         'awg_peer_p1', 'awg_peer_p2', 'awg_peer_endpoint',
         'awg_peer_allowedips', 'awg_peer_keepalive'
     ];
@@ -4543,6 +4583,12 @@ function parseConfig(text, fileName){
                 case 'RejectAfterTime':        setVal('awg_rjt', val); break;
                 case 'KeepaliveTimeout':       setVal('awg_kat', val); break;
                 case 'MaxHandshakeAttempts':   setVal('awg_mha', val); break;
+                // AmneziaWG 3.1 booleans. The backend emits the stored value verbatim and
+                // amneziawg-tools' parse_bool takes only "on"/"off"/digits, so normalise the
+                // provider's spelling here; an unrecognised value stays unset rather than
+                // riding through to a setconf error.
+                case 'RandomTrailers':         setVal('awg_rt', awgNormOnOff(val)); break;
+                case 'DisableCookies':         setVal('awg_dc', awgNormOnOff(val)); break;
             }
         } else if(section === 'peer'){
             switch(key){
@@ -5163,7 +5209,27 @@ function initAutocompleteIp(){
                     <td><input type="text" class="input_6_table" id="awg_mha" maxlength="21" placeholder="18" aria-label="MaxHandshakeAttempts">
                         <div class="awg-hint" data-i18n="HINT_AWG3_MHA">Handshake retries before giving up. Default 18.</div></td>
                 </tr>
+                <tr>
+                    <th>RandomTrailers<span class="awg-ver">AWG 3.1</span></th>
+                    <td><select id="awg_rt" class="input_option" style="font-size:12px;" aria-label="RandomTrailers">
+                            <option value="" data-i18n="OPT_AWG31_UNSET">— (default: off)</option>
+                            <option value="on">on</option>
+                            <option value="off">off</option>
+                        </select>
+                        <div class="awg-hint" data-i18n="HINT_AWG31_RT">Random-length tail on handshake packets (size obfuscation). SYMMETRIC: with it on, the peer's trailer-less handshakes still pass, but ours are dropped by a peer that lacks it — set only what the provider's config says.</div></td>
+                </tr>
+                <tr>
+                    <th>DisableCookies<span class="awg-ver">AWG 3.1</span></th>
+                    <td><select id="awg_dc" class="input_option" style="font-size:12px;" aria-label="DisableCookies">
+                            <option value="" data-i18n="OPT_AWG31_UNSET">— (default: off)</option>
+                            <option value="on">on</option>
+                            <option value="off">off</option>
+                        </select>
+                        <div class="awg-hint" data-i18n="HINT_AWG31_DC">Never send WireGuard cookie replies (a load-protection message DPI can fingerprint). Affects this side only — safe with any peer.</div></td>
+                </tr>
                 </table>
+                <div id="awg31_unsupported" style="display:none; margin-top:8px; padding:6px 10px; border:1px solid #7a6a3a; background:#4a4230; border-radius:3px; font-size:11px; color:#e8dfc8;"
+                     data-i18n="AWG31_UNSUPPORTED">AmneziaWG 3.1 parameters (RandomTrailers / DisableCookies) are not supported by the installed binaries — those two fields are disabled.</div>
                 </details>
 
                 <!-- ==================== ROUTING ==================== -->

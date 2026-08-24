@@ -78,6 +78,7 @@ var statusTimer = null;
 // applyAwg3CapabilitySrv); unknown must NOT disable anything. Declared here, next to the other
 // page state, because genHpk() and the peer-config export both read it.
 var awgs3Cap = null;
+var awgs31Cap = null;
 var awgsActionGen = 0;          // generation token: stale in-flight polls must not repaint the UI
 var awgsStatus = null;
 var awgsPeers = [];             // working copy of the peer store (saved on Apply)
@@ -128,6 +129,10 @@ en: {
     HINT_AWG3_REKEY: "Seconds. Defaults 120 / 5.",
     HINT_AWG3_REJECT: "Seconds. Defaults 180 / 10. RejectAfterTime must stay above RekeyAfterTime.",
     HINT_AWG3_MHA: "Handshake retries before giving up. Default 18.",
+    AWG31_UNSUPPORTED: "AmneziaWG 3.1 parameters (RandomTrailers / DisableCookies) are not supported by the installed binaries — those two fields are disabled.",
+    OPT_AWG31_UNSET: "— (default: off)",
+    HINT_AWG31_RT_SRV: "SYMMETRIC: \"on\" is written into every peer config/QR — peers need an AmneziaWG 3.1+ client app and must re-import after changing this, or the server's handshakes are dropped.",
+    HINT_AWG31_DC_SRV: "Server-side only: never send cookie replies (a DPI-visible message). Not written into peer configs.",
     MSG_HPK_S_BUMPED: "Header protection needs S1–S4 ≥ 12, so %s were raised automatically. Re-export the peer configs / QR codes — clients must use the same values.",
     SEC_PEERS: "Peers (devices that connect to this router)",
     SEC_LOG: "Log",
@@ -230,6 +235,10 @@ ru: {
     HINT_AWG3_REKEY: "Секунды. По умолчанию 120 / 5.",
     HINT_AWG3_REJECT: "Секунды. По умолчанию 180 / 10. RejectAfterTime должен быть больше RekeyAfterTime.",
     HINT_AWG3_MHA: "Сколько раз повторять хендшейк перед сдачей. По умолчанию 18.",
+    AWG31_UNSUPPORTED: "Параметры AmneziaWG 3.1 (RandomTrailers / DisableCookies) не поддерживаются установленными бинарниками — эти два поля отключены.",
+    OPT_AWG31_UNSET: "— (по умолчанию off)",
+    HINT_AWG31_RT_SRV: "Симметричный: при «on» попадает в каждый конфиг пира и QR — пирам нужно приложение с AmneziaWG 3.1+, и после изменения конфиг надо переимпортировать, иначе рукопожатия сервера отбрасываются.",
+    HINT_AWG31_DC_SRV: "Только на сервере: не отправлять cookie-ответы (служебное сообщение, заметное для DPI). В конфиги пиров не записывается.",
     MSG_HPK_S_BUMPED: "Для Header protection нужны S1–S4 ≥ 12, поэтому %s подняты автоматически. Переэкспортируйте конфиги пиров / QR — на клиентах должны быть те же значения.",
     SEC_PEERS: "Пиры (устройства, подключающиеся к роутеру)",
     SEC_LOG: "Журнал",
@@ -444,6 +453,8 @@ function loadSettings(){
     sv('awgs_rat_f', gs('awgs_rat')); sv('awgs_rto_f', gs('awgs_rto'));
     sv('awgs_rjt_f', gs('awgs_rjt')); sv('awgs_kat_f', gs('awgs_kat'));
     sv('awgs_mha_f', gs('awgs_mha'));
+    // AmneziaWG 3.1 ('' | 'on' | 'off')
+    sv('awgs_rt_f', gs('awgs_rt')); sv('awgs_dc_f', gs('awgs_dc'));
     // I1-I5 from chunked base64 (lines "In = value")
     var b64 = getChunked('awgs_initdata', 30);
     if (b64) {
@@ -730,6 +741,14 @@ function buildPeerConf(p){
         var av = gv(awg3f[a][1]);
         if (av) lines.push(awg3f[a][0] + ' = ' + av);
     }
+    // AmneziaWG 3.1. RandomTrailers is SYMMETRIC: a server with it on still ACCEPTS plain
+    // handshakes, but every handshake IT sends (responses included) carries a random trailer,
+    // which a peer WITHOUT the flag rejects — so "on" must ride into every peer config (and
+    // demands an AmneziaWG 3.1+ client app). "off"/unset is deliberately NOT written: older
+    // client apps abort the import on an unknown key, and absent == off anyway.
+    // DisableCookies is a server-local policy (never send cookie replies) — mirroring it to
+    // peers would buy nothing and cost the same compatibility, so it stays out.
+    if (awgs31Cap !== false && gv('awgs_rt_f') === 'on') lines.push('RandomTrailers = on');
     lines.push('');
     lines.push('[Peer]');
     lines.push('PublicKey = ' + gv('awgs_pub_f'));
@@ -821,6 +840,8 @@ function saveSettings(){
     ss('awgs_rat', gv('awgs_rat_f')); ss('awgs_rto', gv('awgs_rto_f'));
     ss('awgs_rjt', gv('awgs_rjt_f')); ss('awgs_kat', gv('awgs_kat_f'));
     ss('awgs_mha', gv('awgs_mha_f'));
+    // AmneziaWG 3.1
+    ss('awgs_rt', gv('awgs_rt_f')); ss('awgs_dc', gv('awgs_dc_f'));
     // I1-I5 -> chunked base64 text (ASCII-only, same as the client page)
     var itxt = '';
     for (var n = 1; n <= 5; n++) {
@@ -971,9 +992,26 @@ function applyAwg3CapabilitySrv(cap){
     var gb = document.getElementById('awgs_hpk_gen');
     if (gb) { gb.disabled = !ok; gb.style.opacity = ok ? '' : '0.5'; }
 }
+// The AmneziaWG 3.1 pair — same three-state contract, its own gate (a 3.0-capable pair keeps
+// the seven fields above live while these two stay disabled).
+var AWGS31_FIELDS = ['rt','dc'];
+function applyAwg31CapabilitySrv(cap){
+    var known = (cap === true || cap === false);
+    var ok = (cap !== false);
+    awgs31Cap = known ? cap : null;
+    var note = document.getElementById('awgs31_unsupported');
+    if (note) note.style.display = (known && !ok) ? '' : 'none';
+    for (var i = 0; i < AWGS31_FIELDS.length; i++) {
+        var el = document.getElementById('awgs_' + AWGS31_FIELDS[i] + '_f');
+        if (!el) continue;
+        el.disabled = !ok;
+        el.style.opacity = ok ? '' : '0.5';
+    }
+}
 function renderStatus(st){
     awgsStatus = st;
     applyAwg3CapabilitySrv(st.awg3);
+    applyAwg31CapabilitySrv(st.awg31);
     var badge = document.getElementById('awgs_badge');
     if (st.starting) {
         badge.className = 'awg-status connecting';
@@ -1293,7 +1331,27 @@ function initial(){
                     <td><input type="text" id="awgs_mha_f" class="input_6_table" maxlength="21" placeholder="18" onchange="markDirty();">
                         <div class="awg-hint" data-i18n="HINT_AWG3_MHA">Handshake retries before giving up. Default 18.</div></td>
                 </tr>
+                <tr>
+                    <th>RandomTrailers <span style="opacity:.6; font-size:10px;">AWG 3.1</span></th>
+                    <td><select id="awgs_rt_f" class="input_option" style="font-size:12px;" onchange="markDirty();">
+                            <option value="" data-i18n="OPT_AWG31_UNSET">— (default: off)</option>
+                            <option value="on">on</option>
+                            <option value="off">off</option>
+                        </select>
+                        <div class="awg-hint" data-i18n="HINT_AWG31_RT_SRV">SYMMETRIC: "on" is written into every peer config/QR — peers need an AmneziaWG 3.1+ client app and must re-import after changing this, or the server's handshakes are dropped.</div></td>
+                </tr>
+                <tr>
+                    <th>DisableCookies <span style="opacity:.6; font-size:10px;">AWG 3.1</span></th>
+                    <td><select id="awgs_dc_f" class="input_option" style="font-size:12px;" onchange="markDirty();">
+                            <option value="" data-i18n="OPT_AWG31_UNSET">— (default: off)</option>
+                            <option value="on">on</option>
+                            <option value="off">off</option>
+                        </select>
+                        <div class="awg-hint" data-i18n="HINT_AWG31_DC_SRV">Server-side only: never send cookie replies (a DPI-visible message). Not written into peer configs.</div></td>
+                </tr>
                 </table>
+                <div id="awgs31_unsupported" class="awg-hint" style="display:none; margin:6px 0 0 5px; padding:6px 10px; border:1px solid #7a6a3a; background:#4a4230; border-radius:3px; color:#e8dfc8;"
+                     data-i18n="AWG31_UNSUPPORTED">AmneziaWG 3.1 parameters (RandomTrailers / DisableCookies) are not supported by the installed binaries — those two fields are disabled.</div>
 
                 <!-- Peers -->
                 <div class="awg-section" data-i18n="SEC_PEERS">Peers</div>

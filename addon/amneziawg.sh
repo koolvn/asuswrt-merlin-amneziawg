@@ -4,7 +4,7 @@
 # Userspace amneziawg-go, per-device policy routing, GeoIP/GeoSite
 # =============================================================
 
-AWG_VERSION="1.5.19"
+AWG_VERSION="1.5.20"
 ADDON_DIR="/jffs/addons/amneziawg"
 AWG_DIR="/opt/amneziawg"
 CONF="$AWG_DIR/awg0.conf"
@@ -3561,6 +3561,18 @@ validate_range(){
     return 0
 }
 
+# An AmneziaWG 3.1 boolean param (RandomTrailers / DisableCookies). The page writes only
+# "on"/"off", but a hand-edited settings line may carry the numeric form — amneziawg-tools'
+# parse_bool accepts strcasecmp "on"/"off" plus digits, and we pass the value through verbatim,
+# so accept exactly that set (lowercased by the page; reject mixed case here to keep the emitted
+# conf canonical). Anything else ("true", "yes") would die inside awg with a generic parse error.
+validate_onoff(){
+    case "$1" in
+        on|off|0|1) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # --- AmneziaWG 3.0 capability gate -------------------------------------------------------
 # The 7 AWG-3.0 device params need BOTH a v3-aware `awg` CLI (amneziawg-tools gained them only
 # on the feat/awg3 branch — NO released tag parses them) AND a v3 daemon. Emitting them at the
@@ -3657,6 +3669,72 @@ awg3_supported(){
         return 0
     fi
     echo "awg3=0 $now $sig" > "$AWG_CAPS_FILE" 2>/dev/null
+    return 1
+}
+
+# --- AmneziaWG 3.1 capability gate (RandomTrailers / DisableCookies) ---------------------
+# Same FAIL-CLOSED contract and the same failure modes as the 3.0 gate above: an old awg CLI
+# aborts the whole setconf on the first unknown key, an old daemon EINVALs the UAPI set. A
+# SEPARATE gate (not a widened awg3 probe) because the fleet legitimately runs mixed pairs
+# mid-upgrade, and "3.0 yes / 3.1 no" must keep the 7 older params flowing.
+AWG_CAPS31_FILE="/tmp/.awg_caps31"
+
+_awg31_probe(){
+    local pconf perr iface="awgcap0"
+    [ -e "/sys/class/net/$iface" ] && return 1
+    [ -s "$AWG_BIN" ] && [ -x "$AWG_BIN" ] || return 1
+    [ -s "$AWG_GO_CANON" ] && [ -x "$AWG_GO_CANON" ] || return 1
+
+    # CI stamps `-awg31-` next to `-awg3-` when it builds from the v3.1 fork branch. NB the
+    # 3.0 gate's `*-awg3-*` glob does NOT match "-awg31-" — both markers are stamped.
+    case "$("$AWG_GO_CANON" --version 2>/dev/null)" in
+        *-awg31-*) ;;
+        *) return 1 ;;
+    esac
+
+    pconf="/tmp/.awg_capprobe31.$$"
+    {
+        echo "[Interface]"
+        echo "PrivateKey = $AWG_CAP_DUMMY_KEY"
+        echo "RandomTrailers = on"
+        echo "DisableCookies = off"
+    } > "$pconf" 2>/dev/null || return 1
+    perr=$("$AWG_BIN" setconf "$iface" "$pconf" 2>&1)
+    rm -f "$pconf"
+    case "$perr" in
+        *"Line unrecognized"*|*"Configuration parsing error"*) return 1 ;;  # old tools
+        *"Unable to"*|*"No such"*|*"not exist"*) return 0 ;;                # parsed, IPC failed
+        *) return 1 ;;                                                      # unknown => closed
+    esac
+}
+
+# Cached wrapper — the awg3_supported contract verbatim (positive pinned to the binaries'
+# `ls -l` signature, negative expires after AWG_CAPS_NEG_TTL, incomplete binary pair refuses
+# to answer or cache). Kept as its own file so the two verdicts never clobber each other.
+awg31_supported(){
+    local sig lines cached cstamp now
+    sig=$(ls -l "$AWG_GO_CANON" "$AWG_BIN" 2>/dev/null)
+    lines=$(echo "$sig" | grep -c .)
+    [ "$lines" = "2" ] || return 1
+    sig=$(echo "$sig" | tr -d ' \n')
+
+    now=$(date +%s 2>/dev/null) || now=0
+    if [ -f "$AWG_CAPS31_FILE" ]; then
+        cached=$(cat "$AWG_CAPS31_FILE" 2>/dev/null)
+        case "$cached" in
+            "awg31=1 $sig") return 0 ;;
+            "awg31=0 "*" $sig")
+                cstamp=$(echo "$cached" | cut -d' ' -f2)
+                [ -n "$cstamp" ] && [ "$now" -gt 0 ] 2>/dev/null \
+                    && [ $((now - cstamp)) -lt "$AWG_CAPS_NEG_TTL" ] 2>/dev/null && return 1
+                ;;
+        esac
+    fi
+    if _awg31_probe; then
+        echo "awg31=1 $sig" > "$AWG_CAPS31_FILE" 2>/dev/null
+        return 0
+    fi
+    echo "awg31=0 $now $sig" > "$AWG_CAPS31_FILE" 2>/dev/null
     return 1
 }
 
@@ -3811,6 +3889,25 @@ generate_config(){
         fi
     fi
 
+    # --- AmneziaWG 3.1 device params ---------------------------------------------------
+    # RandomTrailers is SYMMETRIC (the daemon only accepts trailered handshake packets when
+    # its OWN flag is on, and the far side drops OUR trailered handshakes unless it has the
+    # flag too) — it comes from the provider config and must be passed through verbatim.
+    # DisableCookies is local-only. Same fail-closed emission gate as the 3.0 set: on an
+    # older pair the keys abort the whole setconf, so unsupported means "not emitted".
+    local rt dc awg31=0
+    rt=$(pf_slot_get "$pf" rt)
+    dc=$(pf_slot_get "$pf" dc)
+    [ -n "$rt" ] && { validate_onoff "$rt" || { log_msg "ERROR: Invalid RandomTrailers: $rt (expected \"on\" or \"off\")"; return 1; }; }
+    [ -n "$dc" ] && { validate_onoff "$dc" || { log_msg "ERROR: Invalid DisableCookies: $dc (expected \"on\" or \"off\")"; return 1; }; }
+    if [ -n "$rt$dc" ]; then
+        if awg31_supported; then
+            awg31=1
+        else
+            log_msg "WARNING: AmneziaWG 3.1 parameters (RandomTrailers/DisableCookies) are set but this build does not support them — they are NOT applied. NB a provider endpoint that REQUIRES RandomTrailers will drop our handshakes without it."
+        fi
+    fi
+
     {
         echo "[Interface]"
         echo "PrivateKey = $iface_p1"
@@ -3839,6 +3936,10 @@ generate_config(){
             [ -n "$rjt" ] && echo "RejectAfterTime = $rjt"
             [ -n "$kat" ] && echo "KeepaliveTimeout = $kat"
             [ -n "$mha" ] && echo "MaxHandshakeAttempts = $mha"
+        fi
+        if [ "$awg31" = "1" ]; then
+            [ -n "$rt" ] && echo "RandomTrailers = $rt"
+            [ -n "$dc" ] && echo "DisableCookies = $dc"
         fi
         echo ""
         echo "[Peer]"
@@ -4769,7 +4870,7 @@ do_start(){
             local adv
             adv=$(awk '
                 /^(Jc|Jmin|Jmax|S[1-4]|H[1-4]) /{ print; next }
-                /^(ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts|PersistentKeepalive) /{ print; next }
+                /^(ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts|PersistentKeepalive|RandomTrailers|DisableCookies) /{ print; next }
                 /^I[1-5] /{ if(length($0)>44) $0=substr($0,1,28)"…"substr($0,length($0)-7); print }
             ' "$CONF" 2>/dev/null | tr '\n' '|')
             [ -n "$adv" ] && log_msg "  awg params: $adv"
@@ -5227,6 +5328,9 @@ EOF
     # would then refuse to emit. Cached in /tmp, keyed on the binaries — cheap per poll.
     local awg3_cap=false
     awg3_supported && awg3_cap=true
+    # Same, one protocol step up: the AmneziaWG 3.1 pair (RandomTrailers/DisableCookies).
+    local awg31_cap=false
+    awg31_supported && awg31_cap=true
 
     local conf_pending=false _rc_sig _cf_sig _pk_live _pk_conf
     if [ "$running" = "true" ] && [ -f "$CONF" ]; then
@@ -5433,7 +5537,7 @@ EOF
     # awg_status.htm or awg_widget.js. The old ".tmp" is removed too in case an upgrade left one.
     rm -f "${STATUS_FILE}.tmp" "${STATUS_FILE}".[0-9]* 2>/dev/null
     cat > "${STATUS_FILE}.$$" << STATUSEOF
-{"running":${running},"starting":${starting},"stopping":${stopping},"version":"${AWG_VERSION}","lang":"${pref_lang}","public_key":"${pub_key}","listen_port":"${listen_port}","interface_addr":"${iface_addr}","peers":${peers_json},"no_handshake":${no_handshake},"conf_pending":${conf_pending},"awg3":${awg3_cap},"conn_start":${conn_start},"conn_uptime":${conn_uptime},"conn_history":${conn_hist},"profile":{"active":${pf_active},"user":${pf_user},"auto":${pf_auto},"name":"${pf_name}","failover":${pf_failover},"list":[${pf_list}]},"default_policy":"${default_policy}","dpi_tool":"${dpi_tool}","killswitch":${killswitch},"agh":${agh},"coexist_warn":${coexist_warn},"xray_capture":${xray_capture},"xray_ctl":${xray_ctl},"fwvpn_state":"${fwvpn_state}","fwvpn_detail":"${fwvpn_detail}","ctf_block":${ctf_block},"kernel_unsup":${kernel_unsup},"dnsgeo_warn":"${dnsgeo_warn}","geo_matchall_warn":"${geo_matchall_warn}","clients":"${clients_data}","active_rules":${active_rules},"ipset_count":${ipset_count},"geo_domains":${geo_domains},"geo_stats":{${geo_stats}},"geo_downloaded":${geo_downloaded},"geo_busy":${geo_busy},"analyze_active":${analyze_active},"log":"${log_text}"}
+{"running":${running},"starting":${starting},"stopping":${stopping},"version":"${AWG_VERSION}","lang":"${pref_lang}","public_key":"${pub_key}","listen_port":"${listen_port}","interface_addr":"${iface_addr}","peers":${peers_json},"no_handshake":${no_handshake},"conf_pending":${conf_pending},"awg3":${awg3_cap},"awg31":${awg31_cap},"conn_start":${conn_start},"conn_uptime":${conn_uptime},"conn_history":${conn_hist},"profile":{"active":${pf_active},"user":${pf_user},"auto":${pf_auto},"name":"${pf_name}","failover":${pf_failover},"list":[${pf_list}]},"default_policy":"${default_policy}","dpi_tool":"${dpi_tool}","killswitch":${killswitch},"agh":${agh},"coexist_warn":${coexist_warn},"xray_capture":${xray_capture},"xray_ctl":${xray_ctl},"fwvpn_state":"${fwvpn_state}","fwvpn_detail":"${fwvpn_detail}","ctf_block":${ctf_block},"kernel_unsup":${kernel_unsup},"dnsgeo_warn":"${dnsgeo_warn}","geo_matchall_warn":"${geo_matchall_warn}","clients":"${clients_data}","active_rules":${active_rules},"ipset_count":${ipset_count},"geo_domains":${geo_domains},"geo_stats":{${geo_stats}},"geo_downloaded":${geo_downloaded},"geo_busy":${geo_busy},"analyze_active":${analyze_active},"log":"${log_text}"}
 STATUSEOF
     mv "${STATUS_FILE}.$$" "$STATUS_FILE" 2>/dev/null
 }
@@ -5736,17 +5840,18 @@ do_install_page(){
 
     mount_menu_tree "$cli_page" "$srv_page"
 
-    # Both seeds carry "awg3" for the same reason: until the role's own status pass runs, this
-    # stub IS what the page polls, and a missing field reads as "capability unknown".
+    # Both seeds carry "awg3"/"awg31" for the same reason: until the role's own status pass
+    # runs, this stub IS what the page polls, and a missing field reads as "capability unknown".
     _seed_awg3=false; awg3_supported && _seed_awg3=true
-    echo "{\"running\":false,\"starting\":false,\"stopping\":false,\"version\":\"${AWG_VERSION}\",\"awg3\":${_seed_awg3},\"killswitch\":false,\"coexist_warn\":false,\"dpi_tool\":\"\",\"peers\":[],\"log\":\"Installed.\"}" > "$STATUS_FILE"
+    _seed_awg31=false; awg31_supported && _seed_awg31=true
+    echo "{\"running\":false,\"starting\":false,\"stopping\":false,\"version\":\"${AWG_VERSION}\",\"awg3\":${_seed_awg3},\"awg31\":${_seed_awg31},\"killswitch\":false,\"coexist_warn\":false,\"dpi_tool\":\"\",\"peers\":[],\"log\":\"Installed.\"}" > "$STATUS_FILE"
     # Seed the server status file too, so the server page's first poll isn't a 404.
     # It MUST carry "awg3": the full status is only written by srv_update_status, which runs
     # from the server's own */1 cron and therefore never on a router where the server role was
     # never configured. Without the field the page reads undefined and — failing closed — told
     # the user "AmneziaWG 3.0 parameters are not supported by the installed binaries", which is
     # simply false on a box whose daemon and CLI both handle 3.0 (field-reported on the RT-AX).
-    [ -f /www/user/awgs_status.htm ] || echo "{\"running\":false,\"starting\":false,\"stopping\":false,\"version\":\"${AWG_VERSION}\",\"awg3\":${_seed_awg3},\"peers\":[],\"log\":\"\"}" > /www/user/awgs_status.htm 2>/dev/null
+    [ -f /www/user/awgs_status.htm ] || echo "{\"running\":false,\"starting\":false,\"stopping\":false,\"version\":\"${AWG_VERSION}\",\"awg3\":${_seed_awg3},\"awg31\":${_seed_awg31},\"peers\":[],\"log\":\"\"}" > /www/user/awgs_status.htm 2>/dev/null
 
     [ ! -f /jffs/scripts/service-event ] && echo "#!/bin/sh" > /jffs/scripts/service-event
     chmod +x /jffs/scripts/service-event 2>/dev/null
