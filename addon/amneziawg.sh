@@ -4,7 +4,7 @@
 # Userspace amneziawg-go, per-device policy routing, GeoIP/GeoSite
 # =============================================================
 
-AWG_VERSION="1.5.20"
+AWG_VERSION="1.5.21"
 ADDON_DIR="/jffs/addons/amneziawg"
 AWG_DIR="/opt/amneziawg"
 CONF="$AWG_DIR/awg0.conf"
@@ -4112,7 +4112,11 @@ do_diag(){
     for _L in "$LOCKDIR" "$GEOLOCK" /tmp/.awg_dnsreload; do
         if [ -d "$_L" ]; then
             _lp2=$(cat "$_L/pid" 2>/dev/null)
-            if [ -n "$_lp2" ] && kill -0 "$_lp2" 2>/dev/null; then echo "  $_L : held by pid $_lp2 (alive)"
+            if [ -n "$_lp2" ] && kill -0 "$_lp2" 2>/dev/null; then
+                # Holder age makes a wedged job visible at a glance (the 2026-08-24 field diag
+                # showed only "alive" — the 6-minute hang had to be inferred from timestamps).
+                _la2=$(proc_age_s "$_lp2")
+                echo "  $_L : held by pid $_lp2 (alive${_la2:+, ${_la2}s old})"
             elif [ -n "$_lp2" ]; then echo "  $_L : held by pid $_lp2 (DEAD — stale lock!)"
             else echo "  $_L : held (no pid recorded)"; fi
         else
@@ -5246,6 +5250,100 @@ reap_stale_status(){
     log_msg "Reaped $n stale 'status' process(es) — a firmware 'nvram get' had wedged them (envrams IPC has no timeout)"
 }
 
+# Age of one process in seconds — /proc/<pid>/stat field 22 (starttime, USER_HZ=100 ticks)
+# against /proc/uptime, no forks. Prints nothing when either read fails (gone pid, bad stat).
+proc_age_s(){
+    local pp="$1" up sline
+    { read -r up < /proc/uptime; } 2>/dev/null || return 0
+    up=${up%%.*}
+    case "$up" in ''|*[!0-9]*) return 0 ;; esac
+    sline=""
+    { read -r sline < "/proc/$pp/stat"; } 2>/dev/null
+    [ -n "$sline" ] || return 0
+    # `set -f` only around the split (the stale_status_pids lesson); field 2 = (comm) — ours
+    # are `sh`/`nvram`, never spaced, so field 22 really is starttime.
+    set -f; set -- $sline; set +f
+    [ $# -ge 22 ] || return 0
+    shift 21
+    case "$1" in ''|*[!0-9]*) return 0 ;; esac
+    echo $(( up - $1 / 100 ))
+}
+
+# --- Stale dnsmasq-reload-job reaper (1.5.21) --------------------------------------------
+# Second incarnation of the wedged-`nvram get` disease (see reap_stale_status above): the
+# DETACHED reload_dnsmasq job polls a bare `nvram get rc_service` once a second inside
+# _rc_settle, and ONE lost envrams reply parks the whole job in the kernel forever — while it
+# HOLDS /tmp/.awg_dnsreload. Every later reload then waits its 240 s and self-skips ("another
+# reload job still running"), so dnsmasq never picks up refreshed DOMAIN geo rules again until
+# a reboot. Field-caught 2026-08-24 (TUF-AX3000_V2 @1.5.20 diag): holder alive 6+ minutes, rc
+# idle the whole time, not one further journal/syslog line from the job — parked before its
+# `service` call, i.e. inside the nvram read. Unlike a status run, this job's lifetime is
+# LEGITIMATELY minutes (up to 240 s in the lock queue, a 150 s rc-settle budget, and up to 30
+# notify_rc attempts that can each block ~15 s on a busy rc), so the threshold sits far above
+# all of that combined. Age is measured on the holder PROCESS (proc_age_s), not on a lock
+# file — so locks taken by a pre-1.5.21 addon are covered the moment this version lands.
+DNSRELOAD_STALE_S=1200
+
+reap_stale_dnsreload(){
+    local hp age victims kids more d p sline v pass
+    [ -d /tmp/.awg_dnsreload ] || return 0
+    hp=$(cat /tmp/.awg_dnsreload/pid 2>/dev/null)
+    if [ -z "$hp" ]; then
+        # mkdir won but the pid write never landed (writer killed in that instant). The
+        # queue's dead-holder reclaim keys on the pid FILE, so a pidless dir blocks every
+        # reload forever. Same age discipline as the watchdog's LOCKDIR reclaim: touch it
+        # only once the dir is demonstrably old — mid-acquire is a moment, not minutes.
+        [ -n "$(find /tmp/.awg_dnsreload -maxdepth 0 -mmin +5 2>/dev/null)" ] || return 0
+        rm -rf /tmp/.awg_dnsreload 2>/dev/null
+        log_msg "WATCHDOG: removed an orphaned pidless dnsmasq-reload lock (it was blocking every reload)"
+        return 0
+    fi
+    case "$hp" in *[!0-9]*) return 0 ;; esac
+    if ! kill -0 "$hp" 2>/dev/null; then
+        # Dead holder. The reload queue reclaims these itself, but only when the NEXT reload
+        # actually queues up behind it — clear it now so that one starts instantly instead.
+        rm -rf /tmp/.awg_dnsreload 2>/dev/null
+        return 0
+    fi
+    age=$(proc_age_s "$hp")
+    [ -n "$age" ] || return 0
+    [ "$age" -gt "$DNSRELOAD_STALE_S" ] || return 0
+    # Collect the holder's descendants TRANSITIVELY: the wedged `nvram get` runs inside a
+    # $(…) command-substitution subshell, i.e. it is usually a GRANDchild of the holder — a
+    # single-level PPid pass would kill the middle shell and orphan the nvram process, still
+    # wedged, onto init. Deepest generation lands FIRST in $kids, and children die BEFORE
+    # the holder (the reap_stale_status lesson: freeing the shell alone lets it resume and
+    # act on a world that moved on minutes ago).
+    victims=" $hp"; kids=""; pass=0
+    while [ $pass -lt 4 ]; do
+        more=""
+        for d in /proc/[0-9]*; do
+            p=${d#/proc/}
+            case "$victims$more " in *" $p "*) continue ;; esac
+            sline=""
+            { read -r sline < "$d/stat"; } 2>/dev/null
+            [ -n "$sline" ] || continue
+            set -f; set -- $sline; set +f
+            [ $# -ge 4 ] || continue    # pid (comm) state ppid — our victims' comms are never spaced
+            for v in $victims; do
+                [ "$4" = "$v" ] && { more="$more $p"; break; }
+            done
+        done
+        [ -n "$more" ] || break
+        kids="$more$kids"
+        victims="$victims$more"
+        pass=$((pass + 1))
+    done
+    [ -n "$kids" ] && kill -9 $kids 2>/dev/null
+    kill -9 "$hp" 2>/dev/null
+    rm -rf /tmp/.awg_dnsreload 2>/dev/null
+    log_msg "WATCHDOG: reaped a wedged dnsmasq-reload job (pid $hp, ${age}s old — a firmware 'nvram get' with no timeout had parked it; reloads were being skipped) — re-queuing the reload"
+    # The killed job's reload never happened; run a fresh one so refreshed domain rules reach
+    # dnsmasq now rather than at the next Apply. It detaches itself and self-skips via the
+    # conf md5 signature when there is genuinely nothing to load.
+    reload_dnsmasq
+}
+
 # --- Status JSON for web UI ---
 
 update_status(){
@@ -6259,6 +6357,11 @@ do_watchdog(){
         log_msg "WATCHDOG: stale update flag (>15 min) — updater likely died mid-flight; reclaiming"
         rm -f /tmp/.awg_no_autostart
     fi
+
+    # The dnsmasq-reload lock is INDEPENDENT of the main operation lock, so reap a wedged
+    # reload job BEFORE the busy-gate below — a stuck holder must not ride out a busy spell.
+    # Cheap until it actually fires: one cat + kill -0 + two /proc reads.
+    reap_stale_dnsreload
 
     # Skip if another operation is mid-flight — but only if its holder is ALIVE. A leaked lock
     # (a process killed between acquire and release) used to silence the watchdog FOREVER
