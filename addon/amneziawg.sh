@@ -4,7 +4,7 @@
 # Userspace amneziawg-go, per-device policy routing, GeoIP/GeoSite
 # =============================================================
 
-AWG_VERSION="1.5.21"
+AWG_VERSION="1.5.22"
 ADDON_DIR="/jffs/addons/amneziawg"
 AWG_DIR="/opt/amneziawg"
 CONF="$AWG_DIR/awg0.conf"
@@ -4330,8 +4330,22 @@ AWG_GOMEMLIMIT_AVAIL_PCT=60   # opportunistic ceiling from MemAvailable when the
 # the heap ballooned at line rate and the Go runtime OOM-aborted — 3 incidents in 6 min
 # (2026-07-16, incidents.log), watchdog crash-looped the server. With the cap the same
 # imbalance just throttles (WaitPool.Get blocks the reader): slow but ALIVE. Reverted in
-# 1.3.14: launch_daemon never sets the env; the -poolcfg daemon keeps honoring
-# WG_PREALLOCATED_BUFFERS_PER_POOL for MANUAL experiments only.
+# 1.3.14: the launcher never RAISES the cap, and 0 (= UNBOUNDED to the daemon) is never
+# emitted; the -poolcfg daemon keeps honoring WG_PREALLOCATED_BUFFERS_PER_POOL for
+# manual experiments.
+#
+# 1.5.22: on CONSTRAINED boxes the launcher now LOWERS the cap (compute_pool_cap below).
+# Strict-overcommit firmwares (vm.overcommit_memory=2 — seen on gnuton 388.11 / 512MB
+# RT-AX82U_V2 and stock 3006.102 / 2GB RT-BE88U) shrink the commit budget so far that
+# GOMEMLIMIT lands at its 64MiB overcommit floor while the compiled pool cap ALONE may
+# pin 1024x64KB = 64MB — the entire ceiling. Under an RX burst the pool fills toward its
+# cap, blows through the SOFT limit (GOMEMLIMIT never refuses an allocation) and the
+# next heap-arena mmap exceeds the commit budget -> `runtime: out of memory` rc=2 abort
+# seconds after start (field 2026-08-26, AX82U_V2 @1.5.21: 25+ OOM incidents in 2 days,
+# one crash 8 s after a watchdog restart; user-visible as «рвётся каждую минуту на
+# ~30 сек» — OOM -> health-check/watchdog restart -> OOM). A TIGHTER cap is MORE flow
+# control, so the 1.3.14 lesson stands untouched; roomy boxes keep the compiled 1024
+# (env not exported at all).
 AWG_GOTUNE_BELOW_MIB=768
 
 # STRICT-OVERCOMMIT GUARD (1.3.15): MemTotal is the WRONG lens when the kernel runs
@@ -4419,6 +4433,36 @@ compute_go_memlimit(){
     printf '%dMiB' "$_lim_mib"
 }
 
+# Scale the daemon's buffer-pool cap DOWN to the memory envelope on constrained boxes
+# (1.5.22 — see the strict-overcommit paragraph above AWG_GOTUNE_BELOW_MIB). $1 =
+# compute_go_memlimit's output ("NNNMiB" or empty). Empty/unparsable in => empty out:
+# launch_daemon leaves the env unset and the compiled default (1024) applies — roomy
+# boxes never reach a reduced cap. Otherwise: 4 buffers per limit-MiB (buffers are 64KB,
+# so the message pool may pin ~25% of GOMEMLIMIT), clamped to [512, 1024].
+#
+# WHY 512 IS THE FLOOR (liveness, not tuning): the message-buffer pool feeds THREE
+# rolling consumers that PRE-HOLD one full batch (conn.IdealBatchSize=128 buffers) each
+# even while idle — the v4 receive routine, the v6 receive routine and the TUN reader
+# (verified in the fork: receive.go fills bufsArrs before blocking in recv, send.go
+# pre-fills its elems) — plus up to one staged batch per peer awaiting a handshake.
+# 384 pre-held + one batch in flight = 512 is the minimum that keeps every path able to
+# make progress; WaitPool.Get BLOCKS at the cap (backpressure, not drops), so below that
+# the pipeline serializes to a crawl while idle paths sit on their batches.
+#
+# WHY 1024 IS THE CEILING: that is the compiled default — this helper only ever TIGHTENS
+# flow control (raising/un-capping is forbidden, see the 1.3.14 field crash above), and
+# 0 (= unbounded to the daemon) must never be emitted. Honored by -poolcfg daemons
+# (>= 1.3.13, incl. the 3.1 fork); older -pool1024 builds ignore the env — harmless.
+compute_pool_cap(){
+    case "$1" in *MiB) : ;; *) return 0 ;; esac
+    _pcl_mib=${1%MiB}
+    case "$_pcl_mib" in ''|*[!0-9]*) return 0 ;; esac
+    _pcl=$(( _pcl_mib * 4 ))
+    [ "$_pcl" -lt 512 ]  && _pcl=512
+    [ "$_pcl" -gt 1024 ] && _pcl=1024
+    printf '%d' "$_pcl"
+}
+
 # One-line description of the Go-runtime tuning decision for logs/diag. Every site that
 # names the tune goes through this helper, so the wording cannot drift from what
 # launch_daemon actually applies (client and server share both).
@@ -4427,7 +4471,8 @@ go_tune_desc(){
         printf 'stock Go GC (MemTotal >= %sMiB: no GOMEMLIMIT/GOGC caps) + buffer pool capped at 1024 (compiled default — flow control that keeps a slow egress path from ballooning the heap)' "$AWG_GOTUNE_BELOW_MIB"
     else
         _gtd=$(compute_go_memlimit)
-        printf 'GOMEMLIMIT=%s GOGC=%s + buffer pool capped at 1024 (constrained box: MemTotal < %sMiB or strict vm.overcommit — OOM protection under load)' "${_gtd:-unset}" "$AWG_GOGC" "$AWG_GOTUNE_BELOW_MIB"
+        _gtp=$(compute_pool_cap "$_gtd")
+        printf 'GOMEMLIMIT=%s GOGC=%s + buffer pool capped at %s (constrained box: MemTotal < %sMiB or strict vm.overcommit — OOM protection under load)' "${_gtd:-unset}" "$AWG_GOGC" "${_gtp:-1024}" "$AWG_GOTUNE_BELOW_MIB"
     fi
 }
 
@@ -4451,9 +4496,13 @@ launch_daemon(){
     # literal prefix) so it never leaks to the parent and so an empty value simply leaves
     # the env untouched.
     _glim=$(compute_go_memlimit)
-    # NB: the buffer-pool cap is deliberately NOT touched here — the compiled 1024
-    # default applies everywhere (see the AWG_GOTUNE_BELOW_MIB block: un-capping
-    # field-crashed a 2GB box in minutes; the cap is flow control, not a RAM knob).
+    # Buffer-pool cap: NEVER raised or un-capped from here (the 1.3.14 lesson — 0 or
+    # >1024 field-crashed a 2GB box in minutes; the cap is flow control, not a RAM
+    # knob), but on constrained boxes it is LOWERED to fit the memory envelope
+    # (1.5.22, compute_pool_cap — strict-overcommit firmwares leave GOMEMLIMIT at a
+    # floor the compiled 1024x64KB pool alone can fill). Empty on roomy boxes => env
+    # untouched, compiled 1024.
+    _gpool=$(compute_pool_cap "$_glim")
     # WG_PROCESS_FOREGROUND=1: without it amneziawg-go DAEMONIZES — the process we launch is
     # only a short-lived parent that forks the real daemon and exits 0 once the device is up.
     # The wrapper then recorded THAT exit ("[daemon exited rc=0]" on every successful start —
@@ -4464,18 +4513,20 @@ launch_daemon(){
     # literal prefixes in explicit branches (not `${1:+LOG_LEVEL=$1} cmd`).
     if [ -n "$1" ]; then
         ( [ -n "$_glim" ] && export GOMEMLIMIT="$_glim" GOGC="$AWG_GOGC"
+          [ -n "$_gpool" ] && export WG_PREALLOCATED_BUFFERS_PER_POOL="$_gpool"
           WG_PROCESS_FOREGROUND=1 LOG_LEVEL="$1" "$AWG_GO" "$IFACE" > $DAEMON_LOG 2>&1
           _rc=$?
           echo "rc=$_rc at $(date '+%H:%M:%S')" > $DAEMON_RC
           echo "[daemon exited rc=$_rc at $(date '+%H:%M:%S')]" >> $DAEMON_LOG
-          record_daemon_oom "$_rc" "$_glim" ) &
+          record_daemon_oom "$_rc" "$_glim" "$_gpool" ) &
     else
         ( [ -n "$_glim" ] && export GOMEMLIMIT="$_glim" GOGC="$AWG_GOGC"
+          [ -n "$_gpool" ] && export WG_PREALLOCATED_BUFFERS_PER_POOL="$_gpool"
           WG_PROCESS_FOREGROUND=1 "$AWG_GO" "$IFACE" > $DAEMON_LOG 2>&1
           _rc=$?
           echo "rc=$_rc at $(date '+%H:%M:%S')" > $DAEMON_RC
           echo "[daemon exited rc=$_rc at $(date '+%H:%M:%S')]" >> $DAEMON_LOG
-          record_daemon_oom "$_rc" "$_glim" ) &
+          record_daemon_oom "$_rc" "$_glim" "$_gpool" ) &
     fi
 }
 
@@ -4488,7 +4539,7 @@ launch_daemon(){
 record_daemon_oom(){
     if grep -qiF 'out of memory' $DAEMON_LOG 2>/dev/null; then
         # The Go runtime's OWN fatal-OOM (heap-commit refused). rc is typically 2.
-        awg_incident "amneziawg-go OOM-crashed (rc=${1:-?}) — Go heap hit its ceiling under load (GOMEMLIMIT=${2:-unset}); box is low on RAM for this throughput"
+        awg_incident "amneziawg-go OOM-crashed (rc=${1:-?}) — Go heap hit its ceiling under load (GOMEMLIMIT=${2:-unset}, pool cap ${3:-1024}); box is low on RAM for this throughput"
     elif [ "${1:-}" = 137 ] && dmesg 2>/dev/null | grep -iE 'killed process|out of memory' | grep -qi 'amneziawg-go'; then
         # rc=137 = 128+SIGKILL. That's ALSO how do_stop/do_start's `kill -9` fallback exits
         # the daemon, so rc alone must NOT be trusted — only record when the kernel log shows
@@ -4496,7 +4547,7 @@ record_daemon_oom(){
         # Go-runtime one above and invisible in the daemon's own log). Without that corroboration
         # a plain forced teardown would false-flag an incident. This catches the failure mode
         # GOMEMLIMIT can shift residual crashes toward (per-daemon cap holds, box still starves).
-        awg_incident "amneziawg-go killed by the KERNEL oom-killer (rc=137) under box-wide memory pressure — not a Go-runtime OOM; free RAM / reduce co-resident load (GOMEMLIMIT=${2:-unset})"
+        awg_incident "amneziawg-go killed by the KERNEL oom-killer (rc=137) under box-wide memory pressure — not a Go-runtime OOM; free RAM / reduce co-resident load (GOMEMLIMIT=${2:-unset}, pool cap ${3:-1024})"
     fi
 }
 
