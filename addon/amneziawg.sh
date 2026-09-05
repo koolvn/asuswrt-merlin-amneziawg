@@ -1874,12 +1874,23 @@ fw_dns_redirect_active(){
 # lets geo-by-domain populate (DoT: dnsmasq stays the resolver) from the ones that DON'T:
 # AdGuardHome and DNSFilter / DNS Director redirect clients PAST dnsmasq, so domains never enter
 # the set. AGH is named first — it usually rides on top of one of the nvram flags below.
-# Echoes nothing when no DNS owner is active.
+# Echoes nothing when no DNS owner is active. A flag read that timed out names an "unknown" owner:
+# fw_dns_redirect_active() treats that read as "active", and the label must not contradict it by
+# blaming a redirect that was never seen.
 fw_dns_redirect_name(){
+    local _v _k
     pidof AdGuardHome >/dev/null 2>&1 && { echo "AdGuardHome (DNS owner — clients bypass dnsmasq ipset)"; return; }
-    [ "$(nv get dnsfilter_enable_x 2>/dev/null)" = "1" ] && { echo "firmware DNSFilter (dnsfilter_enable_x=1)"; return; }
-    [ "$(nv get dns_director_enable 2>/dev/null)" = "1" ] && { echo "firmware DNS Director (dns_director_enable=1)"; return; }
-    [ "$(nv get dnspriv_enable 2>/dev/null)" = "1" ] && { echo "firmware DoT/DNS-over-TLS (dnspriv_enable=1)"; return; }
+    for _k in dnsfilter_enable_x dns_director_enable dnspriv_enable; do
+        _v=$(nv get "$_k" 2>/dev/null)
+        [ $? -eq 124 ] && { echo "unknown DNS owner (nvram get $_k timed out)"; return; }
+        [ "$_v" = "1" ] || continue
+        case "$_k" in
+            dnsfilter_enable_x)  echo "firmware DNSFilter (dnsfilter_enable_x=1)" ;;
+            dns_director_enable) echo "firmware DNS Director (dns_director_enable=1)" ;;
+            dnspriv_enable)      echo "firmware DoT/DNS-over-TLS (dnspriv_enable=1)" ;;
+        esac
+        return
+    done
 }
 
 # True when AdGuardHome is the active resolver on this box (it fronts :53 and clients bypass
@@ -3354,6 +3365,7 @@ setup_firewall(){
             case "$_fwdns" in
                 AdGuardHome*) log_msg "  note: AdGuardHome resolves clients directly — they bypass dnsmasq's ipset= directive, so geo-by-domain won't populate via dnsmasq; AGH has its own ipset feature (currently unconfigured — point it at the geo set to route domains)" ;;
                 *DoT*)        log_msg "  note: DoT keeps dnsmasq as the resolver — geo-by-domain still populates for clients that use the router's DNS (not external DoH/DoT)" ;;
+                unknown*)     log_msg "  note: the firmware DNS flags could not be read this pass — interception is skipped as a precaution and re-decided on the next watchdog tick" ;;
                 *)            log_msg "  note: this redirects clients PAST dnsmasq — geo-by-domain will NOT populate unless firmware DNS is set to 'Router' (or interception is forced)" ;;
             esac
         else
@@ -5782,7 +5794,7 @@ EOF
             else
                 _fwdnsn=$(fw_dns_redirect_name)
                 case "$_fwdnsn" in
-                    ""|*DoT*) ;;
+                    ""|*DoT*|unknown*) ;;
                     *) dnsgeo_warn="fwdns:${_fwdnsn%% (*}" ;;
                 esac
             fi
