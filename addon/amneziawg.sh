@@ -1025,10 +1025,12 @@ kill_tree(){
 # and returns cmd's rc. On timeout the whole process tree
 # is killed (kill_tree — the wedged nvram inside cru is a grandchild), the event is logged +
 # recorded as an incident, nothing is printed and rc is 124 — callers already treat an empty
-# read as "unset". Cost per call on an aarch64 box: ~10 ms (mktemp + the poll granularity)
-# against ~3 ms for a bare nvram — fine for the */1 status cron's two or three reads
-# (measured on the RT-AX88U PRO: 20 × `nv get` = 0.39 s). `usleep` is a busybox applet on
-# every Merlin build we know of; the fallback is a 1 s sleep.
+# read as "unset" — except the two decisions where "unset" would ACT unsafely
+# (fw_dns_redirect_active, setup_ipv6_block): those test for rc 124 and fail safe. Cost per
+# call on an aarch64 box: ~20 ms (mktemp + fork + the poll granularity; measured on the
+# RT-AX88U PRO: 20 × `nv get` = 0.39 s) against ~3 ms for a bare nvram — fine for the */1
+# status cron's two or three reads. `usleep` is a busybox applet on every Merlin build we
+# know of; the fallback is a 1 s sleep.
 NV_TIMEOUT_S=5
 CRU_TIMEOUT_S=10
 
@@ -1845,11 +1847,18 @@ EOF
 # hijack (geo-by-IP still works; only forced domain-geo is weakened for clients that resolve past
 # the router) instead of fighting the resolver owner. intercept_wanted() shares this, so the
 # watchdog reconciler can't drift from setup_firewall's decision.
+# A flag read that TIMED OUT (rc 124 from the bounded nvram call) counts as "active": the
+# callers act on "inactive" by installing our :53 DNAT, and doing that over a DNS owner we
+# merely failed to see is the exact conflict this probe exists to prevent. The next tick
+# re-reads; a skipped tick costs nothing.
 fw_dns_redirect_active(){
+    local _v _k
     pidof AdGuardHome >/dev/null 2>&1 && return 0
-    [ "$(nv get dnsfilter_enable_x 2>/dev/null)" = "1" ] && return 0
-    [ "$(nv get dns_director_enable 2>/dev/null)" = "1" ] && return 0
-    [ "$(nv get dnspriv_enable 2>/dev/null)" = "1" ] && return 0
+    for _k in dnsfilter_enable_x dns_director_enable dnspriv_enable; do
+        _v=$(nv get "$_k" 2>/dev/null)
+        [ $? -eq 124 ] && return 0
+        [ "$_v" = "1" ] && return 0
+    done
     return 1
 }
 
@@ -2008,7 +2017,11 @@ resolve_domain_v4(){
 setup_ipv6_block(){
     local ipv6_svc
     ipv6_svc=$(nv get ipv6_service 2>/dev/null)
-    [ "$ipv6_svc" = "disabled" ] || [ -z "$ipv6_svc" ] && return 0
+    # Only a CONFIRMED "disabled"/unset skips the block; a timed-out read (rc 124) installs it
+    # — two REJECTs that never match on an IPv6-less box beat a silent leak on one with IPv6.
+    if [ $? -ne 124 ]; then
+        case "$ipv6_svc" in ''|disabled) return 0 ;; esac
+    fi
     # Idempotent (-C guard) so setup_firewall can re-assert it on every Apply without
     # stacking duplicates. setup_firewall is the single rebuild point that all three trigger
     # paths (do_start, do_firewall_restart, awgsaveconf) hit, so the IPv6 block stays

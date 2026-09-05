@@ -903,18 +903,21 @@ do_srv_watchdog(){
         rm -f /tmp/.awg_no_autostart
     fi
 
-    # Busy/stale lock handling (alive holder -> busy; dead holder -> reclaim).
+    # Busy/stale lock handling (alive holder -> busy, unless it has been "busy" longer than
+    # any server operation can run — then it is wedged and reclaimed like the client's lock;
+    # dead holder -> reclaim).
     if [ -d "$LOCKDIR" ]; then
         local _lp
         _lp=$(cat "$LOCKDIR/pid" 2>/dev/null)
         if [ -n "$_lp" ] && kill -0 "$_lp" 2>/dev/null; then
-            return 0
+            reclaim_wedged_lock "$_lp" "WATCHDOG" || return 0
+        else
+            if [ -z "$_lp" ]; then
+                [ -n "$(find "$LOCKDIR" -maxdepth 0 -mmin +5 2>/dev/null)" ] || return 0
+            fi
+            log_msg "WATCHDOG: stale server lock (holder ${_lp:-unknown} is gone) — reclaiming"
+            rm -rf "$LOCKDIR"
         fi
-        if [ -z "$_lp" ]; then
-            [ -n "$(find "$LOCKDIR" -maxdepth 0 -mmin +5 2>/dev/null)" ] || return 0
-        fi
-        log_msg "WATCHDOG: stale server lock (holder ${_lp:-unknown} is gone) — reclaiming"
-        rm -rf "$LOCKDIR"
     fi
 
     if ! iface_exists "$IFACE" || ! pidof awgs-go >/dev/null 2>&1; then
