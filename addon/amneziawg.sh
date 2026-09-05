@@ -1041,7 +1041,10 @@ CRU_TIMEOUT_S=10
 run_bounded(){
     local _secs="$1" _tmp _pid _up _deadline _rc
     shift
-    _tmp=$(mktemp /tmp/.awg_rb.XXXXXX 2>/dev/null) || _tmp="/tmp/.awg_rb.$$"
+    # No fallback name: `$$` inside a `( ) &` subshell is the parent's pid, so a `$$`-based
+    # name collides between sibling jobs. An unwritable /tmp makes the answer unreadable —
+    # report it as such (124 = "unavailable", the callers' fail-safe branch).
+    _tmp=$(mktemp /tmp/.awg_rb.XXXXXX 2>/dev/null) || { log_msg "WARNING: mktemp failed for '$*' — /tmp unwritable?"; return 124; }
     "$@" > "$_tmp" 2>/dev/null < /dev/null &
     _pid=$!
     read -r _up _rc < /proc/uptime
@@ -2465,16 +2468,23 @@ reload_dnsmasq(){
         # behavior instead of pinning this job (and the lock) forever.
         _rcbudget=150
         # A TIMED-OUT read (rc 124) is not "idle": it is the one answer that would make us
-        # fire blind, so it is treated as busy — sleep, spend budget, ask again.
+        # fire blind, so it is treated as busy — sleep, spend budget, ask again. The budget
+        # is WALL-CLOCK seconds (measured per iteration on /proc/uptime), not iterations: a
+        # slow nvram spends up to 6 s per pass, and counting passes would let this loop run
+        # ~15 min — past the reaper's DNSRELOAD_STALE_S — while still "in budget".
         _rc_settle(){
-            local _rcs
+            local _rcs _t0 _t1 _d _r
             while [ $_rcbudget -gt 0 ]; do
+                read -r _t0 _r < /proc/uptime
                 _rcs=$(nv get rc_service 2>/dev/null)
                 [ $? -ne 124 ] && [ -z "$_rcs" ] && return 0
                 # Update began while we waited: its final reload supersedes this one.
                 if dnsreload_deferred; then touch "$DNSRELOAD_PENDING"; exit 0; fi
                 sleep 1
-                _rcbudget=$((_rcbudget - 1))
+                read -r _t1 _r < /proc/uptime
+                _d=$(( ${_t1%%.*} - ${_t0%%.*} ))
+                [ "$_d" -lt 1 ] && _d=1
+                _rcbudget=$((_rcbudget - _d))
             done
             return 0
         }
@@ -4236,8 +4246,12 @@ do_diag(){
     [ -f "$FAILOVER_STATE" ] && echo "  failover circle      : start+hops = $(tr '\n' ' ' < "$FAILOVER_STATE" 2>/dev/null)(incident in progress)"
     echo "--- self-heal / background state ---"
     echo "awg crons (cru l):"
-    _crons=$(awg_cru l 2>/dev/null | grep -i awg)
-    if [ -n "$_crons" ]; then echo "$_crons" | sed 's/^/  /'; else echo "  (NONE — watchdog/status cron not scheduled!)"; fi
+    _crons=$(awg_cru l 2>/dev/null)
+    if [ $? -eq 124 ]; then echo "  (cru l timed out — cron table unreadable, not necessarily empty)"
+    else
+        _crons=$(echo "$_crons" | grep -i awg)
+        if [ -n "$_crons" ]; then echo "$_crons" | sed 's/^/  /'; else echo "  (NONE — watchdog/status cron not scheduled!)"; fi
+    fi
     echo "watchdog last tick   : $([ -f /tmp/.awg_wd_beat ] && cat /tmp/.awg_wd_beat || echo '(never — cron not firing, or pre-1.2.31)')"
     echo "watchdog fail state  : $([ -f /tmp/.awg_wd_state ] && tr '\n' ' ' < /tmp/.awg_wd_state || echo none)"
     # A non-empty list means the */1 status cron is being wedged by the firmware's nvram IPC
@@ -4258,7 +4272,12 @@ do_diag(){
                 # showed only "alive" — the 6-minute hang had to be inferred from timestamps).
                 _la2=$(proc_age_s "$_lp2")
                 _wd2=""
-                [ "$_L" = "$LOCKDIR" ] && [ -n "$_la2" ] && [ "$_la2" -gt "$LOCK_STALE_S" ] && _wd2=" — WEDGED (>${LOCK_STALE_S}s; reclaimed by the next watchdog tick / acquire_lock)"
+                case "$_L" in
+                    "$LOCKDIR")          _th2="$LOCK_STALE_S"; _by2="the next watchdog tick / acquire_lock" ;;
+                    /tmp/.awg_dnsreload) _th2="$DNSRELOAD_STALE_S"; _by2="the next watchdog tick" ;;
+                    *)                   _th2="" ;;   # GEOLOCK has no reaper
+                esac
+                [ -n "$_th2" ] && [ -n "$_la2" ] && [ "$_la2" -gt "$_th2" ] && _wd2=" — WEDGED (>${_th2}s; reclaimed by $_by2)"
                 echo "  $_L : held by pid $_lp2 (alive${_la2:+, ${_la2}s old})$_wd2"
             elif [ -n "$_lp2" ]; then echo "  $_L : held by pid $_lp2 (DEAD — stale lock!)"
             else echo "  $_L : held (no pid recorded)"; fi
