@@ -971,6 +971,9 @@ LOCK_STALE_S=1800
 # the live holder PID is older than LOCK_STALE_S, 1 otherwise (young holder = genuinely busy).
 reclaim_wedged_lock(){
     local _hp="$1" _who="$2" _age
+    # An empty/garbage pid (a competitor mid-acquire has mkdir'd but not yet written the
+    # file) must never be spliced into /proc/<pid>/… — refuse, never reclaim.
+    case "$_hp" in ''|*[!0-9]*) return 1 ;; esac
     _age=$(proc_age_s "$_hp")
     [ -n "$_age" ] && [ "$_age" -gt "$LOCK_STALE_S" ] || return 1
     kill_tree "$_hp"
@@ -1025,8 +1028,9 @@ kill_tree(){
 # and returns cmd's rc. On timeout the whole process tree
 # is killed (kill_tree — the wedged nvram inside cru is a grandchild), the event is logged +
 # recorded as an incident, nothing is printed and rc is 124 — callers already treat an empty
-# read as "unset" — except the two decisions where "unset" would ACT unsafely
-# (fw_dns_redirect_active, setup_ipv6_block): those test for rc 124 and fail safe. Cost per
+# read as "unset" — except the decisions where "unset" would ACT unsafely
+# (fw_dns_redirect_active, setup_ipv6_block, _rc_settle, the rc_support install gate): those
+# test for rc 124 and fail safe. Cost per
 # call on an aarch64 box: ~20 ms (mktemp + fork + the poll granularity; measured on the
 # RT-AX88U PRO: 20 × `nv get` = 0.39 s) against ~3 ms for a bare nvram — fine for the */1
 # status cron's two or three reads. `usleep` is a busybox applet on every Merlin build we
@@ -2460,9 +2464,13 @@ reload_dnsmasq(){
         # budget is job-global, so a pathologically busy rc degrades to the old fire-blind
         # behavior instead of pinning this job (and the lock) forever.
         _rcbudget=150
+        # A TIMED-OUT read (rc 124) is not "idle": it is the one answer that would make us
+        # fire blind, so it is treated as busy — sleep, spend budget, ask again.
         _rc_settle(){
+            local _rcs
             while [ $_rcbudget -gt 0 ]; do
-                [ -z "$(nv get rc_service 2>/dev/null)" ] && return 0
+                _rcs=$(nv get rc_service 2>/dev/null)
+                [ $? -ne 124 ] && [ -z "$_rcs" ] && return 0
                 # Update began while we waited: its final reload supersedes this one.
                 if dnsreload_deferred; then touch "$DNSRELOAD_PENDING"; exit 0; fi
                 sleep 1
@@ -5456,18 +5464,21 @@ proc_age_s(){
 }
 
 # --- Stale dnsmasq-reload-job reaper (1.5.21) --------------------------------------------
-# Second incarnation of the wedged-`nvram get` disease (see reap_stale_status above): the
-# DETACHED reload_dnsmasq job polls a bare `nvram get rc_service` once a second inside
-# _rc_settle, and ONE lost envrams reply parks the whole job in the kernel forever — while it
-# HOLDS /tmp/.awg_dnsreload. Every later reload then waits its 240 s and self-skips ("another
-# reload job still running"), so dnsmasq never picks up refreshed DOMAIN geo rules again until
-# a reboot. Field-caught 2026-08-24 (TUF-AX3000_V2 @1.5.20 diag): holder alive 6+ minutes, rc
-# idle the whole time, not one further journal/syslog line from the job — parked before its
-# `service` call, i.e. inside the nvram read. Unlike a status run, this job's lifetime is
-# LEGITIMATELY minutes (up to 240 s in the lock queue, a 150 s rc-settle budget, and up to 30
-# notify_rc attempts that can each block ~15 s on a busy rc), so the threshold sits far above
-# all of that combined. Age is measured on the holder PROCESS (proc_age_s), not on a lock
-# file — so locks taken by a pre-1.5.21 addon are covered the moment this version lands.
+# Second incarnation of the wedged-`nvram get` disease (see reap_stale_status above): until
+# 1.5.23 the DETACHED reload_dnsmasq job polled a BARE `nvram get rc_service` once a second
+# inside _rc_settle, and ONE lost envrams reply parked the whole job in the kernel forever —
+# while it HELD /tmp/.awg_dnsreload. Every later reload then waited its 240 s and self-skipped
+# ("another reload job still running"), so dnsmasq never picked up refreshed DOMAIN geo rules
+# again until a reboot. Field-caught 2026-08-24 (TUF-AX3000_V2 @1.5.20 diag): holder alive 6+
+# minutes, rc idle the whole time, not one further journal/syslog line from the job — parked
+# before its `service` call, i.e. inside the nvram read. Since 1.5.23 that read is bounded
+# (`nv`, 5 s) and a timeout counts as "busy"; the reaper stays as the net under the steps that
+# are STILL unbounded — each `service restart_dnsmasq` (notify_rc blocks ~15 s on a busy rc)
+# and `dnsmasq --test`. Unlike a status run, this job's lifetime is LEGITIMATELY minutes (up
+# to 240 s in the lock queue, a 150 s rc-settle budget, and up to 30 notify_rc attempts), so
+# the threshold sits far above all of that combined. Age is measured on the holder PROCESS
+# (proc_age_s), not on a lock file — so locks taken by a pre-1.5.21 addon are covered the
+# moment this version lands.
 DNSRELOAD_STALE_S=1200
 
 reap_stale_dnsreload(){
@@ -6085,7 +6096,10 @@ do_analyze_stop(){
 
 do_install_page(){
     source /usr/sbin/helper.sh
-    nv get rc_support | grep -q am_addons || { log_msg "ERROR: Addons not supported"; return 1; }
+    local _rcsup
+    _rcsup=$(nv get rc_support 2>/dev/null)
+    [ $? -eq 124 ] && { log_msg "ERROR: nvram get rc_support timed out — retry the install"; return 1; }
+    case "$_rcsup" in *am_addons*) ;; *) log_msg "ERROR: Addons not supported"; return 1 ;; esac
 
     mkdir -p "$ADDON_DIR"
     [ "$(readlink -f "$0")" != "$(readlink -f "$ADDON_DIR/amneziawg.sh")" ] && cp "$0" "$ADDON_DIR/amneziawg.sh"
