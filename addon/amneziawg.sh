@@ -4,7 +4,7 @@
 # Userspace amneziawg-go, per-device policy routing, GeoIP/GeoSite
 # =============================================================
 
-AWG_VERSION="1.5.22"
+AWG_VERSION="1.5.23"
 ADDON_DIR="/jffs/addons/amneziawg"
 AWG_DIR="/opt/amneziawg"
 CONF="$AWG_DIR/awg0.conf"
@@ -926,6 +926,10 @@ acquire_lock(){
                 rm -rf "$LOCKDIR"
                 continue
             fi
+            # Alive but wedged for longer than any operation can legitimately run: reap it
+            # here too, so an Apply/restart during the wedge does not have to wait for the
+            # next watchdog tick and fail with "lock timeout" meanwhile.
+            reclaim_wedged_lock "$old_pid" "acquire_lock" && continue
         fi
         tries=$((tries + 1))
         [ $tries -ge 30 ] && { log_msg "ERROR: lock timeout"; return 1; }
@@ -945,6 +949,122 @@ release_lock(){
     [ -n "$p" ] && [ "$p" != "${AWG_LOCK_PID:-$$}" ] && return 0
     rm -rf "$LOCKDIR"
 }
+
+# --- Wedged-holder lock reclaim ------------------------------------------------------------
+# A lock holder that is ALIVE but has held LOCKDIR longer than any operation can legitimately
+# run is wedged, not busy. Until 1.5.23 a live pid of any age counted as "genuinely busy":
+# acquire_lock timed out behind it forever and the watchdog stood down every tick. Field case
+# 2026-09-05 (RT-AX88U_PRO @1.5.22): the 04:00 update_geo cron took the lock, tore the base
+# rules down (do_firewall_restart -> cleanup_firewall) and then parked inside
+# `cru d awg_geo_update` -> `nvram get http_username` (envrams IPC, no timeout) BEFORE the
+# rebuild — for 10 hours LAN traffic into the tunnel went out un-NATed (dead), geo went
+# unmarked (leaked to WAN), and every Apply/restart/firewall-start hook/UI geo update aborted
+# on "lock timeout". The tunnel itself was fine (router-sourced probes need no NAT), so the
+# watchdog saw nothing wrong and never healed.
+# Threshold: the longest legitimate hold is the updater (stop -> opkg -> install -> restart,
+# a few minutes) and a full start with its health probes (well under 2 min); 30 min is far
+# above both. Age is measured on the holder PROCESS (proc_age_s), so a lock taken by a
+# pre-1.5.23 addon is covered the moment this version lands.
+LOCK_STALE_S=1800
+
+# reclaim_wedged_lock PID CALLER: returns 0 (lock removed, holder + descendants killed) when
+# the live holder PID is older than LOCK_STALE_S, 1 otherwise (young holder = genuinely busy).
+reclaim_wedged_lock(){
+    local _hp="$1" _who="$2" _age
+    _age=$(proc_age_s "$_hp")
+    [ -n "$_age" ] && [ "$_age" -gt "$LOCK_STALE_S" ] || return 1
+    kill_tree "$_hp"
+    rm -rf "$LOCKDIR" 2>/dev/null
+    log_msg "$_who: operation lock holder pid $_hp was alive but wedged for ${_age}s (>${LOCK_STALE_S}s) — killed with its descendants, lock reclaimed"
+    awg_incident "wedged operation lock holder (pid $_hp, ${_age}s) killed by $_who — likely a firmware 'nvram get' that never returned"
+    return 0
+}
+
+# Kill PID and every descendant, SIGKILL, deepest generation first. Fork-free /proc scan (the
+# reap_stale_dnsreload discipline): descendants are collected transitively because a wedged
+# `nvram` is usually a GRANDchild (inside `cru`, or a `$(…)` subshell) — a one-level pass would
+# orphan it onto init still wedged. The (comm) field is stripped by expansion before the split
+# (a spaced comm elsewhere in /proc must not shift the ppid column), and `set -f` brackets ONLY
+# the split (a glob under set -f iterates its literal pattern).
+kill_tree(){
+    local _root="$1" _victims _kids="" _more _d _p _sline _v _pass=0
+    _victims=" $_root"
+    while [ $_pass -lt 4 ]; do
+        _more=""
+        for _d in /proc/[0-9]*; do
+            _p=${_d#/proc/}
+            case "$_victims$_more " in *" $_p "*) continue ;; esac
+            _sline=""
+            { read -r _sline < "$_d/stat"; } 2>/dev/null
+            [ -n "$_sline" ] || continue
+            _sline=${_sline##*) }        # "state ppid pgrp …" — field 2 is now the ppid
+            set -f; set -- $_sline; set +f
+            [ $# -ge 2 ] || continue
+            for _v in $_victims; do
+                [ "$2" = "$_v" ] && { _more="$_more $_p"; break; }
+            done
+        done
+        [ -n "$_more" ] || break
+        _kids="$_more$_kids"
+        _victims="$_victims$_more"
+        _pass=$((_pass + 1))
+    done
+    [ -n "$_kids" ] && kill -9 $_kids 2>/dev/null
+    kill -9 "$_root" 2>/dev/null
+}
+
+# --- Bounded firmware calls --------------------------------------------------------------
+# `nvram` can block FOREVER on a lost envrams reply (wchan=__skb_wait_for_more_packets — the
+# binary has no timeout), and `cru` runs `nvram get http_username` inside itself, so it can
+# too. Two reapers already clean up AFTER such a hang (reap_stale_status, reap_stale_dnsreload,
+# reclaim_wedged_lock above); this bounds the call ITSELF, so no path — least of all one
+# holding LOCKDIR between a teardown and a rebuild — can park on it in the first place.
+# run_bounded SECS cmd [args…]: runs cmd detached with stdout captured, polls its liveness
+# every ~10 ms against a /proc/uptime deadline (NOT a tick count — each `usleep` is a fork
+# that costs ~20 ms on an aarch64 box, so counted ticks ran 3× long), then prints the output
+# and returns cmd's rc. On timeout the whole process tree
+# is killed (kill_tree — the wedged nvram inside cru is a grandchild), the event is logged +
+# recorded as an incident, nothing is printed and rc is 124 — callers already treat an empty
+# read as "unset". Cost per call on an aarch64 box: ~10 ms (mktemp + the poll granularity)
+# against ~3 ms for a bare nvram — fine for the */1 status cron's two or three reads
+# (measured on the RT-AX88U PRO: 20 × `nv get` = 0.39 s). `usleep` is a busybox applet on
+# every Merlin build we know of; the fallback is a 1 s sleep.
+NV_TIMEOUT_S=5
+CRU_TIMEOUT_S=10
+
+run_bounded(){
+    local _secs="$1" _tmp _pid _up _deadline _rc
+    shift
+    _tmp=$(mktemp /tmp/.awg_rb.XXXXXX 2>/dev/null) || _tmp="/tmp/.awg_rb.$$"
+    "$@" > "$_tmp" 2>/dev/null < /dev/null &
+    _pid=$!
+    read -r _up _rc < /proc/uptime
+    _deadline=$(( ${_up%%.*} + _secs ))
+    while kill -0 "$_pid" 2>/dev/null; do
+        read -r _up _rc < /proc/uptime
+        if [ "${_up%%.*}" -ge "$_deadline" ]; then
+            kill_tree "$_pid"
+            wait "$_pid" 2>/dev/null
+            rm -f "$_tmp"
+            log_msg "WARNING: '$*' hung for ${_secs}s — killed (firmware envrams IPC lost the reply)"
+            awg_incident "'$*' hung for ${_secs}s — killed (bounded call)"
+            return 124
+        fi
+        usleep 10000 2>/dev/null || sleep 1
+    done
+    wait "$_pid" 2>/dev/null
+    _rc=$?
+    cat "$_tmp" 2>/dev/null
+    rm -f "$_tmp"
+    return $_rc
+}
+
+# Drop-in replacements: `nv get KEY` / `nv show` for `nvram …`, `awg_cru a|d|l …` for `cru …`.
+# Every firmware nvram/cron call in this script and in amneziawg_server.sh goes through these;
+# the only exceptions are the `nvram set`/`nvram commit` pair in do_ctf_disable — a one-shot
+# interactive path that takes no lock, where a half-applied commit would be worse than a hang.
+nv(){ run_bounded "$NV_TIMEOUT_S" nvram "$@"; }
+awg_cru(){ run_bounded "$CRU_TIMEOUT_S" cru "$@"; }
 
 human_size(){
     local bytes=${1:-0}
@@ -1284,7 +1404,7 @@ mount_menu_tree(){
     local page="$1" srv_page="$2"
     # Firmware UI language at mount time — gives the header widget a zero-flicker first paint
     # (it self-corrects from the status JSON "lang" field on its first poll if this goes stale).
-    local pref_lang=$(nvram get preferred_lang 2>/dev/null)
+    local pref_lang=$(nv get preferred_lang 2>/dev/null)
     [ -z "$pref_lang" ] && pref_lang="EN"
     [ ! -f /tmp/menuTree.js ] && cp /www/require/modules/menuTree.js /tmp/
     # Remove our previous tab lines (substring match — also catches 'AmneziaWG Server';
@@ -1607,7 +1727,7 @@ do_xray_stop(){
 # No-op (returns false) on every box without the module — the AX-series fleet never trips it.
 ctf_active(){
     grep -q '^ctf ' /proc/modules 2>/dev/null || return 1
-    [ "$(nvram get ctf_disable 2>/dev/null)" = "1" ] && return 1
+    [ "$(nv get ctf_disable 2>/dev/null)" = "1" ] && return 1
     return 0
 }
 
@@ -1705,7 +1825,7 @@ EOF
     # cron: five chances per minute became one. Semantics are unchanged — still NUMBERED keys
     # only, so the bare `wgc_enable` VPN-Fusion edit-buffer leftover still cannot false-alarm,
     # and a key that does not exist at all simply never matches (it used to read back empty).
-    for u in $(nvram show 2>/dev/null | sed -n 's/^wgc\([1-5]\)_enable=1$/\1/p'); do
+    for u in $(nv show 2>/dev/null | sed -n 's/^wgc\([1-5]\)_enable=1$/\1/p'); do
         iface_exists "wgc${u}" && continue
         en="$en wgc${u}"
     done
@@ -1727,9 +1847,9 @@ EOF
 # watchdog reconciler can't drift from setup_firewall's decision.
 fw_dns_redirect_active(){
     pidof AdGuardHome >/dev/null 2>&1 && return 0
-    [ "$(nvram get dnsfilter_enable_x 2>/dev/null)" = "1" ] && return 0
-    [ "$(nvram get dns_director_enable 2>/dev/null)" = "1" ] && return 0
-    [ "$(nvram get dnspriv_enable 2>/dev/null)" = "1" ] && return 0
+    [ "$(nv get dnsfilter_enable_x 2>/dev/null)" = "1" ] && return 0
+    [ "$(nv get dns_director_enable 2>/dev/null)" = "1" ] && return 0
+    [ "$(nv get dnspriv_enable 2>/dev/null)" = "1" ] && return 0
     return 1
 }
 
@@ -1741,9 +1861,9 @@ fw_dns_redirect_active(){
 # Echoes nothing when no DNS owner is active.
 fw_dns_redirect_name(){
     pidof AdGuardHome >/dev/null 2>&1 && { echo "AdGuardHome (DNS owner — clients bypass dnsmasq ipset)"; return; }
-    [ "$(nvram get dnsfilter_enable_x 2>/dev/null)" = "1" ] && { echo "firmware DNSFilter (dnsfilter_enable_x=1)"; return; }
-    [ "$(nvram get dns_director_enable 2>/dev/null)" = "1" ] && { echo "firmware DNS Director (dns_director_enable=1)"; return; }
-    [ "$(nvram get dnspriv_enable 2>/dev/null)" = "1" ] && { echo "firmware DoT/DNS-over-TLS (dnspriv_enable=1)"; return; }
+    [ "$(nv get dnsfilter_enable_x 2>/dev/null)" = "1" ] && { echo "firmware DNSFilter (dnsfilter_enable_x=1)"; return; }
+    [ "$(nv get dns_director_enable 2>/dev/null)" = "1" ] && { echo "firmware DNS Director (dns_director_enable=1)"; return; }
+    [ "$(nv get dnspriv_enable 2>/dev/null)" = "1" ] && { echo "firmware DoT/DNS-over-TLS (dnspriv_enable=1)"; return; }
 }
 
 # True when AdGuardHome is the active resolver on this box (it fronts :53 and clients bypass
@@ -1887,7 +2007,7 @@ resolve_domain_v4(){
 
 setup_ipv6_block(){
     local ipv6_svc
-    ipv6_svc=$(nvram get ipv6_service 2>/dev/null)
+    ipv6_svc=$(nv get ipv6_service 2>/dev/null)
     [ "$ipv6_svc" = "disabled" ] || [ -z "$ipv6_svc" ] && return 0
     # Idempotent (-C guard) so setup_firewall can re-assert it on every Apply without
     # stacking duplicates. setup_firewall is the single rebuild point that all three trigger
@@ -2222,7 +2342,7 @@ cleanup_firewall(){
     # dropped here: cleanup_firewall runs on every Apply/firewall-restart AND on the
     # health-check/deadman auto-rollback, and removing the watchdog there would strand a
     # rolled-back tunnel with no way to recover. It is removed only on a user stop/uninstall.
-    cru d awg_geo_update 2>/dev/null
+    awg_cru d awg_geo_update 2>/dev/null
 
     cleanup_ipv6_block
 
@@ -2329,7 +2449,7 @@ reload_dnsmasq(){
         _rcbudget=150
         _rc_settle(){
             while [ $_rcbudget -gt 0 ]; do
-                [ -z "$(nvram get rc_service 2>/dev/null)" ] && return 0
+                [ -z "$(nv get rc_service 2>/dev/null)" ] && return 0
                 # Update began while we waited: its final reload supersedes this one.
                 if dnsreload_deferred; then touch "$DNSRELOAD_PENDING"; exit 0; fi
                 sleep 1
@@ -3302,16 +3422,16 @@ setup_firewall(){
     #     (re)added here so it survives firewall-restart/Apply — cleanup_firewall drops
     #     it, and previously it was only added in do_start and was silently lost ---
     if [ "$(get_setting awg_geo_autoupdate)" = "1" ]; then
-        cru a awg_geo_update "0 4 * * * '$ADDON_DIR/amneziawg.sh' update_geo"
+        awg_cru a awg_geo_update "0 4 * * * '$ADDON_DIR/amneziawg.sh' update_geo"
     fi
-    cru a awg_watchdog "*/5 * * * * '$ADDON_DIR/amneziawg.sh' watchdog"
+    awg_cru a awg_watchdog "*/5 * * * * '$ADDON_DIR/amneziawg.sh' watchdog"
     # Background status refresh (every minute) so the UI peer table — handshake age and the
     # cumulative RX/TX counters — stays current WITHOUT a user action. The web page only re-reads
     # the static awg_status.htm; nothing else regenerated it between actions, so it used to freeze.
     # 'status' is read-only (awg show + file write), takes NO lock and triggers NO notify_rc, so
     # it's safe to run on a timer. Mirrors awg_watchdog's lifecycle exactly (cru is idempotent on
     # re-add, so firewall-restart/Apply won't duplicate it).
-    cru a awg_status "*/1 * * * * '$ADDON_DIR/amneziawg.sh' status"
+    awg_cru a awg_status "*/1 * * * * '$ADDON_DIR/amneziawg.sh' status"
 
     # Re-assert the IPv6 leak block here (idempotent) so it survives a bare Apply
     # (awgsaveconf -> setup_firewall), which previously tore it down without re-adding it.
@@ -4095,7 +4215,7 @@ do_diag(){
     [ -f "$FAILOVER_STATE" ] && echo "  failover circle      : start+hops = $(tr '\n' ' ' < "$FAILOVER_STATE" 2>/dev/null)(incident in progress)"
     echo "--- self-heal / background state ---"
     echo "awg crons (cru l):"
-    _crons=$(cru l 2>/dev/null | grep -i awg)
+    _crons=$(awg_cru l 2>/dev/null | grep -i awg)
     if [ -n "$_crons" ]; then echo "$_crons" | sed 's/^/  /'; else echo "  (NONE — watchdog/status cron not scheduled!)"; fi
     echo "watchdog last tick   : $([ -f /tmp/.awg_wd_beat ] && cat /tmp/.awg_wd_beat || echo '(never — cron not firing, or pre-1.2.31)')"
     echo "watchdog fail state  : $([ -f /tmp/.awg_wd_state ] && tr '\n' ' ' < /tmp/.awg_wd_state || echo none)"
@@ -4116,7 +4236,9 @@ do_diag(){
                 # Holder age makes a wedged job visible at a glance (the 2026-08-24 field diag
                 # showed only "alive" — the 6-minute hang had to be inferred from timestamps).
                 _la2=$(proc_age_s "$_lp2")
-                echo "  $_L : held by pid $_lp2 (alive${_la2:+, ${_la2}s old})"
+                _wd2=""
+                [ "$_L" = "$LOCKDIR" ] && [ -n "$_la2" ] && [ "$_la2" -gt "$LOCK_STALE_S" ] && _wd2=" — WEDGED (>${LOCK_STALE_S}s; reclaimed by the next watchdog tick / acquire_lock)"
+                echo "  $_L : held by pid $_lp2 (alive${_la2:+, ${_la2}s old})$_wd2"
             elif [ -n "$_lp2" ]; then echo "  $_L : held by pid $_lp2 (DEAD — stale lock!)"
             else echo "  $_L : held (no pid recorded)"; fi
         else
@@ -4168,12 +4290,12 @@ do_diag(){
     echo "compat (no DNS hijack): $([ "$(get_setting awg_no_dns_intercept)" = "1" ] && echo "ON (coexist)" || echo off)"
     echo "geo match-all ipset  : $(_fm=$(geo_foreign_matchall); [ -n "$_fm" ] && echo "FOREIGN line routes ALL domains into a geo set -> Geo sends EVERY site via VPN: $_fm" || echo none)"
     echo "kernel / sendmmsg    : $(uname -r) -> $(kernel_pre_sendmmsg && echo 'pre-3.0 (2.6.x): no native sendmmsg — daemon uses the bundled smfix per-packet fallback; SUPPORTED since 1.2.61 (guard removed; disable CTF first if present)' || echo 'ok (>=3.0)')"
-    echo "Broadcom CTF (HW-NAT) : $(grep -q '^ctf ' /proc/modules 2>/dev/null && echo "module loaded" || echo "no module") ctf_disable=$(nvram get ctf_disable 2>/dev/null) force=$(nvram get ctf_disable_force 2>/dev/null) -> $(ctf_active && echo 'ACTIVE (BLOCKS tunnel start — disable + reboot)' || echo 'not blocking')"
+    echo "Broadcom CTF (HW-NAT) : $(grep -q '^ctf ' /proc/modules 2>/dev/null && echo "module loaded" || echo "no module") ctf_disable=$(nv get ctf_disable 2>/dev/null) force=$(nv get ctf_disable_force 2>/dev/null) -> $(ctf_active && echo 'ACTIVE (BLOCKS tunnel start — disable + reboot)' || echo 'not blocking')"
     echo "conntrack count/max  : $(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo '?')/$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo '?')"
     echo "ip rule fwmark 0x100 :"; ip rule show 2>/dev/null | grep -i 'fwmark 0x100' | sed 's/^/  /'
-    echo "lan_ipaddr           : $(nvram get lan_ipaddr 2>/dev/null)"
+    echo "lan_ipaddr           : $(nv get lan_ipaddr 2>/dev/null)"
     echo "--- firmware VPN client (wgc / VPN Fusion) ---"
-    echo "wgc profiles         : $(nvram show 2>/dev/null | grep -E '^wgc[0-9]*_enable=' | tr '\n' ' ')"
+    echo "wgc profiles         : $(nv show 2>/dev/null | grep -E '^wgc[0-9]*_enable=' | tr '\n' ' ')"
     _fwv_diag=$(fw_vpn_client_state 2>/dev/null)
     echo "verdict              : ${_fwv_diag:-none (no enabled profiles, no preempting from-all rules)}"
     echo "preempting rules (prio 1-96, the ones that outrank our prio-98 mark rule):"
@@ -4194,10 +4316,10 @@ do_diag(){
     echo "modprobe tun         : $(modprobe tun 2>&1; echo rc=$?)"
     echo "/dev/net/tun         :"; ls -la /dev/net/tun 2>&1 | sed 's/^/  /'
     echo "--- firmware / model ---"
-    echo "model            : $(nvram get productid 2>/dev/null) (odm $(nvram get odmpid 2>/dev/null))"
-    echo "firmware         : $(nvram get firmver 2>/dev/null).$(nvram get buildno 2>/dev/null)_$(nvram get extendno 2>/dev/null)"
+    echo "model            : $(nv get productid 2>/dev/null) (odm $(nv get odmpid 2>/dev/null))"
+    echo "firmware         : $(nv get firmver 2>/dev/null).$(nv get buildno 2>/dev/null)_$(nv get extendno 2>/dev/null)"
     echo "uptime/load      : $(uptime 2>/dev/null || cat /proc/loadavg 2>/dev/null)"
-    echo "native WireGuard : $(nvram show 2>/dev/null | grep -E '^(wgs|wgc[0-9]*)_enable=' | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+    echo "native WireGuard : $(nv show 2>/dev/null | grep -E '^(wgs|wgc[0-9]*)_enable=' | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
     echo "disk (jffs/opt/tmp):"; df -h /jffs /opt /tmp 2>/dev/null | sed 's/^/  /'
     echo "--- generated config ($CONF, secrets redacted) ---"
     if [ -f "$CONF" ]; then redact_secrets < "$CONF" | sed 's/^/  /'; else echo "  (no config generated yet)"; fi
@@ -5165,13 +5287,13 @@ do_stop(){
     # On a deliberate user stop/uninstall, also drop the self-heal watchdog so the VPN stays
     # down. Auto-rollbacks (health-check, deadman) call do_stop withOUT "user", so the
     # watchdog survives and can still recover the tunnel on its own.
-    [ "$user_stop" = "user" ] && cru d awg_watchdog 2>/dev/null
+    [ "$user_stop" = "user" ] && awg_cru d awg_watchdog 2>/dev/null
     # A deliberate stop also resets the profile-failover state: the next manual start should
     # come up on the user's chosen primary, not a leftover auto-switched slot.
     [ "$user_stop" = "user" ] && rm -f "$PF_OVERRIDE" "$FAILOVER_STATE" 2>/dev/null
     # Drop the background status-refresh cron in lockstep with the watchdog (same 'user' guard),
     # so a deliberate stop/uninstall leaves no orphaned cron; auto-rollbacks keep both.
-    [ "$user_stop" = "user" ] && cru d awg_status 2>/dev/null
+    [ "$user_stop" = "user" ] && awg_cru d awg_status 2>/dev/null
 
     ip route flush table $RT_TABLE 2>/dev/null
     local endpoint
@@ -5675,7 +5797,7 @@ EOF
 
     # Firmware UI language (preferred_lang nvram) so the page/widget can localize without a
     # round-trip. The frontend maps RU -> Russian, everything else -> English. Empty -> EN.
-    local pref_lang=$(nvram get preferred_lang 2>/dev/null)
+    local pref_lang=$(nv get preferred_lang 2>/dev/null)
     [ -z "$pref_lang" ] && pref_lang="EN"
 
     # Write atomically (temp + rename) so the UI never reads a half-written file. The temp is
@@ -5950,7 +6072,7 @@ do_analyze_stop(){
 
 do_install_page(){
     source /usr/sbin/helper.sh
-    nvram get rc_support | grep -q am_addons || { log_msg "ERROR: Addons not supported"; return 1; }
+    nv get rc_support | grep -q am_addons || { log_msg "ERROR: Addons not supported"; return 1; }
 
     mkdir -p "$ADDON_DIR"
     [ "$(readlink -f "$0")" != "$(readlink -f "$ADDON_DIR/amneziawg.sh")" ] && cp "$0" "$ADDON_DIR/amneziawg.sh"
@@ -6422,15 +6544,19 @@ do_watchdog(){
         local _lp
         _lp=$(cat "$LOCKDIR/pid" 2>/dev/null)
         if [ -n "$_lp" ] && kill -0 "$_lp" 2>/dev/null; then
-            return 0   # genuinely busy
+            # Alive: busy — unless it has been "busy" longer than any operation can run, in
+            # which case it is wedged (a firmware nvram call that never returned) and the
+            # rules it tore down before parking are exactly what this tick must now heal.
+            reclaim_wedged_lock "$_lp" "WATCHDOG" || return 0   # genuinely busy
+        else
+            if [ -z "$_lp" ]; then
+                # No pid file — either mid-acquire (mkdir happened a moment ago) or a crash in
+                # that window. Only treat as stale once the dir is demonstrably old.
+                [ -n "$(find "$LOCKDIR" -maxdepth 0 -mmin +5 2>/dev/null)" ] || return 0
+            fi
+            log_msg "WATCHDOG: stale operation lock (holder ${_lp:-unknown} is gone) — reclaiming"
+            rm -rf "$LOCKDIR"
         fi
-        if [ -z "$_lp" ]; then
-            # No pid file — either mid-acquire (mkdir happened a moment ago) or a crash in that
-            # window. Only treat as stale once the dir is demonstrably old.
-            [ -n "$(find "$LOCKDIR" -maxdepth 0 -mmin +5 2>/dev/null)" ] || return 0
-        fi
-        log_msg "WATCHDOG: stale operation lock (holder ${_lp:-unknown} is gone) — reclaiming"
-        rm -rf "$LOCKDIR"
     fi
 
     # DNS-interception coexistence reconcile (only while the tunnel is up). Our one-shot
@@ -7289,7 +7415,7 @@ case "$1" in
     ensure_geo)     ensure_geo ;;
     analyze_start)  do_analyze_start ;;
     analyze_stop)   do_analyze_stop ;;
-    ctf_status)     ctf_active && echo "CTF active (ctf_disable=$(nvram get ctf_disable 2>/dev/null))" || echo "CTF not active" ;;
+    ctf_status)     ctf_active && echo "CTF active (ctf_disable=$(nv get ctf_disable 2>/dev/null))" || echo "CTF not active" ;;
     ctf_disable)    do_ctf_disable ;;
     profile)
         case "$2" in
