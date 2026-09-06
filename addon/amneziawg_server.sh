@@ -601,7 +601,7 @@ srv_any_policy_peer(){
 do_srv_start(){
     [ -f /tmp/.awg_no_autostart ] && { log_msg "Server start blocked: update in progress"; return 0; }
 
-    if is_running; then
+    if is_running && [ ! -f "${LOCKDIR}.stopped" ]; then
         log_msg "Server already running"
         srv_update_status
         return 0
@@ -624,6 +624,10 @@ do_srv_start(){
     fi
 
     acquire_lock || { log_msg "Cannot acquire server lock, aborting start"; srv_update_status; return 1; }
+    if [ "${AWG_WATCHDOG:-0}" = 1 ] && [ -f "${LOCKDIR}.stopped" ]; then
+        release_lock; return 0
+    fi
+    rm -f "${LOCKDIR}.stopped"
     if is_running; then
         log_msg "Server already running (a concurrent start finished first)"
         release_lock
@@ -755,14 +759,21 @@ do_srv_start(){
 do_srv_stop(){
     local user_stop="$1"
     acquire_lock || { log_msg "Cannot acquire server lock, aborting stop"; return 1; }
+    if [ "$user_stop" = user ]; then
+        touch "${LOCKDIR}.stopped" || { release_lock; return 1; }
+    fi
     rm -f "$STARTING_FLAG"
     touch "$STOPPING_FLAG"
     srv_update_status
 
     srv_cleanup_firewall
 
-    [ "$user_stop" = "user" ] && awg_cru d awgs_watchdog 2>/dev/null
-    [ "$user_stop" = "user" ] && awg_cru d awgs_status 2>/dev/null
+    if [ "$user_stop" = "user" ]; then
+        awg_cru d awgs_watchdog 2>/dev/null || log_msg "WARNING: server watchdog cron removal failed — deliberate-stop flag keeps recovery disabled until Start/reboot"
+    fi
+    if [ "$user_stop" = "user" ]; then
+        awg_cru d awgs_status 2>/dev/null || log_msg "WARNING: server status cron removal failed — a read-only status job may remain scheduled"
+    fi
 
     local pid
     pid=$(pidof awgs-go 2>/dev/null)
@@ -894,6 +905,8 @@ do_srv_apply(){
 # =============================================================
 
 do_srv_watchdog(){
+    local AWG_WATCHDOG=1
+    [ -f "${LOCKDIR}.stopped" ] && return 0
     date '+%Y-%m-%d %H:%M:%S' > /tmp/.awgs_wd_beat 2>/dev/null
 
     # Stand down during a package update (same shared flag + staleness rule as the client;
@@ -903,22 +916,7 @@ do_srv_watchdog(){
         rm -f /tmp/.awg_no_autostart
     fi
 
-    # Busy/stale lock handling (alive holder -> busy, unless it has been "busy" longer than
-    # any server operation can run — then it is wedged and reclaimed like the client's lock;
-    # dead holder -> reclaim).
-    if [ -d "$LOCKDIR" ]; then
-        local _lp
-        _lp=$(cat "$LOCKDIR/pid" 2>/dev/null)
-        if [ -n "$_lp" ] && kill -0 "$_lp" 2>/dev/null; then
-            reclaim_wedged_lock "$_lp" "WATCHDOG" || return 0
-        else
-            if [ -z "$_lp" ]; then
-                [ -n "$(find "$LOCKDIR" -maxdepth 0 -mmin +5 2>/dev/null)" ] || return 0
-            fi
-            log_msg "WATCHDOG: stale server lock (holder ${_lp:-unknown} is gone) — reclaiming"
-            rm -rf "$LOCKDIR"
-        fi
-    fi
+    operation_lock_busy && return 0
 
     if ! iface_exists "$IFACE" || ! pidof awgs-go >/dev/null 2>&1; then
         log_msg "WATCHDOG: server down ($IFACE missing or awgs-go dead), restarting"
