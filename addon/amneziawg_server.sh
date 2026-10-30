@@ -47,6 +47,8 @@ DIAG_FILE="/www/user/awgs_diag.htm"
 LOCKDIR="/tmp/.awgs_lock"
 DAEMON_LOG="/tmp/awgs_daemon.log"
 DAEMON_RC="/tmp/awgs_daemon.rc"
+DAEMON_TUNE="/tmp/awgs_daemon.tune"
+DAEMON_CRASH="/tmp/awgs_daemon.crash"
 STARTING_FLAG="/tmp/.awgs_starting"
 STOPPING_FLAG="/tmp/.awgs_stopping"
 # The server daemon runs under its OWN process name (hardlink to the same binary): the
@@ -246,7 +248,8 @@ srv_generate_config(){
         _ic=$((_ic + 1))
     done
     if [ -n "$initdata" ]; then
-        decoded=$(echo "$initdata" | base64 -d 2>/dev/null)
+        b64d_init
+        decoded=$(echo "$initdata" | b64d)   # the client lib's fallback chain (no base64 on stock Merlin)
         i1=$(echo "$decoded" | awk '/^I1 /{sub(/^[^=]+=[ ]?/,"");print;exit}')
         i2=$(echo "$decoded" | awk '/^I2 /{sub(/^[^=]+=[ ]?/,"");print;exit}')
         i3=$(echo "$decoded" | awk '/^I3 /{sub(/^[^=]+=[ ]?/,"");print;exit}')
@@ -302,7 +305,10 @@ srv_generate_config(){
     # RandomTrailers is SYMMETRIC: with it on, the server only ACCEPTS trailered handshakes
     # and always SENDS trailered ones — so every peer must carry `RandomTrailers = on` too
     # (the page writes it into each generated peer config/QR) and needs an AmneziaWG 3.1+
-    # client app. DisableCookies is local: the server just never sends cookie replies.
+    # client app. DisableCookies is local (never mirrored to peers): the server sends no cookie
+    # replies and, since daemon v3.1.20260828 (b5928ef), also skips the whole under-load
+    # MAC2/rate-limit path — handshakes are no longer dropped under load, but there is no
+    # handshake-flood defence at all (see HINT_AWG31_DC_SRV).
     local rt dc awg31=0
     rt=$(get_setting awgs_rt)
     dc=$(get_setting awgs_dc)
@@ -625,7 +631,8 @@ do_srv_start(){
 
     acquire_lock || { log_msg "Cannot acquire server lock, aborting start"; srv_update_status; return 1; }
     if [ "${AWG_WATCHDOG:-0}" = 1 ] && [ -f "${LOCKDIR}.stopped" ]; then
-        release_lock; return 0
+        release_lock
+        return 0
     fi
     rm -f "${LOCKDIR}.stopped"
     if is_running; then
@@ -770,8 +777,6 @@ do_srv_stop(){
 
     if [ "$user_stop" = "user" ]; then
         awg_cru d awgs_watchdog 2>/dev/null || log_msg "WARNING: server watchdog cron removal failed — deliberate-stop flag keeps recovery disabled until Start/reboot"
-    fi
-    if [ "$user_stop" = "user" ]; then
         awg_cru d awgs_status 2>/dev/null || log_msg "WARNING: server status cron removal failed — a read-only status job may remain scheduled"
     fi
 
@@ -906,17 +911,27 @@ do_srv_apply(){
 
 do_srv_watchdog(){
     local AWG_WATCHDOG=1
-    [ -f "${LOCKDIR}.stopped" ] && return 0
     date '+%Y-%m-%d %H:%M:%S' > /tmp/.awgs_wd_beat 2>/dev/null
 
     # Stand down during a package update (same shared flag + staleness rule as the client;
     # the 15-min reclaim keeps a died updater from disabling self-heal forever).
     if [ -f /tmp/.awg_no_autostart ]; then
-        [ -z "$(find /tmp/.awg_no_autostart -mmin +15 2>/dev/null)" ] && return 0
+        file_older_than /tmp/.awg_no_autostart 900 || return 0
         rm -f /tmp/.awg_no_autostart
     fi
 
-    operation_lock_busy && return 0
+    # The shared dnsmasq-reload job (server start/stop reload peer DNS through it) is normally
+    # watched by the CLIENT watchdog; on a box whose client tunnel is not running (never started,
+    # or user-stopped — which drops that cron) nothing else would ever reap a wedged one.
+    # Read the crontab spool directly, NOT `cru l`: Merlin's cru starts with an unguarded
+    # `nvram get http_username` — a */5 periodic nvram read (the 1.5.10 wedge rule).
+    if [ -d /tmp/.awg_dnsreload ] && ! grep -qs '#awg_watchdog#' /var/spool/cron/crontabs/* 2>/dev/null; then
+        reap_stale_dnsreload
+    fi
+
+    [ -f "${LOCKDIR}.stopped" ] && return 0
+
+    operation_lock_busy WATCHDOG && return 0
 
     if ! iface_exists "$IFACE" || ! pidof awgs-go >/dev/null 2>&1; then
         log_msg "WATCHDOG: server down ($IFACE missing or awgs-go dead), restarting"
@@ -1037,7 +1052,10 @@ srv_update_status(){
     [ "$xray_capture" = "true" ] && ! srv_xray_covers_peers && xray_uncov=true
 
     rm -f "${STATUS_FILE}.tmp" "${STATUS_FILE}".[0-9]* 2>/dev/null
-    cat > "${STATUS_FILE}.$$" << STATUSEOF
+    # '<' leaves as its JSON unicode escape, like the client's status: this .htm goes through the
+    # firmware's ASP evaluator and carries user text (peer names, syslog), where a stray
+    # tag opener would livelock httpd.
+    sed 's/</\\u003c/g' > "${STATUS_FILE}.$$" << STATUSEOF
 {"running":${running},"starting":${starting},"stopping":${stopping},"version":"${AWG_VERSION}","lang":"${pref_lang}","port":"${port}","subnet":"${subnet}","router_ip":"${router_ip}","public_key":"${pubkey}","endpoint_hint":"${ep_hint}","wan_private":$([ "$wan_priv" = "1" ] && echo true || echo false),"port_conflict":$([ "$port_conf" = "1" ] && echo true || echo false),"nat_lan":${nat_lan},"autostart":${autostart},"awg3":$(awg3_supported && echo true || echo false),"awg31":$(awg31_supported && echo true || echo false),"client_running":${client_running},"xray_capture":${xray_capture},"xray_ctl":${xray_ctl},"xray_peers_uncovered":${xray_uncov},"peers":${peers_json},"log":"${log_text}"}
 STATUSEOF
     mv "${STATUS_FILE}.$$" "$STATUS_FILE" 2>/dev/null
@@ -1064,6 +1082,21 @@ do_srv_diag(){
     echo "  interface=$IFACE in effective conf: $(grep -c "^interface=$IFACE" /etc/dnsmasq.conf 2>/dev/null)"
     echo "--- watchdog beat ---"
     echo "  $(cat /tmp/.awgs_wd_beat 2>/dev/null || echo never)"
+    [ -f "${LOCKDIR}.stopped" ] && echo "  deliberate Stop: watchdog recovery disabled until Start/reboot"
+    if [ -d "$LOCKDIR" ]; then
+        _lp=$(cat "$LOCKDIR/pid" 2>/dev/null)
+        _lh=$(lock_age_s "$_lp")
+        _lb=""
+        [ -n "$_lh" ] && [ "$_lh" -gt "$LOCK_STALE_S" ] && which flock >/dev/null 2>&1 &&
+            _lb=" — WEDGED (>${LOCK_STALE_S}s; reclaimed by the next watchdog tick / acquire_lock)"
+        if [ -z "$_lp" ]; then
+            echo "  $LOCKDIR without pid (mid-acquire, or reclaimed once older than 300s)"
+        elif kill -0 "$_lp" 2>/dev/null; then
+            echo "  $LOCKDIR held by pid $_lp (alive${_lh:+, lock held ${_lh}s})$_lb"
+        else
+            echo "  $LOCKDIR held by pid $_lp (dead — reclaimed by the next watchdog tick)"
+        fi
+    fi
     echo "--- daemon log tail ---"
     tail -n 15 $DAEMON_LOG 2>/dev/null | sed 's/^/  /'
     echo "  last daemon exit: $(cat $DAEMON_RC 2>/dev/null || echo '(none — running or never exited)')"
@@ -1091,12 +1124,23 @@ do_srv_service_event(){
             do_srv_apply
             ;;
         awgsrvdiag)
-            do_srv_diag > "$DIAG_FILE" 2>&1
+            # Filtered as a stream at this, its one web-served writer (see the client's awgdiag):
+            # an ASP-tag opener in a /www/user .htm livelocks httpd.
+            do_srv_diag 2>&1 | sed 's/<\([%#]\)/< \1/g' > "$DIAG_FILE"
             echo "[DIAG_DONE]" >> "$DIAG_FILE"
             ;;
         awgsrvstatus)  srv_update_status ;;
     esac
 }
+
+# Whitespace in a stored peer name cuts the WHOLE peer store on the pages' settings read-back,
+# and a chunk a pre-1.5.26 page sized by characters reads back cut — rescue both (shared helper,
+# see migrate_server_peers; a one-awk no-op once clean). The same pass also encodes raw spaced
+# CLIENT profile names (migrate_profile_names): this page POSTs every awg_* key as the read-back
+# cut it, so a server-only box would otherwise lose the tails on its first server save. The client
+# dispatch runs it too, but a box serving peers with the client tunnel never started only gets
+# THIS script's crons.
+migrate_server_peers
 
 case "$1" in
     start)            do_srv_start ;;

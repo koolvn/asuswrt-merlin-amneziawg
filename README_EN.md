@@ -11,7 +11,7 @@ A DPI-bypassing VPN **client and server** based on [AmneziaWG](https://github.co
 
 Fully userspace implementation -- no kernel module required, works on any kernel version.
 
-**Protocol: AmneziaWG 3.0** (daemon `amneziawg-go v3.0.3`, since addon 1.5.9; first shipped in 1.5.0). All 1.5/2.0 obfuscation params are supported (`Jc/Jmin/Jmax`, `S1-S4`, `H1-H4`, `I1-I5`) plus the new 3.0 ones: `HeaderProtectionKey` (packet-header encryption with a shared key), `ContentPaddingAddition` and the configurable timings `RekeyAfterTime` / `RekeyTimeout` / `RejectAfterTime` / `KeepaliveTimeout` / `MaxHandshakeAttempts`. Range params accept either a single number or `lo-hi`; so does `PersistentKeepalive`. Existing 2.0 configs keep working unchanged. Works on every supported architecture, the `armv7-2.6` package for old ARM32 routers on 2.6.3x kernels included — verified on a real RT-AC66U_B1 (kernel 2.6.36.4).
+**Protocol: AmneziaWG 3.1** (daemon `amneziawg-go v3.1.20260828` since addon 1.5.25; 3.1 since 1.5.20; 3.0 since 1.5.9, first shipped in 1.5.0). All 1.5/2.0 obfuscation params are supported (`Jc/Jmin/Jmax`, `S1-S4`, `H1-H4`, `I1-I5`), the 3.0 ones: `HeaderProtectionKey` (packet-header encryption with a shared key), `ContentPaddingAddition` and the configurable timings `RekeyAfterTime` / `RekeyTimeout` / `RejectAfterTime` / `KeepaliveTimeout` / `MaxHandshakeAttempts`, — and the new 3.1 ones: `RandomTrailers` (a random tail on handshake packets — size obfuscation; symmetric, must match on both sides) and `DisableCookies` (never send cookie replies — a DPI-visible message). Range params accept either a single number or `lo-hi`; so does `PersistentKeepalive`. Existing 2.0/3.0 configs keep working unchanged. Works on every supported architecture, the `armv7-2.6` package for old ARM32 routers on 2.6.3x kernels included — verified on a real RT-AC66U_B1 (kernel 2.6.36.4).
 
 > **About:** originally a fork of [r0otx/asuswrt-merlin-amneziawg](https://github.com/r0otx/asuswrt-merlin-amneziawg), but the project has changed substantially since forking and is now maintained independently. Thanks to r0otx for the excellent foundation.
 
@@ -85,7 +85,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full changelog (in Russian).
 - **Priority over Xray** -- while XRAYUI runs in "redirect all traffic" mode, devices with a **VPN: all traffic** policy or an include-mode geo policy automatically get priority into the tunnel **ahead of Xray** (an `AWG_PRIO` chain at the top of PREROUTING, since 1.3.12); the rest of the LAN — and an exclude-mode "Direct by lists" geo policy — keeps using Xray, and Xray's own rules are left untouched
 - **Self-healing** -- a post-start health check (ping/TCP/handshake through the tunnel) with auto-rollback of a dead tunnel, a 5-minute watchdog (revives a fallen tunnel, repairs rules after firewall restarts), and a deadman guard against losing the LAN
 - **Conflict warnings** -- on-page banners: co-resident DPI/proxy tools (zapret/b4), Xray/XRAYUI (a two-mode banner with a "Stop Xray" button + a peer-subnet coverage guard), the firmware's own VPN client (wgc/VPN Fusion), hardware CTF acceleration on old Broadcom (one-click "disable & reboot"), a private/CGNAT WAN address and a busy port for the server, domain Geo without DNS interception, a foreign match-all dnsmasq rule
-- **In-app updates** -- one-click check & install of new versions (via jsDelivr when GitHub is blocked), installing a specific version (rollback) and manual `.ipk` upload right from the page; the changelog is shown before updating
+- **In-app updates** -- one-click check & install of new versions (via jsDelivr when GitHub is blocked), installing a specific version (rollback); a local `.ipk` installs over SSH (`S99amneziawg install_ipk`, see «CLI management») — the firmware does not let a page upload a package; the changelog is shown before updating
 - **Diagnostics** -- a page button collects a full report for troubleshooting (platform, binaries, routing, rules, dnsmasq, geo, logs) with keys automatically redacted
 - **MSS clamping** -- automatic TCP MSS fix for tunnel traffic
 - **Auto-update** -- daily cron for geo list refresh
@@ -241,7 +241,7 @@ The router can act not only as a client but also as an **AmneziaWG server**: a d
 A dedicated **VPN > AmneziaWG Server** page (the client part is untouched; both roles can stay enabled at the same time):
 
 - **Setup** — **Generate** the server key pair, port (default `51821`, so it doesn't collide with the firmware's built-in WG server), tunnel subnet (default `10.9.0.0/24`), MTU. Obfuscation parameters (`Jc/Jmin/Jmax/S1/S2/H1-H4`, a "Generate random" button) + advanced `I1-I5` signature packets for AWG 2.x (also with a "Generate" button — a unique random signature that camouflages the flow; embedded into every peer config).
-- **Peers** — a device table: name, auto-assigned IP, on/off, **routing policy** (`Direct` / `VPN: all traffic` / any geo policy), **tunnel scope** (all traffic or home network only). Key pairs and PSKs are generated **right in the browser** (Curve25519) — peer private keys never reach the backend.
+- **Peers** — a device table: name, auto-assigned IP, on/off, **routing policy** (`Direct` / `VPN: all traffic` / any geo policy), **tunnel scope** (all traffic or home network only). Curve25519 key pairs and PSKs are generated **right in the browser**. Clicking **Apply** saves peer private keys and PSKs on the router in `/jffs/addons/custom_settings.txt`, so QR codes can be shown and configs downloaded again. The trust model assumes the router administrator has access to these keys.
 - **Config hand-out** — per peer: a **QR code** (own generator, no external CDNs; scanned by the AmneziaWG app), `.conf` download, copy to clipboard.
 - **Per-peer policy (double hop)** — a peer can get the same policy as a LAN device: with `VPN: all traffic` the peer's traffic exits through the **client** tunnel (phone → home → external VPN). Runs on top of the same policy engine. The rules live and die with the client tunnel's firewall: while the client tunnel is down, peer traffic goes straight to the WAN (fail-open; a yellow banner warns about it).
 - **DNS for peers** — the router's dnsmasq by default (home device names and domain Geo work), or custom servers.
@@ -268,14 +268,15 @@ CLI: `/opt/etc/init.d/S99amneziawg server {start|stop|status|restart|diag}`. Aut
 ### Building amneziawg-go (the userspace daemon)
 
 > **The daemon is built from our fork [`william-aqn/amneziawg-go`](https://github.com/william-aqn/amneziawg-go), not from upstream.** The reason is two router-critical fixes not yet accepted upstream (while the PRs are pending, the build comes from the fork):
-> - **[PR #152](https://github.com/amnezia-vpn/amneziawg-go/pull/152)** — a bounded buffer pool (`PreallocatedBuffersPerPool`) adjustable via the `WG_PREALLOCATED_BUFFERS_PER_POOL` environment variable: the cure for `runtime: out of memory` under load. The build default is 1024 and the cap deliberately applies on **all** routers: it is flow control — without it a slow egress leg balloons the daemon's heap into an OOM even on 2GB boxes (field case, 1.3.13→1.3.14). The variable remains for manual experiments;
-> - **[PR #153](https://github.com/amnezia-vpn/amneziawg-go/pull/153)** — a `sendmmsg`/`recvmmsg` → per-packet `sendmsg`/`recvmsg` fallback on `ENOSYS`: without it, on Linux kernels < 3.0 (RT-AC68U / 2.6.36) the daemon cannot send a single packet and the tunnel passes no traffic;
-> - **[PR #161](https://github.com/amnezia-vpn/amneziawg-go/pull/161)** — S4-padded keepalive classification: an AmneziaWG 3.0 regression against 1.5/2.0 configs — with `S4 > 0` every keepalive counted as data and re-handshaked an idle tunnel roughly every 15 seconds.
+> - **[PR #152](https://github.com/amnezia-vpn/amneziawg-go/pull/152)** — a bounded buffer pool (`PreallocatedBuffersPerPool`) adjustable via the `WG_PREALLOCATED_BUFFERS_PER_POOL` environment variable: the cure for `runtime: out of memory` under load. The build default is 1024 and the cap deliberately applies on **all** routers: it is flow control — without it a slow egress leg balloons the daemon's heap into an OOM even on 2GB boxes (field case, 1.3.13→1.3.14). The addon never raises it; since 1.5.22 it lowers it on memory-constrained boxes (512–1024, scaled from GOMEMLIMIT); `0` (unbounded) is for manual experiments only;
+> - **[PR #153](https://github.com/amnezia-vpn/amneziawg-go/pull/153)** — a `sendmmsg`/`recvmmsg` → per-packet `sendmsg`/`recvmsg` fallback on `ENOSYS`: without it, on Linux kernels < 3.0 (RT-AC68U / 2.6.36) the daemon cannot send a single packet and the tunnel passes no traffic.
 >
-> The fork branch **`router-build-v3`** = the `v3.0.3` tag (AmneziaWG 3.0) + four patches as separate commits; **every** package is built from it, but since 1.5.9 the legacy `armv7-2.6` package has **its own pins** (`AWG_GO_*_LEGACY`) so the Go downgrade lives only in its build step. The `router-build` branch (tag `v0.2.19`) is the parked AmneziaWG 2.0 fallback. **Once the PRs are merged upstream**, the build returns to `amnezia-vpn/amneziawg-go` — a two-line change (`AWG_GO_REPO`/`AWG_GO_REF`) in `.github/workflows/release.yml`.
+> The fork's former third patch — S4-padded keepalive classification (our [PR #161](https://github.com/amnezia-vpn/amneziawg-go/pull/161): with `S4 > 0` every keepalive counted as data and re-handshaked an idle tunnel roughly every 15 seconds) — **was fixed by upstream itself** in `v3.0.20260805` (an `isKeepalive` flag), so the 3.1 branch no longer carries our version.
+>
+> The fork branch **`router-build-v31`** = the `v3.1.20260828` tag (AmneziaWG 3.1; never `.12`/`.13` — a typo in `SendHandshakeCookie` there panics the daemon when `RandomTrailers` is on) + three patches as separate commits. The build takes its snapshot tag `router-build-v31-<addon version that first shipped it>` (the branch is rewritten on every upstream bump; the tag keeps each release's build reproducible) and checks that it really sits on `AWG_GO_TAG`; **every** package is built from it, but since 1.5.9 the legacy `armv7-2.6` package has **its own pins** (`AWG_GO_*_LEGACY`) so the Go downgrade lives only in its build step. The `router-build-v3` (tag `v3.0.3`, AmneziaWG 3.0) and `router-build` (tag `v0.2.19`, AmneziaWG 2.0) branches are parked fallbacks. **Once the PRs are merged upstream**, the build returns to `amnezia-vpn/amneziawg-go` — in `.github/workflows/release.yml` point `AWG_GO_REPO` at upstream and set both `AWG_GO_TAG` and `AWG_GO_REF` to the upstream release tag that contains the fixes (the base check requires the ref to sit exactly on `AWG_GO_TAG`); same for the `AWG_GO_*_LEGACY` pins, and drop the fork-patch asserts.
 
 ```shell
-git clone --depth 1 --branch router-build-v3 https://github.com/william-aqn/amneziawg-go.git
+git clone --depth 1 --branch router-build-v31-1.5.25 https://github.com/william-aqn/amneziawg-go.git
 cd amneziawg-go
 
 # ARM64 (aarch64-3.10) — GT-AX11000, RT-AX86U, RT-AX88U
@@ -294,7 +295,7 @@ GOTOOLCHAIN=go1.23.12 CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=5 \
   go build -ldflags="-s -w" -o ../output/amneziawg-go-arm5
 ```
 
-The canonical commands (including the version patch so `--version` reports `v3.0.3-awg3-legacy26-poolcfg-smfix`, and the hard asserts that both patches are present) live in `.github/workflows/release.yml`, step "Build amneziawg-go-arm5 (legacy Go 1.23…)".
+The canonical commands (including the version patch so `--version` reports `v3.1.20260828-awg3-awg31-legacy26-poolcfg-smfix`, and the hard asserts that every patch is present) live in `.github/workflows/release.yml`, step "Build amneziawg-go-arm5 (legacy Go 1.23…)".
 
 ### Building the awg CLI (static musl)
 
@@ -333,6 +334,9 @@ Output:
 
 # Install a specific version (e.g. rollback or a fix)
 /opt/etc/init.d/S99amneziawg update 1.1.50
+
+# Install a local .ipk (copy it to /tmp first: WinSCP with protocol SCP, or scp -O)
+/opt/etc/init.d/S99amneziawg install_ipk /tmp/amneziawg_1.5.26-1_aarch64-3.10.ipk
 
 # Tunnel status (the client awg0 and/or the server awgs0)
 awg show
@@ -396,7 +400,7 @@ Phone/laptop (peer) --> WAN UDP:51821 --> awgs0 (server) --> br0 (home network)
 | **amneziawg_server.sh** | Server backend: peers, inbound firewall, peer DNS, per-peer policy (reuses `amneziawg.sh` helpers) |
 | **amneziawg_page.asp** | Client web UI (**VPN > AmneziaWG**) |
 | **amneziawg_server_page.asp** | Server web UI (**VPN > AmneziaWG Server**) |
-| **awg_qr.js** | QR code and Curve25519 key generation right in the browser (no external CDNs; peer private keys never leave the page) |
+| **awg_qr.js** | QR code and Curve25519 key generation right in the browser (no external CDNs; keys are saved on the router on Apply for repeated config export) |
 | **amneziawg_widget.js** | The global header widget: an ● AWG status indicator on every firmware page + a mini start/stop panel (served as `/www/user/awg_widget.js`, loaded via `menuTree.js`) |
 
 ## FAQ
@@ -419,7 +423,7 @@ A: Add CIDR ranges to the "Own IPs / subnets" field (GeoCustom), e.g. `149.154.1
 
 **Q: Is ARM32 (RT-AC68U) supported?**
 
-A: Yes, there is a dedicated ARM32 `.ipk` (`armv7-2.6`). Since **1.2.32** the daemon in this package is built with a special legacy toolchain (Go 1.23) — regular Go ≥ 1.24 builds don't support these routers' 2.6.36 kernel and died silently with `ERROR: amneziawg-go failed to create interface`. To check you have the right build: `/opt/amneziawg/amneziawg-go --version` must report `v3.0.3-awg3-legacy26-poolcfg-smfix (…)` (the daemon is built from [the fork](https://github.com/william-aqn/amneziawg-go) with two fixes — see "Building amneziawg-go"; the `-smfix` suffix = the `sendmmsg` fix, without which a 2.6.36 tunnel passes no traffic).
+A: Yes, there is a dedicated ARM32 `.ipk` (`armv7-2.6`). Since **1.2.32** the daemon in this package is built with a special legacy toolchain (Go 1.23) — regular Go ≥ 1.24 builds don't support these routers' 2.6.36 kernel and died silently with `ERROR: amneziawg-go failed to create interface`. To check you have the right build: `/opt/amneziawg/amneziawg-go --version` must report `v3.1.20260828-awg3-awg31-legacy26-poolcfg-smfix (…)` (the daemon is built from [the fork](https://github.com/william-aqn/amneziawg-go) with router fixes — see "Building amneziawg-go"; the `-smfix` suffix = the `sendmmsg` fix, without which a 2.6.36 tunnel passes no traffic).
 
 **Q: The tunnel stops by itself a minute or two after starting (or "runs 2 minutes → drop → reconnect")?**
 

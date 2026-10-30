@@ -382,6 +382,24 @@ textarea.awg-geo-ta {
 </style>
 <script>
 var custom_settings = <% get_custom_settings(); %>;
+// Save-pipeline BASE (1.5.26, see awgSave): the store exactly as the firmware's reader showed it to
+// this page, captured BEFORE any mutation below (the awg_ipk_ sweep, the legacy-key carry-forward,
+// the orphan-meta sweep). A save compares the LIVE store against it — a page-owned key that differs
+// was changed elsewhere since load (another tab, the AWG server page, the CLI) and the save is
+// refused instead of reverting it; after a save it advances only to what THIS page wrote.
+var awgCsBase = (function(){
+    var b = {};
+    for(var k in custom_settings){ if(custom_settings.hasOwnProperty(k)) b[k] = custom_settings[k]; }
+    return b;
+})();
+// Set when another writer stored the settings at the same moment as one of our saves (result
+// 'unknown') or a verified save read back different page-owned values: the base can no longer be
+// trusted, so every later normal save is a conflict until the page is reloaded.
+var awgCsStale = false;
+// One-shot keys of the retired browser .ipk upload (1.1.52-1.5.23): never meant to persist, and
+// every byte left in the store counts against the firmware's shared 8 KB cap — drop any leftover
+// so the next save sweeps it out (the page's saves are full-replace).
+(function(){ for(var k in custom_settings){ if(custom_settings.hasOwnProperty(k) && k.indexOf('awg_ipk_') === 0) delete custom_settings[k]; } })();
 var statusTimer = null;
 var statusFails = 0;
 var awgLoaded = false;
@@ -455,38 +473,15 @@ en: {
     MODAL_CHANGELOG_VER: " — v{0}",
     MODAL_LOADING_CHANGELOG: "Loading changelog…",
     MODAL_CHANGELOG_FAILED: "Could not load the changelog.",
-    MSG_CLOSE_DURING_UPLOAD: "An upload/install is in progress. Close the window and stop tracking it?",
     // ---- install actions ----
-    MSG_PICK_IPK: "Choose an .ipk file to install.",
-    MSG_NOT_IPK_CONFIRM: "The file doesn't look like an .ipk. Install anyway?",
     MSG_ENTER_VERSION: "Enter a version as X.Y.Z, e.g. 1.1.49",
     MSG_VERSION_FORMAT: "Version as X.Y.Z, e.g. 1.1.49",
     MSG_VERSION_INSTALLED_REINSTALL: "Version v{0} is already installed. Reinstall?",
     MSG_LATEST_VERSION: "You already have the latest version{0}.",
     MSG_LATEST_VERSION_VER: " (v{0})",
-    BTN_INSTALLING: "Installing…",
     BTN_INSTALL: "Install",
-    MSG_INSTALL_FAILED: "Installation failed: {0}",
-    // ---- upload (manual .ipk) ----
-    UP_READING_FILE: "Reading file…",
-    UP_READ_FAILED: "could not read the file.",
-    UP_FILE_EMPTY: "the file is empty.",
-    UP_SETTINGS_TOO_BIG: "settings are too large to upload a file via the UI.",
-    UP_PROGRESS: "Uploading {0}/{1}…",
-    UP_TRANSFER_FAILED: "transfer failed ",
-    UP_PART: "(part {0}/{1}).",
-    UP_NO_ROUTER_RESPONSE: "no response from the router (part {0}/{1}).",
-    UP_VERIFYING: "Verifying and installing the package…",
-    UP_DONE_RELOADING: "Done! Reloading the page…",
-    UP_INSTALL_FAILED: "installation failed.",
-    // ---- upload error codes (from backend slugs) ----
-    ERR_GENERIC: "Installation failed",
-    ERR_NO_DATA: "No upload data",
-    ERR_DECODE_FAILED: "Decoding error",
-    ERR_SIZE_MISMATCH: "Size mismatch — upload corrupted",
-    ERR_CORRUPT: "File corrupted or not .ipk",
-    ERR_NOT_IPK: "Not an opkg package (.ipk)",
-    ERR_OPKG_FAILED: "opkg install failed",
+    // ---- install from a local file (SSH only since 1.5.24) ----
+    INSTALL_FILE_HELP: "A local <code>.ipk</code> can't be uploaded through this page: the router firmware discards any addon settings save over {1} KB, and a package weighs megabytes. Install it over SSH instead:<br>1. Copy the file to the router's <code>/tmp</code> — WinSCP with file protocol <b>SCP</b>, or<br><code>scp -O amneziawg_*.ipk &lt;login&gt;@{0}:/tmp/</code> (<code>-O</code>: the router has no SFTP — drop it if your scp rejects it; add <code>-P &lt;port&gt;</code> if SSH isn't on 22)<br>2. In an SSH session run<br><code>/opt/etc/init.d/S99amneziawg install_ipk /tmp/amneziawg_X.Y.Z-1_&lt;arch&gt;.ipk</code><br>The package is checked (gzip CRC + .ipk structure) and installed exactly like an update from this page: geo lists are kept, the VPN is stopped for the install — start it again afterwards. If the router can reach GitHub, «Choose version» installs any published version without a file.",
     // ---- apply / restart ----
     MSG_FORCE_RESTART_CONFIRM: "The VPN will be fully restarted (stop → start) — the connection will drop briefly (devices on a VPN policy lose access for a few seconds). Routes and the firewall will also be rebuilt. Continue?",
     BTN_APPLYING: "Applying…",
@@ -618,6 +613,8 @@ en: {
     NOHS_KS: " — and with the <b>kill-switch ON</b>, all VPN-routed traffic is blocked, so those devices have no internet until the handshake succeeds",
     DNSGEO_USER: "⚠ Domain-based geo lists are active ({0} domains in dnsmasq), but <b>DNS interception is off</b> (compatibility mode). Domains feed the routing only for clients that use the router's DNS — devices with DoH/private DNS bypass the VPN, so in practice mostly the IP lists (GeoIP/Antifilter) route. Not running zapret/Xray/b4? Turn compatibility mode off to re-enable interception.",
     DNSGEO_AUTO: "⚠ Domain-based geo lists are active ({1} domains), but DNS interception is <b>disabled automatically because of {0}</b>. Domains populate only for clients that use the router's DNS; IP lists keep working.",
+    MEM_SQUEEZE_NOSWAP: "⚠ <b>The router is short on memory for this tunnel.</b> This firmware uses strict memory accounting (<code>vm.overcommit_memory=2</code>), and so little of that budget is left that the VPN daemon runs at its minimum settings: heap ceiling {0} MiB, packet buffer pool {1} × 64 KB. Under sustained load — video through the tunnel above all — the daemon can run out of memory, crash and be restarted by the watchdog, which looks like «the VPN drops every few minutes». <b>What helps:</b> a <b>swap file on the USB drive</b> (amtm → swap, 1 GB) — under strict accounting swap raises the memory budget one-to-one, and the next tunnel start gets a higher ceiling. Use a healthy drive: if it fails or is unplugged, programs whose memory was moved to swap will crash. Stopping unused addons and Entware services also frees budget, but usually far less.",
+    MEM_SQUEEZE_SWAP: "⚠ <b>The router is short on memory for this tunnel.</b> Even with swap ({2} MiB), strict memory accounting (<code>vm.overcommit_memory=2</code>) leaves so little budget that the VPN daemon runs at its minimum settings: heap ceiling {0} MiB, packet buffer pool {1} × 64 KB. Under sustained load the daemon can run out of memory and be restarted by the watchdog — it looks like «the VPN drops every few minutes». <b>What helps:</b> enlarge the swap file (e.g. to 1 GB), or stop other memory consumers — unused addons and Entware services, and firmware features such as AiProtection, Traffic Analyzer or Adaptive QoS (their background services count against this budget). The next tunnel start picks up the higher ceiling.",
     CONF_PENDING: "⚠ The saved connection config differs from the one the tunnel is <b>currently running</b>. «Apply» updates routing/geo on the fly but never restarts the tunnel — press <b>«Restart»</b> to switch to the new config (keys, endpoint, obfuscation, DNS, MTU).",
     GEO_MATCHALL: "⛔ A rule in your <b>custom dnsmasq config</b> is routing <b>every</b> domain into a geo set, so Geo mode sends <b>all</b> traffic through the VPN (every site shows the VPN IP and geo-restricted services stop working). The offending line:<div style=\"margin:6px 0;\"><code>{0}</code></div>The <code>https://</code> (or a stray <code>//</code>) leaves an empty segment, which dnsmasq treats as “match everything”. Fix it in your custom dnsmasq config (<code>/jffs/configs/dnsmasq.conf.add</code>): keep only the bare domain — e.g. <code>ipset=/example.com/awg_dst</code> — then restart dnsmasq or reboot. AmneziaWG's own generated rules are fine; this is a hand-added line.",
     COEX_FOOTER: "<span style=\"opacity:0.85;\">After the changes, click <b>«Apply»</b>. GeoIP routing by IP keeps working in the meantime.</span>",
@@ -701,11 +698,49 @@ en: {
     HINT_PF_BAR: "The form below edits the highlighted profile; «Apply» saves it. «Switch to» saves everything AND restarts the tunnel on that profile.",
     HINT_PF_FAILOVER: "Auto-switch: if the started tunnel fails the ~60s connectivity check, the next profile is tried in a circle (see the journal). A reboot or a manual switch returns to your chosen profile.",
     MSG_PF_SWITCH_CONFIRM: "Apply settings and switch to profile \"{0}\"? The tunnel will be restarted.",
-    MSG_PF_DELETE_CONFIRM: "Delete profile \"{0}\"? Its saved fields are removed after you press «Apply».",
+    MSG_PF_DELETE_CONFIRM: "Delete profile \"{0}\"? It is deleted right away (the tunnel is not restarted); unsaved profile names and failover checkboxes in this list are saved together with the deletion.",
     MSG_PF_DEL_ACTIVE: "Can't delete the active profile — switch to another one first.",
+    MSG_PF_DEL_PRIMARY: "This is your primary profile, and a backup one is running right now (auto-switch). Switch to another profile first.",
+    MSG_PF_DISCARD_NEW: "Discard the unsaved profile \"{0}\"?",
+    MSG_PF_WAIT_TRANSITION: "Wait until the tunnel finishes connecting or stopping, then try again.",
+    MSG_PF_SWITCH_BUSY: "The router is busy (the tunnel is connecting or stopping, or lists are downloading) — try again in a few seconds.",
+    MSG_PF_SWITCH_EMPTY: "Can't switch to profile \"{0}\": its form below is empty. Fill it in (or import a .conf) or pick another profile; to delete this one, use the ✕ button in its row. Nothing was saved.",
+    MSG_PF_DEL_PENDING_OVER: "The profile is deleted on this page, but the settings still don't fit the firmware's limit: {0} of {1} bytes. Delete another profile or shorten the lists, then press «Apply».",
+    MSG_PF_DEL_PENDING_KEY: "The profile is deleted on this page but not saved yet: one of the fields doesn't fit the firmware's store. Fix it and press «Apply» (reloading the page before that brings the profile back).",
+    LBL_PF_DELETING: "Deleting…",
+    LBL_PF_DELETED: "Profile deleted ✓",
+    HINT_PF_UNSAVED: "Profile changes are not saved — press «Apply»",
+    MSG_SWITCH_SKIPPED: "The router was busy and skipped the profile switch: the profile is saved, but the tunnel was not restarted on it.",
+    BTN_SWITCH_RETRY: "Retry the switch",
+    MSG_SWITCH_FAILED: "The profile switch did not complete — see the journal below for the reason.",
     MSG_PF_UNSAVED: "Profile \"{0}\" has unsaved edits in the form — discard them?",
     MSG_PF_FULL: "All {0} profile slots are in use.",
-    MSG_SETTINGS_TOO_BIG: "Settings are too large to save ({0} KB — the firmware caps one save at ~50 KB): shorten I1-I5 junk data or delete an unused profile.",
+    // ---- settings save pipeline (live-store check + verification, 1.5.26) ----
+    BTN_CHECKING: "Checking…",
+    MSG_WAIT_SAVE: "Please wait — settings are being saved",
+    ACK_SAVED_BUSY: "Saved; the router was busy — the action may not have run, check the journal",
+    MSG_CS_CONFLICT: "The settings changed after this page was loaded (another tab, the AWG server page or SSH). To avoid overwriting those changes, the save was cancelled. Reload the page now? Unsaved edits on this page will be lost.",
+    MSG_ROUTER_BUSY: "The router is not responding (the tunnel is restarting or lists are downloading) — try again in a few seconds.",
+    MSG_SESSION_EXPIRED: "Your router login session has expired — log in again in another tab and retry; the edits on this page are kept.",
+    MSG_SAVE_DISCARDED: "The router did not store the settings (the firmware rejected the save). Reload the page to see the current state.",
+    TAIL_SWITCH: "The switch was not performed.",
+    TAIL_FORCEAPPLY: "The tunnel was restarted with the previous settings.",
+    TAIL_GEO: "The previously saved lists are being downloaded.",
+    TAIL_DELETE: "The profile was not deleted.",
+    TAIL_ANALYZE: "The capture was stopped.",
+    MSG_CS_UNKNOWN: "Another page stored the settings at the same moment as this save — the result is unknown. Reload the page.",
+    MSG_STORE_TRUNCATED: "The router stored the settings only partially (/jffs is probably full). Don't reload the page: free some space and press «Apply» again.",
+    MSG_UPDATE_PIN_LOST: "The router did not store the chosen version (the firmware rejected the save) — it installs the latest release instead.",
+    OVF_BREAKDOWN: "What takes the space (bytes of the saved settings):",
+    OVF_PROFILE: "Profile #{0} «{1}»: {2} bytes (I1–I5: {3} of them)",
+    OVF_GEO: "Geo policy «{0}»: {1} bytes",
+    OVF_CLIENTS: "Device list: {0} bytes",
+    OVF_AWG_OTHER: "Other AmneziaWG settings: {0} bytes",
+    OVF_SERVER: "AWG server (awgs_*): {0} bytes",
+    OVF_OTHER_ADDONS: "Other addons: {0} bytes — can only be freed in their own settings",
+    OVF_LIVE_OVER: "The router's store ALONE is already over the limit ({0} of {1} bytes): no addon page can save anything until it shrinks.",
+    MSG_SETTINGS_TOO_BIG: "Settings don't fit the firmware's store: {0} of {1} bytes. Asuswrt-Merlin does not save a larger set at all (the whole save is discarded), and this budget is shared with every other addon. Shorten I1-I5 junk data, delete an unused profile, or trim the GeoCustom lists.",
+    MSG_SETTING_TOO_LONG: "«{0}» is too long for the firmware's store: {1} of {2} characters (the firmware silently cuts longer values). Shorten it.",
     SEC_CONFIG: "Configuration",
     BTN_IMPORT_CONF_FILE: "Import .conf",
     TITLE_IMPORT_CONF_FILE: "Import a .conf file from the Amnezia VPN client",
@@ -713,7 +748,7 @@ en: {
     TBL_AWG3: "AmneziaWG 3.0 — needs a 3.0-capable peer on the OTHER side too. Leave empty unless the provider's config has them.",
     AWG3_UNSUPPORTED: "AmneziaWG 3.0 parameters are not supported by the installed binaries — the fields below are disabled. Update the addon to a build with AWG 3.0 support.",
     HINT_AWG3_HPK: "Shared key — must be IDENTICAL on the server and every client. Requires S1–S4 ≥ 12 (all four, S3 included).",
-    HINT_AWG3_RANGE: "A single number or a \"lo-hi\" range.",
+    HINT_AWG3_CPA: "A single number or a \"lo-hi\" range: extra bytes per data packet. A padded packet never exceeds the largest one sent since the peer's last reply (500 B minimum), so the biggest packets go unpadded.",
     HINT_AWG3_RAT: "How long a session lives before a rekey. Default 120. Must stay below RejectAfterTime.",
     HINT_AWG3_RTO: "Retry interval for an unanswered handshake. Default 5. Very small values cause a handshake storm.",
     HINT_AWG3_RJT: "A session is dropped after this. Default 180. Below RekeyAfterTime the tunnel dies before it can rekey.",
@@ -722,7 +757,7 @@ en: {
     AWG31_UNSUPPORTED: "AmneziaWG 3.1 parameters (RandomTrailers / DisableCookies) are not supported by the installed binaries — those two fields are disabled.",
     OPT_AWG31_UNSET: "— (default: off)",
     HINT_AWG31_RT: "Random-length tail on handshake packets (size obfuscation). SYMMETRIC: a peer without it drops OUR trailered handshakes — set only what the provider's config says. Needs AmneziaWG 3.1+ on both sides.",
-    HINT_AWG31_DC: "Never send WireGuard cookie replies (a load-protection message DPI can fingerprint). Affects this side only — safe with any peer.",
+    HINT_AWG31_DC: "Never send WireGuard cookie replies (a load-protection message DPI can fingerprint). Affects this side only — safe with any peer. Trade-off: this side loses its handshake-flood protection.",
     UNIT_BYTES: "bytes",
     UNIT_SEC: "sec",
     TBL_ROUTING_POLICY: "Routing policy",
@@ -782,7 +817,7 @@ en: {
     TH_CUSTOM_IPS: "Custom IPs / subnets",
     HINT_CUSTOM_IPS: "Comma- or newline-separated: individual IPs or CIDR subnets.",
     TBL_GEO_CUSTOM: "GeoCustom — your own domains / IPs / files",
-    HINT_GEO_CUSTOM_FORMAT: "One entry per line. A domain (<code>example.com</code>) is routed via DNS; an IP or CIDR subnet (<code>1.2.3.0/24</code>) is added to the ipset. Lines starting with <code>#</code> are comments. A URL must return a plain-text list in this format.",
+    HINT_GEO_CUSTOM_FORMAT: "One entry per line. A domain (<code>example.com</code>) is routed via DNS; an IPv4 address or CIDR subnet (<code>1.2.3.0/24</code>) is added to the ipset (IPv6 is skipped). Text after <code>#</code> is a comment. A URL must return a plain-text list in this format. Files live inside the firmware's settings store, which holds only <b>about 2 KB of text per tab (~150 lines)</b> — put a bigger list online (e.g. a GitHub raw link) and add it as a URL source: those have no size limit.",
     TH_GEO_FILES: "Custom files",
     TH_GEO_URLS: "URL sources",
     TBL_GEO_MODE: "How the lists work",
@@ -799,7 +834,13 @@ en: {
     BTN_REMOVE: "Remove",
     PH_GEO_FILE_NAME: "name (a-z, 0-9)",
     PH_GEO_URL: "https://example.com/list.txt",
-    MSG_GEO_FILES_TOO_BIG: "Custom files are too large to store in settings. Reduce the content or use a URL source for big lists.",
+    MSG_GEO_FILES_TOO_BIG: "«Custom files»{0} on the «{1}» tab take {2} characters once encoded, but the firmware's settings store keeps at most {3} per tab (about 2 KB of text, ~150 CIDR lines) and silently cuts the rest. Shrink the files, or put a big list online (e.g. a GitHub raw link) and add it under «URL sources» — those have no size limit.",
+    GEO_FILES_EXC_SUFFIX: " (exclusions)",
+    GEO_FILE_CUT: "⚠ The firmware cut this file when it was saved (its settings store keeps ~2 KB of text per tab): only the part that survived is shown, the partial last line was dropped, and any files after it were lost. Shrink it, or move the list to a URL source.",
+    GEO_FILE_UNREADABLE: "⚠ The stored content of this file is damaged (cut by the firmware's settings store) and can't be shown. Paste it again (smaller) or delete the row.",
+    MSG_GEO_URL_BAD: "«URL sources» on the «{0}» tab: \"{1}\" is not an http:// or https:// link.",
+    MSG_GEO_URL_IDN: "«URL sources» on the «{0}» tab: \"{1}\" has a non-Latin host name — the router's downloader needs its punycode (xn--…) form. Copy the link from the browser's address bar after opening it, or convert the domain with any IDN converter.",
+    GEO_URLS_CUT: "⚠ The firmware cut this URL list when it was saved (its settings store keeps ~3000 characters per value): the last, partial link was dropped and any links after it were lost. Re-add them.",
     TBL_ANTIFILTER: "Geo Antifilter — RKN lists (antifilter.download)",
     TH_ANTIFILTER_IP: "Antifilter IP lists",
     AF_ALLYOUNEED: " allyouneed — all the needed subnets (~15K) ",
@@ -845,10 +886,9 @@ en: {
     ARIA_INSTALL_MODE: "Install method",
     OPT_INSTALL_AUTO: "Automatic (latest)",
     OPT_INSTALL_VERSION: "Choose version",
-    OPT_INSTALL_FILE: "Manually from file",
+    OPT_INSTALL_FILE: "From a local file (over SSH)",
     PH_VERSION: "e.g. 1.1.49",
     ARIA_VERSION_TO_INSTALL: "Version to install",
-    ARIA_IPK_FILE: ".ipk file to install",
     BTN_CHECK_UPDATES: "Check for updates",
     BTN_CLOSE: "Close",
     MODAL_DIAG_TITLE: "Diagnostic data",
@@ -885,38 +925,15 @@ ru: {
     MODAL_CHANGELOG_VER: " — v{0}",
     MODAL_LOADING_CHANGELOG: "Загрузка списка изменений…",
     MODAL_CHANGELOG_FAILED: "Не удалось загрузить список изменений.",
-    MSG_CLOSE_DURING_UPLOAD: "Идёт загрузка/установка. Закрыть окно и прекратить отслеживание?",
     // ---- install actions ----
-    MSG_PICK_IPK: "Выберите .ipk файл для установки.",
-    MSG_NOT_IPK_CONFIRM: "Файл не похож на .ipk. Всё равно установить?",
     MSG_ENTER_VERSION: "Введите версию в формате X.Y.Z, например 1.1.49",
     MSG_VERSION_FORMAT: "Версия в формате X.Y.Z, например 1.1.49",
     MSG_VERSION_INSTALLED_REINSTALL: "Версия v{0} уже установлена. Переустановить?",
     MSG_LATEST_VERSION: "У вас последняя версия{0}.",
     MSG_LATEST_VERSION_VER: " (v{0})",
-    BTN_INSTALLING: "Установка…",
     BTN_INSTALL: "Установить",
-    MSG_INSTALL_FAILED: "Не удалось установить: {0}",
-    // ---- upload (manual .ipk) ----
-    UP_READING_FILE: "Чтение файла…",
-    UP_READ_FAILED: "не удалось прочитать файл.",
-    UP_FILE_EMPTY: "файл пуст.",
-    UP_SETTINGS_TOO_BIG: "настройки слишком велики для загрузки файла через UI.",
-    UP_PROGRESS: "Загрузка {0}/{1}…",
-    UP_TRANSFER_FAILED: "сбой передачи ",
-    UP_PART: "(часть {0}/{1}).",
-    UP_NO_ROUTER_RESPONSE: "нет ответа роутера (часть {0}/{1}).",
-    UP_VERIFYING: "Проверка и установка пакета…",
-    UP_DONE_RELOADING: "Готово! Перезагрузка страницы…",
-    UP_INSTALL_FAILED: "установка не удалась.",
-    // ---- upload error codes (from backend slugs) ----
-    ERR_GENERIC: "Установка не удалась",
-    ERR_NO_DATA: "Нет данных загрузки",
-    ERR_DECODE_FAILED: "Ошибка декодирования",
-    ERR_SIZE_MISMATCH: "Размер не совпал — загрузка повреждена",
-    ERR_CORRUPT: "Файл повреждён или не .ipk",
-    ERR_NOT_IPK: "Это не пакет opkg (.ipk)",
-    ERR_OPKG_FAILED: "opkg install не удался",
+    // ---- install from a local file (SSH only since 1.5.24) ----
+    INSTALL_FILE_HELP: "Свой <code>.ipk</code> через эту страницу загрузить нельзя: прошивка роутера отбрасывает любое сохранение настроек аддона больше {1} КБ, а пакет весит мегабайты. Поставьте его по SSH:<br>1. Скопируйте файл в <code>/tmp</code> роутера — WinSCP с протоколом <b>SCP</b> или<br><code>scp -O amneziawg_*.ipk &lt;логин&gt;@{0}:/tmp/</code> (<code>-O</code> — SFTP на роутере нет; если scp его не знает, уберите; если SSH не на 22-м порту, добавьте <code>-P &lt;порт&gt;</code>)<br>2. В SSH-сессии выполните<br><code>/opt/etc/init.d/S99amneziawg install_ipk /tmp/amneziawg_X.Y.Z-1_&lt;arch&gt;.ipk</code><br>Пакет проверяется (CRC gzip + структура .ipk) и ставится так же, как обновление с этой страницы: гео-списки сохраняются, VPN на время установки останавливается — потом запустите его снова. Если роутер видит GitHub, «Выбрать версию» поставит любую опубликованную версию без файла.",
     // ---- apply / restart ----
     MSG_FORCE_RESTART_CONFIRM: "VPN будет полностью перезапущен (stop → start) — соединение временно прервётся (устройства с политикой VPN потеряют доступ на несколько секунд). Заодно пересоберутся маршруты и firewall. Продолжить?",
     BTN_APPLYING: "Применение…",
@@ -1048,6 +1065,8 @@ ru: {
     NOHS_KS: " — а с <b>включённым килл-свичом</b> весь VPN-трафик блокируется, поэтому на этих устройствах интернета не будет, пока рукопожатие не пройдёт",
     DNSGEO_USER: "⚠ Выбраны доменные гео-списки ({0} доменов в dnsmasq), но <b>перехват DNS выключен</b> (режим совместимости). Домены наполняют маршрутизацию только у устройств, использующих DNS роутера, — устройства с DoH/приватным DNS пройдут мимо VPN, т.е. фактически работают в основном IP-списки (GeoIP/Antifilter). Если zapret/Xray/b4 не используются — выключите режим совместимости, и перехват включится.",
     DNSGEO_AUTO: "⚠ Выбраны доменные гео-списки ({1} доменов), но перехват DNS <b>отключён автоматически из-за {0}</b>. Домены будут наполняться только у устройств, использующих DNS роутера; IP-списки работают как обычно.",
+    MEM_SQUEEZE_NOSWAP: "⚠ <b>Роутеру не хватает памяти для этого туннеля.</b> Прошивка использует строгий учёт памяти (<code>vm.overcommit_memory=2</code>), и свободного бюджета осталось так мало, что VPN-демон работает на минимальных настройках: потолок памяти {0} МиБ, пул пакетных буферов {1} × 64 КБ. Под нагрузкой — прежде всего при просмотре видео через туннель — демону может не хватить памяти: он падает, и его поднимает watchdog, а со стороны это выглядит как «VPN отваливается каждые несколько минут». <b>Что помогает:</b> <b>файл подкачки на USB-накопителе</b> (amtm → swap, 1 ГБ) — при строгом учёте swap один к одному увеличивает бюджет памяти, и при следующем запуске туннель получит потолок выше. Нужен исправный накопитель: если он откажет или его извлекут, программы, чья память ушла в подкачку, упадут. Отключение неиспользуемых аддонов и служб Entware тоже освобождает бюджет, но обычно намного меньше.",
+    MEM_SQUEEZE_SWAP: "⚠ <b>Роутеру не хватает памяти для этого туннеля.</b> Даже с подкачкой ({2} МиБ) строгий учёт памяти (<code>vm.overcommit_memory=2</code>) оставляет так мало бюджета, что VPN-демон работает на минимальных настройках: потолок памяти {0} МиБ, пул пакетных буферов {1} × 64 КБ. Под нагрузкой демону может не хватить памяти, и его перезапускает watchdog — выглядит это как «VPN отваливается каждые несколько минут». <b>Что помогает:</b> увеличьте файл подкачки (например, до 1 ГБ) или отключите другие потребители памяти — неиспользуемые аддоны и службы Entware, а также функции прошивки вроде AiProtection, анализатора трафика или адаптивного QoS (их фоновые службы расходуют этот же бюджет). Туннель получит потолок выше при следующем запуске.",
     CONF_PENDING: "⚠ Сохранённая конфигурация подключения отличается от той, на которой туннель <b>работает сейчас</b>. «Применить» обновляет маршрутизацию/гео на лету, но туннель не перезапускает — нажмите <b>«Перезапустить»</b>, чтобы перейти на новую конфигурацию (ключи, endpoint, обфускация, DNS, MTU).",
     GEO_MATCHALL: "⛔ Правило в вашем <b>пользовательском конфиге dnsmasq</b> отправляет в гео-набор <b>все</b> домены, поэтому в режиме Гео через VPN уходит <b>весь</b> трафик (на всех сайтах виден IP VPN, гео-сервисы перестают работать). Проблемная строка:<div style=\"margin:6px 0;\"><code>{0}</code></div>Из-за <code>https://</code> (или лишнего <code>//</code>) появляется пустой сегмент, а его dnsmasq трактует как «совпадает со всем». Исправьте в своём конфиге dnsmasq (<code>/jffs/configs/dnsmasq.conf.add</code>): оставьте только домен — например <code>ipset=/example.com/awg_dst</code> — и перезапустите dnsmasq или перезагрузите роутер. Правила, которые генерирует сам AmneziaWG, тут ни при чём — строка добавлена вручную.",
     COEX_FOOTER: "<span style=\"opacity:0.85;\">После изменений нажмите <b>«Применить»</b>. Geo-маршрутизация по IP при этом продолжает работать.</span>",
@@ -1131,11 +1150,49 @@ ru: {
     HINT_PF_BAR: "Форма ниже редактирует подсвеченный профиль; «Применить» сохраняет его. «Переключиться» сохраняет всё И перезапускает туннель на выбранном профиле.",
     HINT_PF_FAILOVER: "Автопереключение: если запущенный туннель не проходит ~60-сек проверку связности, по кругу пробуется следующий профиль (см. журнал). Перезагрузка или ручное переключение возвращают выбранный вами профиль.",
     MSG_PF_SWITCH_CONFIRM: "Применить настройки и переключиться на профиль «{0}»? Туннель будет перезапущен.",
-    MSG_PF_DELETE_CONFIRM: "Удалить профиль «{0}»? Его сохранённые поля будут удалены после «Применить».",
+    MSG_PF_DELETE_CONFIRM: "Удалить профиль «{0}»? Он удаляется сразу (туннель не перезапускается); несохранённые названия профилей и флажки автопереключения в этом списке сохранятся вместе с удалением.",
     MSG_PF_DEL_ACTIVE: "Нельзя удалить активный профиль — сначала переключитесь на другой.",
+    MSG_PF_DEL_PRIMARY: "Это ваш основной профиль, а сейчас работает резервный (автопереключение). Сначала переключитесь на другой профиль.",
+    MSG_PF_DISCARD_NEW: "Убрать несохранённый профиль «{0}»?",
+    MSG_PF_WAIT_TRANSITION: "Дождитесь окончания подключения или остановки туннеля и повторите.",
+    MSG_PF_SWITCH_BUSY: "Роутер занят (идёт подключение или остановка туннеля либо загрузка списков) — повторите через несколько секунд.",
+    MSG_PF_SWITCH_EMPTY: "Нельзя переключиться на профиль «{0}»: его форма ниже пуста. Заполните её (или импортируйте .conf) либо выберите другой профиль; чтобы удалить этот профиль, нажмите ✕ в его строке. Ничего не сохранено.",
+    MSG_PF_DEL_PENDING_OVER: "Профиль удалён на странице, но настройки всё ещё не помещаются в лимит прошивки: {0} из {1} байт. Удалите ещё профиль или сократите списки и нажмите «Применить».",
+    MSG_PF_DEL_PENDING_KEY: "Профиль удалён на странице, но ещё не сохранён: одно из полей не помещается в хранилище прошивки. Исправьте его и нажмите «Применить» (до этого перезагрузка страницы вернёт профиль).",
+    LBL_PF_DELETING: "Удаление…",
+    LBL_PF_DELETED: "Профиль удалён ✓",
+    HINT_PF_UNSAVED: "Изменения профилей не сохранены — нажмите «Применить»",
+    MSG_SWITCH_SKIPPED: "Роутер был занят и пропустил переключение профиля: профиль сохранён, но туннель на нём не перезапущен.",
+    BTN_SWITCH_RETRY: "Повторить переключение",
+    MSG_SWITCH_FAILED: "Переключение профиля не завершилось — причина в журнале ниже.",
     MSG_PF_UNSAVED: "У профиля «{0}» есть несохранённые правки в форме — отбросить их?",
     MSG_PF_FULL: "Все {0} слотов профилей заняты.",
-    MSG_SETTINGS_TOO_BIG: "Настройки слишком велики для сохранения ({0} КБ — прошивка ограничивает одно сохранение ~50 КБ): сократите I1-I5 или удалите неиспользуемый профиль.",
+    // ---- конвейер сохранения настроек (проверка живого хранилища + подтверждение, 1.5.26) ----
+    BTN_CHECKING: "Проверка…",
+    MSG_WAIT_SAVE: "Подождите — идёт сохранение настроек",
+    ACK_SAVED_BUSY: "Сохранено; роутер был занят — действие могло не выполниться, проверьте журнал",
+    MSG_CS_CONFLICT: "Настройки изменились после загрузки этой страницы (другая вкладка, страница сервера AWG или SSH). Чтобы не перезаписать эти изменения, сохранение отменено. Обновить страницу сейчас? Несохранённые правки на этой странице будут потеряны.",
+    MSG_ROUTER_BUSY: "Роутер не отвечает (идёт перезапуск туннеля или загрузка списков) — повторите через несколько секунд",
+    MSG_SESSION_EXPIRED: "Сеанс входа в роутер истёк — войдите в другой вкладке и повторите; правки на этой странице сохранены",
+    MSG_SAVE_DISCARDED: "Роутер не записал настройки (прошивка отклонила сохранение). Обновите страницу, чтобы увидеть текущее состояние.",
+    TAIL_SWITCH: "Переключение не выполнено.",
+    TAIL_FORCEAPPLY: "Туннель перезапущен с прежними настройками.",
+    TAIL_GEO: "Загружаются ранее сохранённые списки.",
+    TAIL_DELETE: "Профиль не удалён.",
+    TAIL_ANALYZE: "Захват остановлен.",
+    MSG_CS_UNKNOWN: "Одновременно с этим сохранением настройки записала другая страница — результат неизвестен. Обновите страницу.",
+    MSG_STORE_TRUNCATED: "Роутер записал настройки не полностью (вероятно, заполнен /jffs). Не перезагружайте страницу: освободите место и нажмите «Применить» ещё раз",
+    MSG_UPDATE_PIN_LOST: "Роутер не записал выбранную версию (прошивка отклонила сохранение) — будет установлена последняя версия.",
+    OVF_BREAKDOWN: "Что занимает место (байты сохраняемых настроек):",
+    OVF_PROFILE: "Профиль #{0} «{1}»: {2} байт (из них I1–I5: {3})",
+    OVF_GEO: "Гео-политика «{0}»: {1} байт",
+    OVF_CLIENTS: "Список устройств: {0} байт",
+    OVF_AWG_OTHER: "Прочие настройки AmneziaWG: {0} байт",
+    OVF_SERVER: "Сервер AWG (awgs_*): {0} байт",
+    OVF_OTHER_ADDONS: "Другие аддоны: {0} байт — можно освободить только в их настройках",
+    OVF_LIVE_OVER: "Хранилище роутера УЖЕ само превышает лимит ({0} из {1} байт): ни одна страница аддонов не сможет сохранить настройки, пока оно не уменьшится.",
+    MSG_SETTINGS_TOO_BIG: "Настройки не помещаются в хранилище прошивки: {0} из {1} байт. Больший набор Asuswrt-Merlin не сохраняет вообще (сохранение отбрасывается целиком), а этот лимит общий для всех аддонов. Сократите I1-I5, удалите неиспользуемый профиль или уменьшите списки GeoCustom.",
+    MSG_SETTING_TOO_LONG: "«{0}» не помещается в хранилище прошивки: {1} из {2} символов (длиннее прошивка молча обрезает). Сократите.",
     SEC_CONFIG: "Конфигурация",
     BTN_IMPORT_CONF_FILE: "Импорт .conf",
     TITLE_IMPORT_CONF_FILE: "Импорт .conf-файла из клиента Amnezia VPN",
@@ -1143,7 +1200,7 @@ ru: {
     TBL_AWG3: "AmneziaWG 3.0 — нужна поддержка 3.0 и на ДРУГОЙ стороне. Оставьте пустым, если их нет в конфиге провайдера.",
     AWG3_UNSUPPORTED: "Параметры AmneziaWG 3.0 не поддерживаются установленными бинарниками — поля ниже отключены. Обновите аддон до сборки с поддержкой AWG 3.0.",
     HINT_AWG3_HPK: "Общий ключ — должен быть ОДИНАКОВЫМ на сервере и на всех клиентах. Требует S1–S4 ≥ 12 (все четыре, включая S3).",
-    HINT_AWG3_RANGE: "Одно число или диапазон «lo-hi».",
+    HINT_AWG3_CPA: "Одно число или диапазон «lo-hi»: добавочные байты к пакету данных. Пакет с добавкой не больше самого крупного, отправленного с последнего ответа пира (минимум 500 Б), поэтому самые крупные пакеты уходят без добавки.",
     HINT_AWG3_RAT: "Через сколько сессия перезаключается. По умолчанию 120. Должно быть меньше RejectAfterTime.",
     HINT_AWG3_RTO: "Интервал повтора неотвеченного хендшейка. По умолчанию 5. Слишком малые значения дают шторм хендшейков.",
     HINT_AWG3_RJT: "После этого времени сессия отбрасывается. По умолчанию 180. Меньше RekeyAfterTime — туннель умрёт, не успев перезаключиться.",
@@ -1152,7 +1209,7 @@ ru: {
     AWG31_UNSUPPORTED: "Параметры AmneziaWG 3.1 (RandomTrailers / DisableCookies) не поддерживаются установленными бинарниками — эти два поля отключены.",
     OPT_AWG31_UNSET: "— (по умолчанию off)",
     HINT_AWG31_RT: "Случайный «хвост» у пакетов рукопожатия (маскировка размера). Симметричный: пир без него отбрасывает НАШИ рукопожатия с хвостом — ставьте только то, что указано в конфиге провайдера. Нужен AmneziaWG 3.1+ с обеих сторон.",
-    HINT_AWG31_DC: "Не отправлять cookie-ответы WireGuard (служебное сообщение защиты от перегрузки, заметное для DPI). Действует только на этой стороне — совместимо с любым пиром.",
+    HINT_AWG31_DC: "Не отправлять cookie-ответы WireGuard (служебное сообщение защиты от перегрузки, заметное для DPI). Действует только на этой стороне — совместимо с любым пиром. Цена: эта сторона теряет защиту от флуда рукопожатиями.",
     UNIT_BYTES: "байт",
     UNIT_SEC: "сек",
     TBL_ROUTING_POLICY: "Политика маршрутизации",
@@ -1212,7 +1269,7 @@ ru: {
     TH_CUSTOM_IPS: "Свои IP / подсети",
     HINT_CUSTOM_IPS: "Через запятую или с новой строки: отдельные IP или подсети CIDR.",
     TBL_GEO_CUSTOM: "GeoCustom — свои домены / IP / файлы",
-    HINT_GEO_CUSTOM_FORMAT: "Один элемент в строке. Домен (<code>example.com</code>) маршрутизируется через DNS; IP или подсеть CIDR (<code>1.2.3.0/24</code>) добавляется в ipset. Строки, начинающиеся с <code>#</code>, — комментарии. Файл по ссылке должен возвращать простой текстовый список в этом формате.",
+    HINT_GEO_CUSTOM_FORMAT: "Один элемент в строке. Домен (<code>example.com</code>) маршрутизируется через DNS; IPv4-адрес или подсеть CIDR (<code>1.2.3.0/24</code>) добавляется в ipset (IPv6 пропускается). Текст после <code>#</code> — комментарий. Файл по ссылке должен возвращать простой текстовый список в этом формате. Свои файлы хранятся в настройках прошивки, а туда помещается лишь <b>около 2 КБ текста на вкладку (~150 строк)</b> — большой список выложите по ссылке (например, raw-ссылка GitHub) и добавьте как URL-источник: у них ограничения размера нет.",
     TH_GEO_FILES: "Свои файлы",
     TH_GEO_URLS: "URL-источники",
     TBL_GEO_MODE: "Как работают списки",
@@ -1229,7 +1286,13 @@ ru: {
     BTN_REMOVE: "Удалить",
     PH_GEO_FILE_NAME: "имя (a-z, 0-9)",
     PH_GEO_URL: "https://example.com/list.txt",
-    MSG_GEO_FILES_TOO_BIG: "Свои файлы слишком большие для хранения в настройках. Уменьшите содержимое или используйте URL-источник для больших списков.",
+    MSG_GEO_FILES_TOO_BIG: "«Свои файлы»{0} на вкладке «{1}» занимают {2} символов в закодированном виде, а хранилище настроек прошивки держит не больше {3} на вкладку (около 2 КБ текста, ~150 строк CIDR) и молча обрезает остальное. Уменьшите файлы или выложите большой список по ссылке (например, raw-ссылка GitHub) и добавьте её в «URL-источники» — у них ограничения размера нет.",
+    GEO_FILES_EXC_SUFFIX: " (исключения)",
+    GEO_FILE_CUT: "⚠ Прошивка обрезала этот файл при сохранении (её хранилище настроек держит ~2 КБ текста на вкладку): показана уцелевшая часть, неполная последняя строка отброшена, файлы после него потеряны. Уменьшите файл или перенесите список в URL-источник.",
+    GEO_FILE_UNREADABLE: "⚠ Сохранённое содержимое файла повреждено (обрезано хранилищем прошивки) и не может быть показано. Вставьте его заново (поменьше) или удалите строку.",
+    MSG_GEO_URL_BAD: "«URL-источники» на вкладке «{0}»: «{1}» — не ссылка http:// или https://.",
+    MSG_GEO_URL_IDN: "«URL-источники» на вкладке «{0}»: в «{1}» домен не латиницей — загрузчику роутера нужна его punycode-форма (xn--…). Откройте ссылку в браузере и скопируйте её из адресной строки или переведите домен любым IDN-конвертером.",
+    GEO_URLS_CUT: "⚠ Прошивка обрезала этот список ссылок при сохранении (её хранилище держит ~3000 символов на значение): последняя неполная ссылка отброшена, ссылки после неё потеряны. Добавьте их заново.",
     TBL_ANTIFILTER: "Geo Antifilter — РКН-списки (antifilter.download)",
     TH_ANTIFILTER_IP: "Antifilter IP-списки",
     AF_ALLYOUNEED: " allyouneed — все нужные подсети (~15K) ",
@@ -1275,10 +1338,9 @@ ru: {
     ARIA_INSTALL_MODE: "Способ установки",
     OPT_INSTALL_AUTO: "Автоматически (последняя)",
     OPT_INSTALL_VERSION: "Выбрать версию",
-    OPT_INSTALL_FILE: "Вручную через файл",
+    OPT_INSTALL_FILE: "Из своего файла (по SSH)",
     PH_VERSION: "напр. 1.1.49",
     ARIA_VERSION_TO_INSTALL: "Версия для установки",
-    ARIA_IPK_FILE: "Файл .ipk для установки",
     BTN_CHECK_UPDATES: "Проверить обновления",
     BTN_CLOSE: "Закрыть",
     MODAL_DIAG_TITLE: "Диагностические данные",
@@ -1290,8 +1352,8 @@ ru: {
 function T(key){
     var d = AWG_I18N[AWG_LANG] || AWG_I18N.en;
     var s = (d[key] != null) ? d[key] : (AWG_I18N.en[key] != null ? AWG_I18N.en[key] : key);
-    for (var i = 1; i < arguments.length; i++){ s = s.replace('{'+(i-1)+'}', arguments[i]); }
-    return s;
+    var a = arguments;
+    return s.replace(/\{(\d+)\}/g, function(m, n){ n = +n + 1; return n < a.length ? String(a[n]) : m; });
 }
 // Localize static DOM tagged with data-i18n* attributes. Called first in initial().
 function applyI18n(){
@@ -1309,12 +1371,6 @@ function applyI18n(){
     nodes = document.querySelectorAll('[data-i18n-val]');
     for(i=0;i<nodes.length;i++){ el=nodes[i]; el.value = T(el.getAttribute('data-i18n-val')); }
 }
-// Localize backend upload-error codes (see amneziawg.sh). Falls back to a generic message.
-function awgErrText(code){
-    var k = 'ERR_' + String(code||'').toUpperCase();
-    return (AWG_I18N[AWG_LANG] && AWG_I18N[AWG_LANG][k]) || (AWG_I18N.en[k]) || T('ERR_GENERIC');
-}
-
 // Relative handshake age computed CLIENT-SIDE from the raw epoch the backend now emits
 // (hs_epoch). This is what makes the counter tick live every second without a backend
 // round-trip. Returns null when there is no usable epoch (0/absent) so the caller falls
@@ -1567,32 +1623,80 @@ function syncViaVpnToggles(){
     if(u) custom_settings.awg_update_via_awg = u.checked ? '1' : '0';
 }
 
-function doUpdate(version){
+function doUpdate(version, latest){
+    // Synchronous pre-flight, before any UI change (the caller keeps the modal open on false).
+    if(awgFormBusy()){ awgFormBusyRefuse(); return false; }
+    // What this POST carries — ONLY these keys, on top of the LIVE store (awgSave 'onlyExtra'):
+    // the current "download via VPN" choice (even without a prior Apply) and the version pin.
+    // Pin an explicit version (one-shot) so the router installs exactly it — no backend jsDelivr
+    // resolution, no crawl lag; the backend clears it after use. No version = an explicit null,
+    // i.e. DELETE the key: a pin left behind by an earlier update whose event the router dropped
+    // must never be re-posted from the live store (the router would install that stale version).
+    var pinned = !!(version && !latest);
+    var extra = { awg_update_version: version ? String(version) : null };
+    var gv = document.getElementById('awg_geo_via_awg'), uv = document.getElementById('awg_update_via_awg');
+    if(gv) extra.awg_geo_via_awg = gv.checked ? '1' : '0';
+    if(uv) extra.awg_update_via_awg = uv.checked ? '1' : '0';
+    // Local estimate of the firmware's WHOLE-store cap (the model approximates the live store):
+    // over it the firmware would drop the POST whole — a user-chosen version is refused here;
+    // "latest" is posted with NO settings, which the backend resolves by itself (see done()).
+    var est = awgSettingsSnapshot();
+    for(var ek in extra){ if(extra.hasOwnProperty(ek)){ if(extra[ek] === null) delete est[ek]; else est[ek] = extra[ek]; } }
+    var ovfU = awgSettingsOverflow(est, true);
+    if(ovfU && pinned){ ovfU.obj = est; alert(awgOverflowMsg(ovfU)); return false; }
+    var started = awgSave({
+        mode: 'onlyExtra', check: 'total', extra: extra, action: 'start_awgdoupdate',
+        busyUI: awgUpdateCheckUI,
+        onSubmit: awgUpdateUI,
+        done: function(res, info){
+            if(res === 'verified-late'){ awgShowAck(T('ACK_SAVED_BUSY'), true); return; }
+            if(res === 'verified' || res === 'unverified') return;
+            if(res === 'overflow'){
+                // The final object (live store + these keys) is over the cap: a pinned version can't
+                // be carried — refuse (the pre-submit UI is already restored); "latest" needs no
+                // settings — fall back to the empty post exactly as before 1.5.26.
+                if(pinned){ alert(awgOverflowMsg(info.ovf)); return; }
+                if(awgPostSettings('start_awgdoupdate', false, null, function(){}) !== false) awgUpdateUI();
+                return;
+            }
+            // The event fired in all three cases below — the update runs: keep its UI + reload poll.
+            if(res === 'discarded'){ if(pinned) alert(T('MSG_UPDATE_PIN_LOST')); return; }
+            if(res === 'unknown' || res === 'truncated'){ awgSaveNotify(res, info); return; }
+            awgSaveNotify(res, info);   // busy / login: nothing was posted, the page is back as it was
+        }
+    });
+    if(!started){ awgFormBusyRefuse(); return false; }
+    return true;
+}
+// doUpdate's busy label while awgSave reads the live store (the modal has already closed): the
+// badge says «Checking…» and the steady poll is paused so it can't repaint it; 'idle' = the save
+// ended before anything was posted — resume the poll ('submit' hands over to awgUpdateUI).
+function awgUpdateCheckUI(phase){
+    var badge = document.getElementById('awg_badge');
+    if(phase === 'check'){
+        if(statusTimer){ clearInterval(statusTimer); statusTimer = null; }
+        if(badge){ badge.className = 'awg-status connecting'; badge.innerHTML = '&#9679; ' + escHtml(T('BTN_CHECKING')); }
+    } else if(phase === 'idle'){
+        if(!statusTimer && !awgTransitionActive) statusTimer = setInterval(awgRefreshStatus, 5000);
+        awgRefreshStatus();
+    }
+}
+// The update is on its way: «Updating» badge, poll handed over to the reload watcher below.
+function awgUpdateUI(){
     var badge = document.getElementById('awg_badge');
     if(badge){ badge.className = 'awg-status connecting'; badge.innerHTML = '&#9679; ' + escHtml(T('STAT_UPDATING')); }
     awgConnUp = false;
     awgTickUptime();
     if(statusTimer){ clearInterval(statusTimer); statusTimer = null; }
     // Supersede any status read still in flight so it can't repaint over the «Updating» badge
-    // (same generation guard as awgAction; see awgActionGen).
+    // (same generation guard as awgAction; see awgActionGen). That also abandons a running
+    // transition poll — stop it here and drop the transition flag with it.
     awgActionGen++;
+    if(awgPoll){ clearInterval(awgPoll); awgPoll = null; }
+    awgTransitionActive = false;
     // The modal just closed — scroll to the log so the user can watch the update progress.
     var _lb = document.getElementById('awg_log');
     if(_lb){ try { _lb.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch(e){ try { _lb.scrollIntoView(); } catch(e2){} } }
-
-    // Carry the current "download via VPN" choice even without a prior Apply.
-    syncViaVpnToggles();
-    // Pin an explicit version (one-shot) so the router installs exactly it — no backend
-    // jsDelivr resolution, no crawl lag. Sent via custom_settings, then removed from
-    // memory so a later "Apply" can't re-pin it (the backend also clears it after use).
-    // NB this path DOES carry settings (see just above), so it must post the object. It
-    // therefore still writes a page-load snapshot of everything ELSE — a known limitation of the
-    // firmware's whole-object custom_settings API; only paths with no settings intent can clear.
-    if(version) custom_settings.awg_update_version = String(version);
-    document.getElementById('amng_custom').value = JSON.stringify(custom_settings);
-    if(version) delete custom_settings.awg_update_version;
-    document.form.action_script.value = "start_awgdoupdate";
-    awgSubmitForm();
 
     // Wait for update to finish (VPN stopped, new version installed), then reload
     var attempts = 0;
@@ -1642,8 +1746,6 @@ function openUpdateModal(){
     document.addEventListener('keydown', awgModalKeydown);
     var firstCtl = document.getElementById('awg_install_mode');
     if(firstCtl){ try { firstCtl.focus(); } catch(e){} }
-    awgManualUI(false);    // hide any leftover upload progress
-    awgManualEnd(false);   // re-enable the install button
     awgModeUI();           // show the input matching the current mode
     refreshModalState();   // status line + install button visibility
     loadChangelog(ref, function(text, ok){
@@ -1654,9 +1756,6 @@ function openUpdateModal(){
 }
 
 function closeUpdateModal(){
-    if(awgUploading && !confirm(T('MSG_CLOSE_DURING_UPLOAD'))) return;
-    awgRun++;             // invalidate any in-flight upload/poll loops
-    awgManualEnd(false);  // reset the install button + awgUploading flag
     document.removeEventListener('keydown', awgModalKeydown);
     var m = document.getElementById('awg_update_modal');
     if(m) m.style.display = 'none';
@@ -1669,13 +1768,21 @@ function awgModalKeydown(e){
     if(e.key === 'Escape' || e.keyCode === 27) closeUpdateModal();
 }
 
-// Show the version field / file field for the selected install mode.
+// Show the version field / the local-file instructions for the selected install mode.
+// "From a local file" is SSH-only since 1.5.24: the browser upload it used to offer could never
+// work (the firmware discards any settings POST over 8 KB — see AWG_CS_TOTAL_MAX), so the mode
+// now shows the two commands instead of a file picker, with this router's address filled in.
 function awgModeUI(){
     var mode = document.getElementById('awg_install_mode').value;
     var vin = document.getElementById('awg_version_input');
-    var fin = document.getElementById('awg_ipk_file');
+    var help = document.getElementById('awg_file_help');
+    var btn = document.getElementById('awg_install_btn');
     if(vin) vin.style.display = (mode === 'version') ? '' : 'none';
-    if(fin) fin.style.display = (mode === 'file') ? '' : 'none';
+    if(btn) btn.style.display = (mode === 'file') ? 'none' : '';
+    if(help){
+        help.style.display = (mode === 'file') ? 'block' : 'none';
+        if(mode === 'file') help.innerHTML = T('INSTALL_FILE_HELP', escHtml(location.hostname || '192.168.50.1'), Math.round(AWG_CS_TOTAL_MAX / 1024));
+    }
     // When the user picks the "choose version" mode, focus the version field right away.
     if(mode === 'version' && vin){ try { vin.focus(); vin.select(); } catch(e){} }
 }
@@ -1683,19 +1790,10 @@ function awgModeUI(){
 // Install action, dispatched by the mode selector:
 //   auto    -> latest published version (auto-detected)
 //   version -> an exact published version X.Y.Z
-//   file    -> a locally chosen .ipk, uploaded chunk-by-chunk (see awgManualStart)
+//   file    -> nothing to do here: installed over SSH (install_ipk), see awgModeUI
 function installUpdate(){
-    if(awgUploading) return;
     var mode = document.getElementById('awg_install_mode').value;
-
-    if(mode === 'file'){
-        var fsel = document.getElementById('awg_ipk_file');
-        var f = (fsel && fsel.files && fsel.files[0]) || null;
-        if(!f){ alert(T('MSG_PICK_IPK')); return; }
-        if(!/\.ipk$/i.test(f.name) && !confirm(T('MSG_NOT_IPK_CONFIRM'))) return;
-        awgManualStart(f);
-        return;
-    }
+    if(mode === 'file') return;
 
     if(mode === 'version'){
         var inp = document.getElementById('awg_version_input');
@@ -1703,8 +1801,7 @@ function installUpdate(){
         if(!v){ alert(T('MSG_ENTER_VERSION')); return; }
         if(!/^\d+\.\d+\.\d+$/.test(v)){ alert(T('MSG_VERSION_FORMAT')); return; }
         if(awgCurrentVersion && v === awgCurrentVersion && !confirm(T('MSG_VERSION_INSTALLED_REINSTALL', v))) return;
-        closeUpdateModal();
-        doUpdate(v);
+        if(doUpdate(v) !== false) closeUpdateModal();
         return;
     }
 
@@ -1713,55 +1810,7 @@ function installUpdate(){
         alert(T('MSG_LATEST_VERSION', awgCurrentVersion ? T('MSG_LATEST_VERSION_VER', awgCurrentVersion) : ''));
         return;
     }
-    closeUpdateModal();
-    doUpdate(awgLatestVersion || '');
-}
-
-// ---- Manual .ipk upload --------------------------------------------------------------
-// The firmware's apply path can't carry a multi-MB binary (httpd caps the POST body and
-// reads it line-by-line), so we base64-encode the file in the browser and stream it to
-// the router as a sequence of small custom-settings writes (awg_ipk_chunk). The backend
-// (awgupload event) appends each chunk by sequence number and acks via awg_upload.htm;
-// once every chunk is acked we trigger awgmanualinstall, which decodes, verifies
-// (length + gzip CRC + .ipk structure) and installs. A corrupt upload fails verification
-// and is never installed.
-var awgUploading = false;
-// Generation counter: bumped when a new upload starts and when the modal is closed.
-// Every poll/retry loop captures the generation it belongs to and stops itself once the
-// generation changes — so a stale loop from a previous or aborted upload can never drive
-// the UI (e.g. reload the page mid-install on a quick retry).
-var awgRun = 0;
-function awgStale(runId){ return runId !== awgRun; }
-
-function awgManualUI(show){
-    var p = document.getElementById('awg_manual_progress');
-    if(p) p.style.display = show ? 'block' : 'none';
-}
-function awgSetProgress(frac, msg){
-    var bar = document.getElementById('awg_manual_bar');
-    var m = document.getElementById('awg_manual_msg');
-    if(bar) bar.style.width = Math.round(Math.max(0, Math.min(1, frac)) * 100) + '%';
-    if(m && msg != null) m.textContent = msg;
-}
-function awgManualEnd(uploading){
-    awgUploading = uploading;
-    var btn = document.getElementById('awg_install_btn');
-    if(btn){ btn.disabled = uploading; btn.value = uploading ? T('BTN_INSTALLING') : T('BTN_INSTALL'); }
-}
-function awgManualFail(msg){
-    awgManualEnd(false);
-    awgSetProgress(0, '');
-    awgManualUI(false);
-    alert(T('MSG_INSTALL_FAILED', msg));
-}
-
-// Encode a Uint8Array to base64 without blowing the call stack on large files.
-function awgBytesToB64(bytes){
-    var bin = '', step = 0x8000;
-    for(var i = 0; i < bytes.length; i += step){
-        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + step));
-    }
-    return btoa(bin);
+    if(doUpdate(awgLatestVersion || '', true) !== false) closeUpdateModal();
 }
 
 // Single submit point for the shared form. The browser's "Save password?" prompt fires
@@ -1775,9 +1824,135 @@ function awgSubmitForm(){
     document.form.submit();
 }
 
-// Submit the shared form (-> hidden_frame, proven auth path) with the current settings
-// plus one-shot upload keys in `extra`. cb() fires when the POST has been processed.
+// ---- Firmware custom_settings limits (Asuswrt-Merlin httpd, every branch incl. gnuton) ----------
+// write_custom_settings(): snprintf(line, 3040, "%s %s\n") per key — a record over 3039 bytes is CUT
+//   and loses its '\n', so the NEXT key is glued onto it (the router's line reader then can't see it).
+// ej_get_custom_settings(): sscanf("%29s%*[ ]%2999s") — the page reads back at most 2999 bytes of a
+//   value (and cuts it at its first whitespace).
+// validate_apply(): amng_custom is declared CKN_STR8192 — a POST whose JSON exceeds 8192 bytes fails
+//   nvram_check and is DISCARDED WHOLE (syslog "nvram_check fail: nvram amng_custom over length"),
+//   while the service event still fires and the iframe still loads: nothing saved, no error.
+//   That 8 KB is shared with every other addon's keys. (The old ~50/64 KB budgets here were wrong.)
+var AWG_CS_VALUE_MAX = 2900;   // our per-value ceiling — same margin as the chunked initdata keys
+var AWG_CS_TOTAL_MAX = 8192;
+function awgUtf8Len(s){
+    s = String(s == null ? '' : s);
+    try { return unescape(encodeURIComponent(s)).length; } catch(e){ return s.length * 3; }
+}
+// Why `obj` can't be saved as-is — {key, len} for the first over-long value of OUR keys, or
+// {key:'', total} when the whole object is over the firmware's cap — or null when it fits.
+// Only OUR awg_* keys are length-checked: other addons' (and the server page's awgs_*) values
+// came through the firmware's own reader and are that page's business.
+function awgSettingsOverflow(obj, totalOnly){
+    for(var k in obj){
+        if(totalOnly) break;
+        if(!obj.hasOwnProperty(k) || k.indexOf('awg_') !== 0) continue;
+        var n = awgUtf8Len(obj[k]);
+        var cap = /^awg_(geo_|antifilter)/.test(k) ? AWG_CS_VALUE_MAX : Math.min(2999, 3037 - k.length);
+        if(n > cap) return { key: k, len: n, cap: cap };
+    }
+    var total = awgUtf8Len(JSON.stringify(obj));
+    return total > AWG_CS_TOTAL_MAX ? { key: '', total: total } : null;
+}
+// A human message for awgSettingsOverflow's result, naming the field (and geo tab) when possible.
+// A total-size refusal carries the object that was measured (o.obj — awgSave's FINAL object, which
+// is what the firmware would receive) and the live store (o.live): the breakdown says where the
+// bytes are, so the user knows what to shorten.
+function awgOverflowMsg(o){
+    if(!o.key) return T('MSG_SETTINGS_TOO_BIG', o.total, AWG_CS_TOTAL_MAX) + (o.obj ? awgOverflowBreakdown(o.obj, o.live) : '');
+    var m = /^awg_geo_(?:(\d+)_)?(v2fly|v2fly_ip|custom_domains|custom_ips|custom_files|custom_urls|exc_domains|exc_ips|exc_files|exc_urls)$/.exec(o.key), label = o.key;
+    var cap = o.cap || AWG_CS_VALUE_MAX;
+    if(m){
+        var id = m[1] ? parseInt(m[1], 10) : 1, gi = geoPolicyIndexById(id);
+        var tab = gi !== -1 ? geoDecodeName(geoPolicies[gi].name) : String(id);
+        if(m[2] === 'custom_files' || m[2] === 'exc_files')
+            return T('MSG_GEO_FILES_TOO_BIG', m[2] === 'exc_files' ? T('GEO_FILES_EXC_SUFFIX') : '', tab, o.len, cap);
+        var lk = { custom_domains:'TH_CUSTOM_DOMAINS', exc_domains:'TH_CUSTOM_DOMAINS', custom_ips:'TH_CUSTOM_IPS',
+                   exc_ips:'TH_CUSTOM_IPS', custom_urls:'TH_GEO_URLS', exc_urls:'TH_GEO_URLS',
+                   v2fly:'TH_GEOSITE_LISTS', v2fly_ip:'TH_GEOIP_LISTS' }[m[2]];
+        label = (lk ? T(lk) : o.key) + (m[2].indexOf('exc_') === 0 ? T('GEO_FILES_EXC_SUFFIX') : '') + ' — ' + tab;
+    } else {
+        var am = /^awg_antifilter(?:_(\d+))?_lists$/.exec(o.key);
+        if(am){
+            var ai = geoPolicyIndexById(am[1] ? parseInt(am[1], 10) : 1);
+            label = T('TH_ANTIFILTER_IP') + ' — ' + (ai !== -1 ? geoDecodeName(geoPolicies[ai].name) : (am[1] || '1'));
+        } else if(o.key === 'awg_clients') label = T('TBL_ROUTING_POLICY');
+        else if(/^awg_(?:pf\d+_)?peer_allowedips$/.test(o.key)) label = T('TH_ALLOWED_IPS');
+        else if(o.key === 'awg_watchdog_hosts') label = T('TH_TUNNEL_CHECK_ADDR');
+    }
+    return T('MSG_SETTING_TOO_LONG', label, o.len, cap);
+}
+// Where the bytes of a too-big settings object go. Each key is charged its JSON contribution —
+// `"k":"v"` plus the comma after it — and the object's braces go to "other AmneziaWG settings", so
+// the lines add up to exactly the total the firmware measures. Largest group first.
+function awgOverflowBreakdown(obj, live){
+    var groups = {}, order = [], sum = 0, k, m;
+    function add(id, n, i5){
+        if(!groups[id]){ groups[id] = { n: 0, i5: 0 }; order.push(id); }
+        groups[id].n += n; groups[id].i5 += (i5 || 0);
+    }
+    // Slot numbers of the profiles the object configures, for the "#k" ordinals (C5).
+    var cfgSlots = [];
+    for(var s = 1; s <= AWG_PF_MAX; s++){ if(pfConfiguredIn(obj, s)) cfgSlots.push(s); }
+    for(k in obj){
+        if(!obj.hasOwnProperty(k)) continue;
+        var n = awgUtf8Len(JSON.stringify(k) + ':' + JSON.stringify(obj[k])) + 1;
+        sum += n;
+        var slot = pfSlotOfKey(k);
+        if(slot && cfgSlots.indexOf(slot) !== -1){ add('pf' + slot, n, /initdata\d*$/.test(k) ? n : 0); continue; }
+        if((m = /^awg_geo_(?:(\d+)_)?(?:v2fly|v2fly_ip|custom_domains|custom_ips|custom_files|custom_urls|mode|exc_domains|exc_ips|exc_files|exc_urls)$/.exec(k)) ||
+           (m = /^awg_antifilter(?:_(\d+))?_lists$/.exec(k))){ add('geo' + (m[1] ? parseInt(m[1], 10) : 1), n); continue; }
+        if(k === 'awg_clients'){ add('clients', n); continue; }
+        if(k.indexOf('awg_') === 0){ add('awg', n); continue; }
+        if(k.indexOf('awgs_') === 0){ add('srv', n); continue; }
+        add('other', n);
+    }
+    var total = awgUtf8Len(JSON.stringify(obj));
+    add('awg', total - sum);
+    order.sort(function(a, b){ return groups[b].n - groups[a].n; });
+    var lines = [];
+    for(var i = 0; i < order.length; i++){
+        var id = order[i], g = groups[id];
+        if(g.n <= 0) continue;
+        if(id.indexOf('pf') === 0){
+            var sl = parseInt(id.slice(2), 10), ord = cfgSlots.indexOf(sl) + 1;
+            var nm = pfNameDec(obj[pfKey(sl, 'name')] || '') || T('PF_UNNAMED', ord);
+            lines.push(T('OVF_PROFILE', ord, nm, g.n, g.i5));
+        } else if(id.indexOf('geo') === 0){
+            var gi = geoPolicyIndexById(parseInt(id.slice(3), 10));
+            lines.push(T('OVF_GEO', gi !== -1 ? geoDecodeName(geoPolicies[gi].name) : id.slice(3), g.n));
+        } else if(id === 'clients') lines.push(T('OVF_CLIENTS', g.n));
+        else if(id === 'awg') lines.push(T('OVF_AWG_OTHER', g.n));
+        else if(id === 'srv') lines.push(T('OVF_SERVER', g.n));
+        else lines.push(T('OVF_OTHER_ADDONS', g.n));
+    }
+    var out = '\n\n' + T('OVF_BREAKDOWN') + '\n• ' + lines.join('\n• ');
+    var liveTotal = live ? awgUtf8Len(JSON.stringify(live)) : 0;
+    if(liveTotal > AWG_CS_TOTAL_MAX) out += '\n\n' + T('OVF_LIVE_OVER', liveTotal, AWG_CS_TOTAL_MAX);
+    return out;
+}
+// Deep-enough copy of custom_settings (flat string map) to roll back a refused save: applyConfig
+// and updateGeoLists write their values into the object BEFORE the store-limit check, and a
+// refused value left behind would ride along on the next path that posts the object.
+function awgSettingsSnapshot(){
+    var c = {};
+    for(var k in custom_settings){ if(custom_settings.hasOwnProperty(k)) c[k] = custom_settings[k]; }
+    return c;
+}
+function awgSettingsRestore(snap){
+    var k;
+    for(k in custom_settings){ if(custom_settings.hasOwnProperty(k)) delete custom_settings[k]; }
+    for(k in snap){ if(snap.hasOwnProperty(k)) custom_settings[k] = snap[k]; }
+}
+
+// Submit the shared form (-> hidden_frame, proven auth path) for an action with NO settings
+// intent: amng_custom is posted EMPTY, so the firmware writes nothing (re-posting the page-load
+// snapshot would revert changes made elsewhere since, and an over-limit object would be discarded
+// anyway). See awgAction. Every settings-carrying POST goes through awgSave instead (1.5.26) —
+// `extra` must be false. cb() fires when the POST has been processed. Returns false (and posts
+// nothing) while a settings save holds the form (awgFormBusy): callers check that first.
 function awgPostSettings(actionScript, extra, waitVal, cb){
+    if(awgFormBusy()) return false;
     var fr = document.getElementById('hidden_frame');
     var done = false;
     var to = setTimeout(function(){ if(!done){ done = true; cleanup(); cb(false); } }, 12000);
@@ -1785,11 +1960,8 @@ function awgPostSettings(actionScript, extra, waitVal, cb){
     function onl(){ if(done) return; done = true; cleanup(); cb(true); }
     fr.addEventListener('load', onl);
 
-    var merged = {};
-    for(var k in custom_settings){ if(custom_settings.hasOwnProperty(k)) merged[k] = custom_settings[k]; }
-    if(extra){ for(var k2 in extra){ if(extra.hasOwnProperty(k2)) merged[k2] = extra[k2]; } }
     var ac = document.getElementById('amng_custom');
-    if(ac) ac.value = JSON.stringify(merged);
+    if(ac) ac.value = '';
 
     var aw = document.form.action_wait;
     var oldwait = aw ? aw.value : null;
@@ -1797,131 +1969,437 @@ function awgPostSettings(actionScript, extra, waitVal, cb){
     document.form.action_script.value = actionScript;
     awgSubmitForm();
     if(aw && oldwait != null) aw.value = oldwait;   // submit() snapshots fields synchronously
+    return true;
 }
 
-// Poll awg_upload.htm until the backend acks sequence `wantSeq` for this upload `token`.
-// cb(ackObjOrNull): {status:'ok'} on success; {status:'gap'|'err'} is a hard failure;
-// null on timeout (caller retries). Acks from other uploads (token mismatch) are ignored.
-function awgPollAck(token, wantSeq, timeoutMs, runId, cb){
-    var t0 = Date.now();
-    (function tick(){
-        if(awgStale(runId)) return;   // a newer upload (or close) superseded this one
-        var x = new XMLHttpRequest();
-        x.open('GET', '/user/awg_upload.htm?_=' + Date.now(), true);
-        x.timeout = 3000;
-        x.onload = function(){
-            if(awgStale(runId)) return;
-            var j = null;
-            try { j = JSON.parse(x.responseText); } catch(e){}
-            if(j && j.tok === token){
-                if(j.status === 'ok' && j.seq === wantSeq){ cb(j); return; }
-                if(j.status === 'gap' || j.status === 'err'){ cb(j); return; }
+// ==================== Settings save pipeline (1.5.26) ====================
+// The firmware's settings API is a FULL REPLACE of /jffs/addons/custom_settings.txt with whatever
+// JSON the page posts, shared by every addon AND by this addon's server page — and it reports
+// nothing: an over-limit POST is discarded whole while the event still fires, a POST that lands
+// while rc runs one of our long handlers is written but its event dropped (~15 s notify_rc block),
+// a full /jffs cuts the file short. So every settings-carrying POST goes through awgSave:
+//   pre-fetch the LIVE store  →  refuse if a page-owned key changed elsewhere since load (conflict)
+//   →  post live's not-owned keys + this page's own keys, the save token LAST  →  read the store
+//   back and classify: verified / verified-late / unverified / discarded / unknown / truncated.
+// Ownership, not merging: this page owns every awg_* key except the two below; everything else
+// (awgs_* = the server page, other addons) is taken from the live store as-is.
+var AWG_CS_NOT_OWNED = {
+    awg_save_tok: 1,         // the save token — rewritten by every save of either page
+    awg_update_version: 1    // one-shot update pin, cleared by the backend's do_update
+};
+function awgCsOwned(k){ return k.indexOf('awg_') === 0 && !AWG_CS_NOT_OWNED.hasOwnProperty(k); }
+// A value as the firmware's reader will show it back — ej_get_custom_settings() parses each line
+// with sscanf("%29s%*[ ]%2999s"): the separating spaces and any further leading C-whitespace are
+// skipped, the value ends at its first C-whitespace and at 2999 bytes, an empty value is not
+// emitted at all. undefined = absent. Every comparison of page state against the store uses this.
+function awgCsNorm(v){
+    if(v === undefined || v === null) return undefined;
+    var s = String(v).replace(/^[ \t\v\f\r]+/, '');
+    if(s === '' || s.charAt(0) === '\n') return undefined;
+    s = s.replace(/[ \t\n\v\f\r][\s\S]*$/, '');
+    if(awgUtf8Len(s) > 2999) s = awgUtf8Cut(s, 2999);
+    return s === '' ? undefined : s;
+}
+// The reader view of obj[k]: keys over 29 chars are invisible to %29s.
+function awgCsView(obj, k){ return (k.length > 29) ? undefined : awgCsNorm(obj[k]); }
+// Cut a string to at most `max` UTF-8 bytes on a character boundary.
+function awgUtf8Cut(s, max){
+    var out = '', n = 0;
+    for(var i = 0; i < s.length; i++){
+        var c = s.charCodeAt(i), ch = s.charAt(i), w;
+        if(c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length){ ch = s.substr(i, 2); w = 4; i++; }
+        else w = (c < 0x80) ? 1 : (c < 0x800 ? 2 : 3);
+        if(n + w > max) break;
+        out += ch; n += w;
+    }
+    return out;
+}
+function awgCsCopy(o){
+    var c = {};
+    for(var k in o){ if(o.hasOwnProperty(k)) c[k] = o[k]; }
+    return c;
+}
+// Every live-store GET carries a globally unique cache buster (never a per-load counter, never the
+// save token): 3006.102+/master serve .htm files with an ETag of the FILE, which never changes
+// while its output does, so a repeated URL may be answered 304 from the browser's cache.
+var awgCsReqSeq = 0, awgCsTokSeq = 0;
+function awgCsUnique(){ return Date.now() + '_' + (++awgCsReqSeq); }
+// The save token: base36 time + a counter, [0-9a-z] and at most 12 chars.
+function awgCsNewToken(){ return (Date.now().toString(36) + (++awgCsTokSeq).toString(36)).slice(0, 12); }
+function awgCsPlainObj(txt){
+    try {
+        var o = JSON.parse(txt);
+        return (o && typeof o === 'object' && !(o instanceof Array)) ? o : null;
+    } catch(e){ return null; }
+}
+// The rendered-page fallback: the settings object of this very page, as the firmware renders it
+// into the custom_settings line of the first script. The needle is built by concatenation and
+// must be followed by '{' or "new Object()", so this function's own source text (also part of
+// the rendered page) can never match; the brace scan is string- and escape-aware.
+function awgCsExtractPage(body){
+    var needle = 'var custom' + '_settings =', from = 0, i;
+    while((i = body.indexOf(needle, from)) !== -1){
+        var j = i + needle.length;
+        while(j < body.length && /\s/.test(body.charAt(j))) j++;
+        if(body.substr(j, 12) === 'new Object()') return {};
+        if(body.charAt(j) === '{'){
+            var depth = 0, inStr = false, esc = false;
+            for(var e = j; e < body.length; e++){
+                var c = body.charAt(e);
+                if(inStr){
+                    if(esc) esc = false;
+                    else if(c === '\\') esc = true;
+                    else if(c === '"') inStr = false;
+                    continue;
+                }
+                if(c === '"') inStr = true;
+                else if(c === '{') depth++;
+                else if(c === '}'){ if(--depth === 0) return awgCsPlainObj(body.slice(j, e + 1)); }
             }
-            if(Date.now() - t0 > timeoutMs){ cb(null); return; }
-            setTimeout(tick, 300);
-        };
-        x.onerror = x.ontimeout = function(){
-            if(awgStale(runId)) return;
-            if(Date.now() - t0 > timeoutMs){ cb(null); return; }
-            setTimeout(tick, 400);
-        };
-        x.send();
-    })();
+            return null;
+        }
+        from = j;
+    }
+    return null;
 }
-
-function awgManualStart(file){
-    var myRun = ++awgRun;   // claim a new generation; supersedes any prior upload's loops
-    awgManualEnd(true);
-    awgManualUI(true);
-    awgSetProgress(0, T('UP_READING_FILE'));
-
-    var reader = new FileReader();
-    reader.onerror = function(){ awgManualFail(T('UP_READ_FAILED')); };
-    reader.onload = function(){
-        var bytes = new Uint8Array(reader.result);
-        var total = bytes.length;
-        if(total === 0){ awgManualFail(T('UP_FILE_EMPTY')); return; }
-        var b64 = awgBytesToB64(bytes);
-
-        // Size each chunk so the whole POST (current settings + chunk, URL-encoded) stays
-        // well under the firmware's ~64 KB body cap. If the existing settings alone are
-        // already too big, bail out cleanly rather than send a silently-truncated POST.
-        var baseLen = encodeURIComponent(JSON.stringify(custom_settings)).length;
-        // -256: the "amng_custom=" prefix, the other form fields, and the chunk key names
-        // (awg_ipk_chunk/seq/token/first) that ride along in the same POST body.
-        var budget = 52000 - baseLen - 256;
-        if(budget < 2000){ awgManualFail(T('UP_SETTINGS_TOO_BIG')); return; }
-        var chunkChars = Math.floor(budget / 1.06);
-        var total_chunks = Math.ceil(b64.length / chunkChars);
-        var token = 'u' + Date.now() + Math.floor(Math.random() * 1e9).toString(36);
-
-        function sendChunk(i){
-            if(awgStale(myRun)) return;
-            if(i >= total_chunks){ triggerInstall(); return; }
-            var piece = b64.substr(i * chunkChars, chunkChars);
-            var extra = { awg_ipk_chunk: piece, awg_ipk_seq: String(i), awg_ipk_token: token };
-            if(i === 0) extra.awg_ipk_first = '1';
-            attemptChunk(i, extra, 0);
-        }
-        function attemptChunk(i, extra, attempt){
-            if(awgStale(myRun)) return;
-            awgSetProgress(i / total_chunks, T('UP_PROGRESS', i + 1, total_chunks));
-            awgPostSettings('start_awgupload', extra, 1, function(){
-                awgPollAck(token, i, 15000, myRun, function(ack){
-                    if(ack && ack.status === 'ok'){ sendChunk(i + 1); return; }
-                    if(ack && (ack.status === 'gap' || ack.status === 'err')){
-                        awgManualFail((ack.code ? awgErrText(ack.code) + ' ' : (ack.msg ? ack.msg + ' ' : T('UP_TRANSFER_FAILED'))) + T('UP_PART', i + 1, total_chunks));
-                        return;
-                    }
-                    if(attempt < 4){ attemptChunk(i, extra, attempt + 1); return; }   // timeout -> retry
-                    awgManualFail(T('UP_NO_ROUTER_RESPONSE', i + 1, total_chunks));
-                });
-            });
-        }
-        function triggerInstall(){
-            if(awgStale(myRun)) return;
-            awgSetProgress(1, T('UP_VERIFYING'));
-            awgPostSettings('start_awgmanualinstall', { awg_ipk_len: String(total), awg_ipk_token: token }, 30, function(){
-                awgPollManualInstall(token, myRun);
-            });
-        }
-
-        awgSetProgress(0, T('UP_PROGRESS', 1, total_chunks));
-        sendChunk(0);
+// httpd's answer to ANY request of an expired session: a tiny page that navigates the whole tab to
+// the login form. The file name is split so no addon page ever contains it contiguously (a
+// rendered page is itself a fallback response and must never read as a login page).
+var AWG_CS_LOGIN_RE = new RegExp('top\\.location\\.href\\s*=\\s*[\'"]\\/Main_' + 'Login\\.asp');
+// Classify a response body, in this fixed order: the AWGCS-framed endpoint → the rendered page →
+// the login page (short bodies only) → unusable.
+function awgCsParseBody(body){
+    var b = String(body == null ? '' : body).replace(/^\s+|\s+$/g, '');
+    if(b.length >= 10 && b.slice(0, 5) === 'AWGCS' && b.slice(-5) === 'AWGCS'){
+        var mid = b.slice(5, -5).replace(/^\s+|\s+$/g, '');
+        if(mid === 'new Object()') return { kind: 'store', obj: {} };   // no settings file at all
+        var o = awgCsPlainObj(mid);
+        return o ? { kind: 'store', obj: o } : { kind: 'unusable' };
+    }
+    var po = awgCsExtractPage(b);
+    if(po) return { kind: 'store', obj: po };
+    if(b.length < 512 && AWG_CS_LOGIN_RE.test(b)) return { kind: 'login' };
+    return { kind: 'unusable' };
+}
+// One GET. cb(kind, body): 'ok' (2xx), 'transient' (timeout / status 0 / 5xx — worth a retry),
+// 'missing' (404 and other definitive answers).
+function awgCsGet(url, ms, cb){
+    var x = new XMLHttpRequest(), fin = false;
+    function end(kind){ if(fin) return; fin = true; cb(kind, kind === 'ok' ? String(x.responseText || '') : ''); }
+    try { x.open('GET', url, true); } catch(e){ setTimeout(function(){ end('transient'); }, 0); return; }
+    x.timeout = ms;
+    x.onload = function(){
+        var st = x.status;
+        end((st >= 200 && st < 300) ? 'ok' : ((st === 0 || st >= 500) ? 'transient' : 'missing'));
     };
-    reader.readAsArrayBuffer(file);
+    x.onerror = function(){ end('transient'); };
+    x.ontimeout = function(){ end('transient'); };
+    try { x.send(); } catch(e2){ end('transient'); }
+}
+// Read the LIVE store: /user/awg_cs.htm (the backend writes it next to the page: an AWGCS-framed
+// get_custom_settings), falling back to a fresh GET of this page when the endpoint is unusable.
+// o = { budget: ms (pre-fetch) | tries: n (verify), perTry: ms, gap: ms, page: start on the page }.
+// cb(r): r.kind = 'store' (r.obj, r.page) | 'login' | 'legacy' (both definitively unusable —
+// NOT a timeout) | 'busy' (the budget / the tries ran out on timeouts).
+function awgCsFetch(o, cb){
+    var t0 = Date.now(), tries = 0, page = !!o.page;
+    function next(){
+        var left = o.budget ? (o.budget - (Date.now() - t0)) : o.perTry;
+        if(o.budget ? (left <= 0) : (tries >= o.tries)){ cb({ kind: 'busy' }); return; }
+        tries++;
+        var url = page ? (location.pathname + '?_=' + awgCsUnique()) : ('/user/awg_cs.htm?_=' + awgCsUnique());
+        awgCsGet(url, Math.max(1000, Math.min(o.perTry, left)), function(kind, body){
+            if(kind === 'transient'){ setTimeout(next, o.gap); return; }
+            var r = (kind === 'ok') ? awgCsParseBody(body) : { kind: 'unusable' };
+            if(r.kind === 'store'){ cb({ kind: 'store', obj: r.obj, page: page }); return; }
+            if(r.kind === 'login'){ cb({ kind: 'login' }); return; }
+            if(!page){ page = true; tries--; next(); return; }   // switching to the fallback costs no try
+            cb({ kind: 'legacy' });
+        });
+    }
+    next();
+}
+// Did a page-owned key change in the live store since this page's base? (keys of either side)
+function awgCsConflict(live){
+    var k;
+    for(k in live){ if(live.hasOwnProperty(k) && awgCsOwned(k) && awgCsNorm(live[k]) !== awgCsNorm(awgCsBase[k])) return k; }
+    for(k in awgCsBase){ if(awgCsBase.hasOwnProperty(k) && awgCsOwned(k) && awgCsNorm(live[k]) !== awgCsNorm(awgCsBase[k])) return k; }
+    return '';
+}
+// The object to post, without the token (appended LAST by awgSave). Normal: every NOT-owned key
+// from live, every owned key from `mine`, in live's key order first (the file keeps its layout),
+// then this page's new keys. onlyExtra: a copy of live. No live store (LEGACY): a copy of mine.
+// Then owned values are trimmed and '' dropped (the reader never returns an empty value — every
+// byte counts against the shared 8 KB), name/fo meta of unconfigured profile slots dropped, and
+// the extras applied (null = delete the key).
+function awgCsBuildFinal(mine, live, onlyExtra, extra){
+    var f = {}, k;
+    if(!live){
+        for(k in mine){ if(mine.hasOwnProperty(k)) f[k] = mine[k]; }
+        // A LEGACY save can't see the store; don't let it revert a profile switch made elsewhere
+        // (CLI / another tab): an untouched pointer follows the backend's last report of it. A
+        // pointer the page only REPAIRED (pfUserFix, K13 — awgPfPtrAuto) is untouched too: else the
+        // repair reads as an edit and reverts a CLI switch made after the load. A page «Switch to»
+        // is never overridden here — applyConfig posts its target as an extra, applied below.
+        var mp = awgCsNorm(mine.awg_profile_active);
+        if(!onlyExtra && (mp === awgCsNorm(awgCsBase.awg_profile_active) || (awgPfPtrAuto !== null && mp === awgPfPtrAuto)) &&
+           awgPfStatus && awgPfStatus.user >= 1 && awgLastStatus && !awgLastStatus.starting && !awgLastStatus.stopping)
+            f.awg_profile_active = String(awgPfStatus.user);
+    } else if(onlyExtra){
+        for(k in live){ if(live.hasOwnProperty(k)) f[k] = live[k]; }
+    } else {
+        for(k in live){
+            if(!live.hasOwnProperty(k)) continue;
+            if(!awgCsOwned(k)) f[k] = live[k];
+            else if(mine.hasOwnProperty(k)) f[k] = mine[k];
+        }
+        for(k in mine){ if(mine.hasOwnProperty(k) && awgCsOwned(k) && !f.hasOwnProperty(k)) f[k] = mine[k]; }
+    }
+    if(!onlyExtra || !live){
+        for(k in f){
+            if(!f.hasOwnProperty(k) || !awgCsOwned(k)) continue;
+            if(typeof f[k] === 'string') f[k] = f[k].replace(/^[ \t\n\v\f\r]+|[ \t\n\v\f\r]+$/g, '');
+            if(f[k] === '' || f[k] === undefined || f[k] === null) delete f[k];
+        }
+        for(var n = 1; n <= AWG_PF_MAX; n++){
+            if(!pfConfiguredIn(f, n)){ delete f[pfKey(n, 'name')]; delete f[pfKey(n, 'fo')]; }
+        }
+    }
+    for(k in extra){
+        if(!extra.hasOwnProperty(k)) continue;
+        if(extra[k] === null) delete f[k]; else f[k] = String(extra[k]);
+    }
+    delete f.awg_save_tok;
+    return f;
+}
+// The file keeps the posted order, so a store the firmware cut short (full /jffs) reads back as a
+// strict in-order PREFIX of what the reader would show of the posted object.
+function awgCsIsPrefix(live2, fobj){
+    var fk = [], k;
+    for(k in fobj){ if(fobj.hasOwnProperty(k) && awgCsView(fobj, k) !== undefined) fk.push(k); }
+    var lk = [];
+    for(k in live2){ if(live2.hasOwnProperty(k)) lk.push(k); }
+    if(lk.length >= fk.length) return false;
+    for(var i = 0; i < lk.length; i++){ if(lk[i] !== fk[i]) return false; }
+    return true;
+}
+function awgCsSameStore(a, b){
+    var ka = [], kb = [], k, i;
+    for(k in a){ if(a.hasOwnProperty(k)) ka.push(k); }
+    for(k in b){ if(b.hasOwnProperty(k)) kb.push(k); }
+    if(ka.length !== kb.length) return false;
+    for(i = 0; i < ka.length; i++){ if(ka[i] !== kb[i] || String(a[ka[i]]) !== String(b[kb[i]])) return false; }
+    return true;
+}
+// What the read-back says about OUR POST (tok = its token, live = the pre-fetch).
+function awgCsClassify(live2, fobj, live, tok, late){
+    var t2 = live2.awg_save_tok, t1 = live ? live.awg_save_tok : undefined;
+    if(t2 === tok) return late ? 'verified-late' : 'verified';
+    if(t2 !== undefined) return (t1 !== undefined && t2 === t1) ? 'discarded' : 'unknown';
+    // No token in the store: unchanged → the firmware dropped the POST; our keys cut short → a
+    // partial write; anything else → another (older, token-less) writer.
+    if(t1 === undefined && live && awgCsSameStore(live2, live)) return 'discarded';
+    return awgCsIsPrefix(live2, fobj) ? 'truncated' : 'unknown';
+}
+// A verified store whose page-owned values differ from what we posted: a writer that keeps the
+// token line (the CLI's set_setting) changed something between our write and the read-back.
+function awgCsDrift(live2, fobj){
+    var k;
+    for(k in fobj){ if(fobj.hasOwnProperty(k) && awgCsOwned(k) && awgCsNorm(live2[k]) !== awgCsView(fobj, k)) return true; }
+    for(k in live2){ if(live2.hasOwnProperty(k) && awgCsOwned(k) && awgCsNorm(live2[k]) !== awgCsView(fobj, k)) return true; }
+    return false;
 }
 
-// After awgmanualinstall is triggered, poll awg_upload.htm for the final result. Both the
-// generation (runId) and the per-upload token are checked, so a leaked poller can never
-// act on another upload's completion.
-function awgPollManualInstall(token, runId){
-    var t0 = Date.now();
-    (function tick(){
-        if(awgStale(runId)) return;
-        var x = new XMLHttpRequest();
-        x.open('GET', '/user/awg_upload.htm?_=' + Date.now(), true);
-        x.timeout = 3000;
-        x.onload = function(){
-            if(awgStale(runId)) return;
-            var j = null;
-            try { j = JSON.parse(x.responseText); } catch(e){}
-            if(j && j.tok === token && j.status === 'installed'){
-                awgSetProgress(1, T('UP_DONE_RELOADING'));
-                setTimeout(awgReload, 1500);
-                return;
+// The form lock: one settings save at a time, and no other submitter of the shared form (which
+// has ONE hidden iframe) while it runs — their POST would cancel ours mid-flight.
+var awgCsSaving = false;
+var awgCsTruncLive = null;   // the pre-fetch live store kept after a 'truncated' save (see below)
+var awgCsAfterSave = [];     // deferred actions queued while the form was locked (awgAfterSave)
+function awgFormBusy(){ return awgCsSaving; }
+// The short "please wait" reply of every refused submitter: the ack next to the Apply buttons for
+// those buttons (nearAck), an alert for every other control (the ack would be off-screen or behind
+// a modal).
+function awgFormBusyRefuse(nearAck){
+    if(nearAck) awgShowAck(T('MSG_WAIT_SAVE'), false);
+    else alert(T('MSG_WAIT_SAVE'));
+}
+// Run fn once the current save has finished (now, when none is running).
+function awgAfterSave(fn){ if(awgCsSaving) awgCsAfterSave.push(fn); else fn(); }
+
+// awgSave(opts) — the one path for every settings-carrying POST. Returns false (nothing done) when
+// another save holds the form. opts:
+//   mode      'normal' (the page's own keys win) | 'onlyExtra' (post the live store + opts.extra —
+//             for actions that carry a key or two and must not act as a settings save)
+//   extra     keys to set on the final object (null = delete)
+//   check     'full' (awgSettingsOverflow on the final object) | 'total' (the 8 KB total only)
+//   action    the action_script, or function(final) returning it
+//   fixFinal  function(final) — last adjustment before the size check (pfDelete)
+//   abort     function() → true: give up before posting (result 'aborted')
+//   busyUI    function(phase): 'check' at entry (label the caller's button), 'submit' right
+//             before onSubmit, 'idle' when the save ends before anything was posted
+//   onSubmit  function(final) — the caller's "in progress" UI, run right before the POST
+//   done      function(result, info) — MUST handle every result (the lock is already released):
+//             'verified' | 'verified-late' (the router was busy: written, but the action may have
+//             been skipped) | 'unverified' (posted, the read-back failed) | 'overflow' (info.ovf)
+//             | 'conflict' | 'busy' | 'login' | 'discarded' (the event still fired) | 'unknown'
+//             (another writer at the same moment) | 'truncated' (a partial write) | 'aborted'
+function awgSave(opts){
+    if(awgCsSaving) return false;
+    awgCsSaving = true;
+    // Frozen at entry: a model change made while the pre-fetch runs must not leak into this POST.
+    var mine = awgCsCopy(custom_settings);
+    var extra = opts.extra || {};
+    var ui = opts.busyUI || null;
+    var tok = awgCsNewToken(), submitted = false, fin = false;
+    if(ui) ui('check');
+    pfBarLock(true);
+    function done(res, info){
+        if(fin) return;
+        fin = true;
+        awgCsSaving = false;
+        if(!submitted && ui) ui('idle');
+        pfBarLock(false);
+        try { opts.done(res, info || {}); }
+        finally {
+            var q = awgCsAfterSave; awgCsAfterSave = [];
+            for(var i = 0; i < q.length; i++){ try { q[i](); } catch(e){} }
+        }
+    }
+    awgCsFetch({ budget: 25000, perTry: 6000, gap: 1000 }, function(r){
+        if(r.kind === 'login'){ done('login'); return; }
+        if(r.kind === 'busy'){ done('busy'); return; }
+        var live = (r.kind === 'store') ? r.obj : null;       // null = LEGACY (no live store readable)
+        // After a partial write the next save rewrites EVERYTHING from the complete pre-fetch copy
+        // kept then (the store now lacks other addons' keys too), once, without a conflict check.
+        var retained = live ? awgCsTruncLive : null;
+        // "full" = this POST writes the page's own keys (a normal save, that rewrite, or LEGACY,
+        // where the page's model is all there is); onlyExtra only adds its extras to live.
+        var full = (opts.mode !== 'onlyExtra') || !!retained || !live;
+        if(live && full && !retained){
+            if(awgCsStale){ done('conflict', { stale: true }); return; }
+            var ck = awgCsConflict(live);
+            if(ck){ done('conflict', { key: ck }); return; }
+        }
+        var fobj = awgCsBuildFinal(mine, retained || live, !full, extra);
+        // Keys the caller forces in the final (fixFinal) are not the model's value: the model keeps
+        // its own (pending) one — they are left out of the post-save model sync.
+        var forced = {};
+        if(opts.fixFinal){
+            var pre = awgCsCopy(fobj);
+            opts.fixFinal(fobj);
+            for(var fk in pre){ if(pre.hasOwnProperty(fk) && pre[fk] !== fobj[fk]) forced[fk] = 1; }
+            for(fk in fobj){ if(fobj.hasOwnProperty(fk) && pre[fk] !== fobj[fk]) forced[fk] = 1; }
+        }
+        delete fobj.awg_save_tok;
+        fobj.awg_save_tok = tok;   // LAST: a file cut short loses it and can't read as saved
+        var ovf = awgSettingsOverflow(fobj, opts.check !== 'full');
+        if(ovf){ ovf.obj = fobj; ovf.live = live; done('overflow', { ovf: ovf, fobj: fobj, live: live }); return; }
+        if(opts.abort && opts.abort()){ done('aborted'); return; }
+
+        var act = (typeof opts.action === 'function') ? opts.action(fobj) : opts.action;
+        var ac = document.getElementById('amng_custom');
+        if(ac) ac.value = JSON.stringify(fobj);
+        document.form.action_script.value = act;
+        submitted = true;
+        if(retained) awgCsTruncLive = null;
+        if(ui) ui('submit');
+        if(opts.onSubmit) opts.onSubmit(fobj);
+        // The load listener and the 20 s no-load fallback belong to THIS submit only (a new submit
+        // into the same iframe cancels the previous navigation). A load ≥10 s after submit is the
+        // notify_rc signature: the store was written, then rc blocked ~15 s on one of our
+        // foreground handlers and DROPPED this event.
+        var fr = document.getElementById('hidden_frame'), landed = false, tm = null, t0 = 0;
+        function onl(){ arrived(false); }
+        function arrived(viaTimer){
+            if(landed) return;
+            landed = true;
+            if(tm) clearTimeout(tm);
+            try { fr.removeEventListener('load', onl); } catch(e){}
+            var late = viaTimer || (Date.now() - t0 >= 10000);
+            if(!live){ finish('unverified', null); return; }   // LEGACY: nothing to read back
+            awgCsFetch({ tries: 3, perTry: 20000, gap: 1500, page: r.page }, function(v){
+                if(v.kind !== 'store'){ finish('unverified', null); return; }
+                finish(awgCsClassify(v.obj, fobj, live, tok, late), v.obj);
+            });
+        }
+        function finish(res, live2){
+            var ok = (res === 'verified' || res === 'verified-late' || res === 'unverified' || res === 'truncated');
+            var k, v;
+            if(ok){
+                // The base advances ONLY to what this page wrote: a change another writer made
+                // in the meantime must still surface as a conflict on the next save.
+                if(full){
+                    var ks = awgCsCopy(awgCsBase);
+                    for(k in fobj){ if(fobj.hasOwnProperty(k)) ks[k] = 1; }
+                    for(k in ks){
+                        if(!ks.hasOwnProperty(k) || !awgCsOwned(k)) continue;
+                        v = awgCsView(fobj, k);
+                        if(v === undefined) delete awgCsBase[k]; else awgCsBase[k] = v;
+                    }
+                    if((res === 'verified' || res === 'verified-late') && awgCsDrift(live2, fobj)) awgCsStale = true;
+                    awgCsSyncModel(mine, fobj, forced);
+                } else {
+                    for(k in extra){
+                        if(!extra.hasOwnProperty(k) || !awgCsOwned(k)) continue;
+                        v = (extra[k] === null) ? undefined : awgCsNorm(extra[k]);
+                        if(v === undefined) delete awgCsBase[k]; else awgCsBase[k] = v;
+                    }
+                }
+                // Extras that are page-owned keys (analyzer device, via-VPN toggles) are now
+                // part of the saved model.
+                for(k in extra){
+                    if(!extra.hasOwnProperty(k) || !awgCsOwned(k)) continue;
+                    if(extra[k] === null) delete custom_settings[k]; else custom_settings[k] = String(extra[k]);
+                }
             }
-            if(j && j.tok === token && j.status === 'install_err'){ awgManualFail(j.code ? awgErrText(j.code) : T('UP_INSTALL_FAILED')); return; }
-            if(Date.now() - t0 > 180000){ awgManualEnd(false); awgReload(); return; }
-            setTimeout(tick, 2000);
-        };
-        x.onerror = x.ontimeout = function(){
-            if(awgStale(runId)) return;
-            if(Date.now() - t0 > 180000){ awgManualEnd(false); awgReload(); return; }
-            setTimeout(tick, 2500);
-        };
-        x.send();
-    })();
+            if(res === 'truncated') awgCsTruncLive = retained || live;
+            if(res === 'unknown') awgCsStale = true;
+            done(res, { fobj: fobj, live: live, live2: live2 });
+        }
+        if(fr) fr.addEventListener('load', onl);
+        tm = setTimeout(function(){ arrived(true); }, 20000);
+        t0 = Date.now();
+        awgSubmitForm();
+    });
+    return true;
+}
+// After a normal save the model must equal what was written: drop the page-owned keys the final
+// object left out ('' values, meta of unconfigured slots) and take its trimmed values. Only keys
+// still holding the value frozen at entry are touched; the meta of the slot the form is editing
+// is kept (a name typed for a profile that isn't saved yet — it rides the Apply that saves it), and
+// so are the keys the caller forced in the final (`forced`, see awgSave's fixFinal).
+function awgCsSyncModel(mine, fobj, forced){
+    var keep = pfConfigured(awgPfSel) ? {} : pfMetaKeys(awgPfSel);
+    for(var k in mine){
+        if(!mine.hasOwnProperty(k) || !awgCsOwned(k) || custom_settings[k] !== mine[k]) continue;
+        if(forced && forced.hasOwnProperty(k)) continue;
+        if(!fobj.hasOwnProperty(k)){ if(!keep.hasOwnProperty(k)) delete custom_settings[k]; }
+        else if(fobj[k] !== mine[k]) custom_settings[k] = fobj[k];
+    }
+}
+// The user-facing message of a save outcome that means the same for every caller (tail = the
+// action-specific consequence of a discarded save).
+function awgSaveNotify(res, info, tail){
+    info = info || {};
+    if(res === 'overflow') alert(awgOverflowMsg(info.ovf));
+    else if(res === 'conflict'){ if(confirm(T('MSG_CS_CONFLICT'))) awgReloadFresh(); }
+    else if(res === 'busy') alert(T('MSG_ROUTER_BUSY'));
+    else if(res === 'login') alert(T('MSG_SESSION_EXPIRED'));
+    else if(res === 'discarded') alert(T('MSG_SAVE_DISCARDED') + (tail ? '\n' + tail : ''));
+    else if(res === 'unknown') alert(T('MSG_CS_UNKNOWN'));
+    else if(res === 'truncated') alert(T('MSG_STORE_TRUNCATED'));
+}
+// Reload for a conflict: a plain cache-busted GET (no scroll-to-log flag, unlike awgReload).
+function awgReloadFresh(){ window.location.href = window.location.pathname + '?_=' + (new Date()).getTime(); }
+// busyUI for a single button: «Checking…» + disabled while the live store is read, the button's
+// own label/state back at submit (the caller's onSubmit then takes over) or when nothing was posted.
+function awgBtnBusyUI(btn){
+    var lbl = null, dis = false;
+    return function(phase){
+        if(!btn) return;
+        if(phase === 'check'){ lbl = btn.value; dis = btn.disabled; btn._awgChk = true; btn.value = T('BTN_CHECKING'); btn.disabled = true; }
+        else if(lbl !== null){ btn.value = lbl; btn.disabled = dis; btn._awgChk = false; lbl = null; }
+    };
 }
 
 // Load the changelog straight from the repo, fetched by the frontend. Use the
@@ -2024,12 +2502,45 @@ var AWG_CONF_KEY_CANON = (function(){
 var awgPfSel = 1;         // slot the form currently edits
 var awgPfSnapshot = '';   // form state at load — detects unsaved edits on slot change
 var awgPfStatus = null;   // last status.profile from the backend (active/user/auto)
-var awgPfSwitchTo = 0;    // pending target of a «Switch to» submit (select it once posted)
+var awgPfPtrAuto = null;  // the pointer value pfUserFix last wrote (a K13 repair, not a user choice)
+var awgLastStatus = null; // the last status object read (transition guards, switch bookkeeping)
 var awgPfRenderKey = '';  // active|auto of the last bar render (skip needless re-renders)
+var awgPfBarMsg = '';     // the bar's own status line («Deleting…» / «Profile deleted ✓»)
+var awgPfBarMsgTimer = null;
+var awgPfBarBusyRender = false;   // the bar was re-rendered (disabled) while a save held the form
+var awgPfBarLocked = [];          // bar controls disabled by pfBarLock, with their prior state
+var awgPfRenderSeq = 0;           // bumps on every bar draw (a postponed render skips if one happened)
+var awgPfRenderPending = false;   // a harvesting render asked for during a save waits for its end
 
 function pfKey(slot, field){
     if(field === 'name' || field === 'fo') return 'awg_pf' + slot + '_' + field;
     return (slot == 1) ? ('awg_' + field) : ('awg_pf' + slot + '_' + field);
+}
+function pfMetaKeys(slot){
+    var o = {};
+    o[pfKey(slot, 'name')] = 1;
+    o[pfKey(slot, 'fo')] = 1;
+    return o;
+}
+// The profile slot a settings key belongs to (0 = none): awg_pf<N>_* (meta of slot 1 included),
+// or one of slot 1's legacy unsuffixed data keys.
+function pfSlotOfKey(k){
+    var m = /^awg_pf(\d+)_/.exec(k);
+    if(m){ var s = parseInt(m[1], 10); return (s >= 1 && s <= AWG_PF_MAX) ? s : 0; }
+    if(/^awg_initdata\d*$/.test(k)) return 1;
+    return (k.indexOf('awg_') === 0 && AWG_PF_FIELDS.indexOf(k.slice(4)) !== -1) ? 1 : 0;
+}
+// Profile names (C4). The store is whitespace-hostile — the firmware's reader cuts a value at its
+// first space, so «My Phone» came back as «My» and the next save persisted the cut. Names are
+// sanitized (whitespace, the store's | and ; delimiters and < > become one space, 32 chars) and
+// stored with '%' → %25 and ' ' → %20; decoding is one pass over exactly those two escapes, so a
+// legacy raw name (stored before 1.5.26) decodes to itself.
+function pfNameSan(s){
+    return String(s == null ? '' : s).replace(/[\s|;<>]+/g, ' ').replace(/^ +| +$/g, '').slice(0, 32).replace(/[\uD800-\uDBFF]$/, '').replace(/ +$/, '');
+}
+function pfNameEnc(s){ return pfNameSan(s).replace(/%/g, '%25').replace(/ /g, '%20'); }
+function pfNameDec(s){
+    return String(s == null ? '' : s).replace(/%(20|25)/g, function(m, c){ return c === '20' ? ' ' : '%'; });
 }
 function pfUser(){
     var p = parseInt(custom_settings.awg_profile_active, 10);
@@ -2040,21 +2551,45 @@ function pfUser(){
 function pfActiveNow(){
     return (awgPfStatus && awgPfStatus.active >= 1) ? awgPfStatus.active : pfUser();
 }
-function pfConfigured(slot){
-    return !!(custom_settings[pfKey(slot, 'iface_p1')]) && !!(custom_settings[pfKey(slot, 'peer_endpoint')]);
+function pfConfiguredIn(obj, slot){
+    return !!(obj[pfKey(slot, 'iface_p1')]) && !!(obj[pfKey(slot, 'peer_endpoint')]);
+}
+function pfConfigured(slot){ return pfConfiguredIn(custom_settings, slot); }
+// K13 on the page: when the pointer names an EMPTY slot (a ≤1.5.25 delete could leave that), the
+// backend's profile_user runs the lowest configured slot. Normalize the MODEL's pointer the same
+// way — not just the getter — so pfUser() and the status' user agree: the form opens on the profile
+// that really runs, the new row's trash reaches the discard path instead of the primary refusal,
+// and «Add profile» appends a real backup rather than filling the pointed slot (an import there
+// would silently make it the primary). The base keeps the old value, so the next save persists the
+// repair as an ordinary page edit. No configured slot at all (a fresh install) = nothing to fix.
+// The value written is remembered (awgPfPtrAuto): a LEGACY save must still treat the repaired
+// pointer as untouched and follow the backend's user (awgCsBuildFinal).
+function pfUserFix(){
+    if(pfConfigured(pfUser())) return;
+    for(var s = 1; s <= AWG_PF_MAX; s++){
+        if(pfConfigured(s)){ custom_settings.awg_profile_active = awgPfPtrAuto = String(s); return; }
+    }
+}
+// Every profile number the user sees is an ORDINAL (C5): the 1-based position among the
+// configured slots in slot order — stored slot numbers stay stable and are never renumbered, so
+// slots {1,3} read as #1 and #2 (never «3/2»). An unconfigured slot (the unsaved new row) is N+1.
+function pfOrdinal(slot){
+    var k = 0;
+    for(var n = 1; n <= AWG_PF_MAX; n++){ if(pfConfigured(n)){ k++; if(n === slot) return k; } }
+    return k + 1;
 }
 function pfName(slot){
-    var nm = custom_settings[pfKey(slot, 'name')];
-    return nm ? String(nm) : T('PF_UNNAMED', slot);
+    var nm = pfNameDec(custom_settings[pfKey(slot, 'name')] || '');
+    return nm ? nm : T('PF_UNNAMED', pfOrdinal(slot));
 }
 // Derive a default profile name from an imported .conf filename — providers usually name the
 // file after the country/location (Netherlands.conf, nl-amsterdam.conf). Strips any path and
-// the trailing extension, then applies the same sanitation as the name inputs (the store's
-// | and ; delimiters out, whitespace collapsed, capped at 32). Unicode names (Германия.conf)
-// pass through. Empty result (e.g. a dotfile) → caller keeps the "Profile N" fallback.
+// the trailing extension, then applies the same sanitation as the name inputs (pfNameSan).
+// Unicode names (Германия.conf) pass through. Returns the DISPLAY form (the caller encodes it);
+// empty result (e.g. a dotfile) → caller keeps the "Profile N" fallback.
 function pfCleanFileName(fname){
     var base = String(fname || '').replace(/^.*[\\/]/, '').replace(/\.[^.]+$/, '');
-    return base.replace(/[|;]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 32);
+    return pfNameSan(base);
 }
 function pfInitB64(slot){
     var b64 = custom_settings[pfKey(slot, 'initdata')] || '';
@@ -2111,9 +2646,16 @@ function pfWipeSlot(slot){
     delete custom_settings[pfKey(slot, 'fo')];
 }
 
+// The form reads as a DELETE of its slot: no private key, no peer key, no endpoint.
+function pfFormEmpty(){
+    var ids = ['awg_iface_p1', 'awg_peer_p1', 'awg_peer_endpoint'];
+    for(var i = 0; i < ids.length; i++){ if((document.getElementById(ids[i]) || {}).value) return false; }
+    return true;
+}
+
 // Serialize the config form into the slot's keys. Returns false when validation blocks the
-// save (field flagged). A fully-empty form is allowed for a NON-active slot — it wipes the
-// slot (that's how a delete gets persisted) — but the active slot must stay complete.
+// save (field flagged). A fully-empty form (pfFormEmpty) is allowed for a NON-active slot — it
+// wipes the slot (that's how a delete gets persisted) — but the active slot must stay complete.
 function pfStoreForm(slot){
     var vals = {};
     for(var i = 0; i < AWG_PF_FIELDS.length; i++){
@@ -2126,12 +2668,29 @@ function pfStoreForm(slot){
         vals[AWG_PF_FIELDS[i]] = v;
     }
     var pk = vals.iface_p1 || '', pubk = vals.peer_p1 || '', ep = vals.peer_endpoint || '';
-    if(!pk && !pubk && !ep){
+    if(pfFormEmpty()){
         if(slot == pfActiveNow()){
             awgFlagField('awg_iface_p1', T('MSG_REQUIRED_FIELDS'));
             return false;
         }
+        // D6 on this second delete path, the same rule as pfDelete: under a failover override the
+        // USER's primary is not the running slot, yet wiping it would leave the pointer on an empty
+        // slot. An already-empty slot is exempt — wiping it deletes nothing, and a pointer an older
+        // version left on an empty slot must not block every Apply. (pfConfigured still reads the
+        // stored keys here: this function writes only after validation.)
+        if(pfConfigured(slot) && (slot == pfUser() || (awgPfStatus && slot == awgPfStatus.user))){
+            awgFlagField('awg_iface_p1', T('MSG_PF_DEL_PRIMARY'));
+            return false;
+        }
         pfWipeSlot(slot);
+        // Clear the slot's name in the bar too — else applyConfig's harvest right after this
+        // would write the typed name back and resurrect an orphan awg_pfN_name (D3) — and put its
+        // failover box back to the default (on): the harvest keeps an untick of the edited slot,
+        // which a profile imported into the emptied slot later would inherit.
+        var bne = document.getElementById('awg_pf_name_' + slot);
+        if(bne) bne.value = '';
+        var bfe = document.getElementById('awg_pf_fo_' + slot);
+        if(bfe) bfe.checked = true;
         awgPfSnapshot = pfFormSerialize();
         return true;
     }
@@ -2197,40 +2756,73 @@ function pfStoreForm(slot){
 
 // Pull the bar's editable state (names, per-slot failover flags, the global toggle) into the
 // local model. Runs before every bar re-render and on Apply, so typed-but-unsaved values
-// survive a re-render and always ride the next POST.
+// survive a re-render and always ride the next POST. Never while a save holds the form: its
+// rollback / model sync own the model then.
 function pfHarvestBar(){
+    if(awgFormBusy()) return;
     for(var n = 1; n <= AWG_PF_MAX; n++){
+        var nk = pfKey(n, 'name'), fk = pfKey(n, 'fo');
+        // Meta of a slot that is neither configured nor the one being edited is an orphan (a
+        // deleted profile's leftover, D3): never keep it, whatever an input may still show.
+        if(!pfConfigured(n) && n !== awgPfSel){ delete custom_settings[nk]; delete custom_settings[fk]; continue; }
         var ne = document.getElementById('awg_pf_name_' + n);
         if(ne){
-            var v = ne.value.replace(/[|;]/g, ' ').trim().slice(0, 32);
-            if(v) custom_settings[pfKey(n, 'name')] = v; else delete custom_settings[pfKey(n, 'name')];
+            var v = pfNameEnc(ne.value);
+            if(v) custom_settings[nk] = v; else delete custom_settings[nk];
         }
         var fe = document.getElementById('awg_pf_fo_' + n);
         if(fe){
-            // Only configured slots carry a persisted flag — else an empty-form "delete"
-            // followed by this harvest would resurrect an orphan awg_pfN_fo key.
-            if(pfConfigured(n)) custom_settings[pfKey(n, 'fo')] = fe.checked ? '1' : '0';
-            else delete custom_settings[pfKey(n, 'fo')];
+            // A configured slot carries an explicit flag. The EDITED unsaved slot keeps an untick
+            // too (absent = on, as the reader and the backend read it), like its typed name: every
+            // redraw draws the box from the model — a refused Apply's rollback, a re-import, a
+            // status-driven render — so a flag dropped here came back ticked, and the Apply that
+            // saved the profile stored fo=1 against the user's choice. awgCsBuildFinal drops the
+            // meta of unconfigured slots from every POST; the empty-form wipe resets the box.
+            if(pfConfigured(n)) custom_settings[fk] = fe.checked ? '1' : '0';
+            else if(!fe.checked) custom_settings[fk] = '0';
+            else delete custom_settings[fk];
         }
     }
     var fw = document.getElementById('awg_failover');
     if(fw) custom_settings.awg_failover = fw.checked ? '1' : '0';
 }
 
-function pfRenderBar(){
+// noHarvest: render the model as it is (after a save / a rollback the model is the truth and the
+// inputs may still show what was just posted or refused). While a save holds the form only such a
+// render draws (disabled); a harvesting one can't harvest then (pfHarvestBar), and drawing from a
+// model that never saw what is typed into the bar reset it: a save that doesn't harvest the bar
+// (geo update, analyzer start, update) keeps its unapplied names / failover ticks ONLY in the
+// inputs — a status-driven render after a failover hop wiped them, then pfBarLock(false)'s redraw
+// made it final. It waits for the save's end instead and harvests first — unless the bar has been
+// drawn since (the caller's own redraw after a save that harvested on entry: the model is the truth).
+function pfRenderBar(noHarvest){
     var bar = document.getElementById('awg_pf_bar');
     if(!bar) return;
-    pfHarvestBar();
+    var busy = awgFormBusy();
+    if(busy && !noHarvest){
+        if(!awgPfRenderPending){
+            awgPfRenderPending = true;
+            var seq = awgPfRenderSeq;
+            awgAfterSave(function(){ awgPfRenderPending = false; if(awgPfRenderSeq === seq) pfRenderBar(); });
+        }
+        return;
+    }
+    if(!noHarvest) pfHarvestBar();
     var active = pfActiveNow();
     var auto = !!(awgPfStatus && awgPfStatus.auto);
     awgPfRenderKey = active + '|' + (auto ? 1 : 0);
     var trash = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="6" y1="6" x2="18" y2="18"></line><line x1="18" y1="6" x2="6" y2="18"></line></svg>';
+    var dis = busy ? ' disabled' : '';
+    // Configured slots in slot order, numbered by ordinal (C5); the unsaved new row (the form
+    // edits an unconfigured slot) comes LAST as N+1, whatever its slot number.
+    var rows = [], n;
+    for(n = 1; n <= AWG_PF_MAX; n++){ if(pfConfigured(n)) rows.push(n); }
+    var used = rows.length;
+    if(!pfConfigured(awgPfSel)) rows.push(awgPfSel);
     var html = '';
-    var used = 0;
-    for(var n = 1; n <= AWG_PF_MAX; n++){
-        var cfg = pfConfigured(n);
-        if(cfg) used++;
-        if(!cfg && n !== awgPfSel) continue;   // show configured slots + the one being edited
+    for(var ri = 0; ri < rows.length; ri++){
+        n = rows[ri];
+        var cfg = (ri < used);
         // The edited slot shows the LIVE form endpoint (a just-imported .conf is visible
         // before Apply); other slots show their stored value.
         var ep = (n === awgPfSel)
@@ -2238,29 +2830,86 @@ function pfRenderBar(){
             : (custom_settings[pfKey(n, 'peer_endpoint')] || '');
         var foChecked = (custom_settings[pfKey(n, 'fo')] != '0') ? ' checked' : '';
         html += '<div class="awg-pf-row' + (n === awgPfSel ? ' sel' : '') + '" onclick="pfSelect(' + n + ');" title="' + escHtml(T('TITLE_PF_EDIT')) + '">' +
-            '<b style="min-width:14px; text-align:center;">' + n + '</b>' +
-            '<input type="text" class="input_25_table" style="width:150px;" id="awg_pf_name_' + n + '" maxlength="32" value="' + escHtml(custom_settings[pfKey(n, 'name')] || '') + '" placeholder="' + escHtml(T('PF_UNNAMED', n)) + '" onclick="event.stopPropagation();">' +
+            '<b style="min-width:14px; text-align:center;">' + (ri + 1) + '</b>' +
+            '<input type="text" class="input_25_table" style="width:150px;" id="awg_pf_name_' + n + '" maxlength="32" value="' + escHtml(pfNameDec(custom_settings[pfKey(n, 'name')] || '')) + '" placeholder="' + escHtml(T('PF_UNNAMED', ri + 1)) + '" onclick="event.stopPropagation();" oninput="pfUpdateDirtyHint();"' + dis + '>' +
             '<span class="awg-pf-ep">' + (ep ? escHtml(ep) : '<i>' + escHtml(T('LBL_PF_EMPTY')) + '</i>') + '</span>' +
             '<span style="margin-left:auto; display:flex; align-items:center; gap:10px;" onclick="event.stopPropagation();">' +
-                '<label style="font-size:11px; color:#b6bdc7; white-space:nowrap; cursor:pointer;" title="' + escHtml(T('TITLE_PF_FO')) + '"><input type="checkbox" id="awg_pf_fo_' + n + '"' + foChecked + '> ' + escHtml(T('LBL_PF_FO')) + '</label>' +
+                '<label style="font-size:11px; color:#b6bdc7; white-space:nowrap; cursor:pointer;" title="' + escHtml(T('TITLE_PF_FO')) + '"><input type="checkbox" id="awg_pf_fo_' + n + '"' + foChecked + ' onchange="pfUpdateDirtyHint();"' + dis + '> ' + escHtml(T('LBL_PF_FO')) + '</label>' +
                 (n === active
                     ? '<span class="awg-pf-badge' + (auto ? ' auto' : '') + '">' + escHtml(T('LBL_PF_ACTIVE')) + (auto ? ' · ' + escHtml(T('LBL_PF_AUTO')) : '') + '</span>'
-                    : (cfg ? '<input type="button" class="button_gen" style="font-size:11px; padding:2px 10px; font-weight:normal; text-transform:none; letter-spacing:0;" value="' + escHtml(T('BTN_PF_SWITCH')) + '" onclick="pfSwitch(' + n + ');">' : '')) +
-                '<button type="button" class="awg-remove-btn" aria-label="' + escHtml(T('TITLE_PF_DELETE')) + '" title="' + escHtml(T('TITLE_PF_DELETE')) + '" onclick="pfDelete(' + n + ');">' + trash + '</button>' +
+                    : (cfg ? '<input type="button" class="button_gen" style="font-size:11px; padding:2px 10px; font-weight:normal; text-transform:none; letter-spacing:0;" value="' + escHtml(T('BTN_PF_SWITCH')) + '" onclick="pfSwitch(' + n + ');"' + dis + '>' : '')) +
+                '<button type="button" class="awg-remove-btn" aria-label="' + escHtml(T('TITLE_PF_DELETE')) + '" title="' + escHtml(T('TITLE_PF_DELETE')) + '" onclick="pfDelete(' + n + ');"' + dis + '>' + trash + '</button>' +
             '</span>' +
         '</div>';
     }
     var fwChecked = (custom_settings.awg_failover == '1') ? ' checked' : '';
     html += '<div style="display:flex; align-items:center; flex-wrap:wrap; gap:14px; margin-top:5px;">' +
-        '<input type="button" class="button_gen" style="font-size:11px; padding:2px 10px; font-weight:normal; text-transform:none; letter-spacing:0;" value="' + escHtml(T('BTN_PF_ADD')) + '" onclick="pfAdd();"' + (used >= AWG_PF_MAX ? ' disabled' : '') + '>' +
-        '<label style="font-size:12px; cursor:pointer;"><input type="checkbox" id="awg_failover"' + fwChecked + '> <span style="color:#FFCC00;">' + escHtml(T('LBL_PF_FAILOVER')) + '</span></label>' +
+        '<input type="button" class="button_gen" style="font-size:11px; padding:2px 10px; font-weight:normal; text-transform:none; letter-spacing:0;" value="' + escHtml(T('BTN_PF_ADD')) + '" onclick="pfAdd();"' + ((used >= AWG_PF_MAX || busy) ? ' disabled' : '') + '>' +
+        '<label style="font-size:12px; cursor:pointer;"><input type="checkbox" id="awg_failover"' + fwChecked + ' onchange="pfUpdateDirtyHint();"' + dis + '> <span style="color:#FFCC00;">' + escHtml(T('LBL_PF_FAILOVER')) + '</span></label>' +
         '</div>' +
+        '<div id="awg_pf_msg" class="awg-hint" style="color:#5cb85c;' + (awgPfBarMsg ? '' : ' display:none;') + '">' + escHtml(awgPfBarMsg) + '</div>' +
+        '<div id="awg_pf_dirty" class="awg-hint" style="color:#FFCC00; display:none;">' + escHtml(T('HINT_PF_UNSAVED')) + '</div>' +
         '<div class="awg-hint">' + escHtml(T('HINT_PF_BAR')) + ' ' + escHtml(T('HINT_PF_FAILOVER')) + '</div>';
     bar.innerHTML = html;
+    awgPfRenderSeq++;
+    awgPfBarBusyRender = busy;
+    pfUpdateDirtyHint();
+}
+// Disable the bar's controls while a save holds the form, and give them back afterwards. A bar
+// re-rendered during the save (noHarvest only — pfDelete's own) was already drawn disabled
+// (pfRenderBar) — it is simply redrawn.
+function pfBarLock(on){
+    var bar = document.getElementById('awg_pf_bar'), i;
+    if(on){
+        awgPfBarLocked = [];
+        awgPfBarBusyRender = false;
+        if(!bar || !bar.querySelectorAll) return;
+        var els = bar.querySelectorAll('input, button');
+        for(i = 0; i < els.length; i++){ awgPfBarLocked.push([els[i], els[i].disabled]); els[i].disabled = true; }
+        return;
+    }
+    var list = awgPfBarLocked;
+    awgPfBarLocked = [];
+    if(awgPfBarBusyRender){ awgPfBarBusyRender = false; pfRenderBar(true); return; }
+    for(i = 0; i < list.length; i++) list[i][0].disabled = list[i][1];
+}
+// The bar's own status line; a success note clears itself after a few seconds.
+function pfSetBarMsg(msg){
+    awgPfBarMsg = msg || '';
+    if(awgPfBarMsgTimer){ clearTimeout(awgPfBarMsgTimer); awgPfBarMsgTimer = null; }
+    var el = document.getElementById('awg_pf_msg');
+    if(el){ el.textContent = awgPfBarMsg; el.style.display = awgPfBarMsg ? '' : 'none'; }
+    if(awgPfBarMsg && awgPfBarMsg === T('LBL_PF_DELETED'))
+        awgPfBarMsgTimer = setTimeout(function(){ pfSetBarMsg(''); }, 5000);
+}
+// P9: are there profile-list edits — names, per-slot failover flags, the global toggle, a pending
+// delete — that the store doesn't hold yet? Compared SEMANTICALLY with the base, as the firmware's
+// reader shows it (an absent fo = on, an absent global toggle = off, a name decoded + sanitized),
+// so an untouched page over a store that never had those keys stays quiet.
+function pfBarDirty(){
+    for(var n = 1; n <= AWG_PF_MAX; n++){
+        var cb = pfConfiguredIn(awgCsBase, n), cm = pfConfigured(n);
+        if(cb !== cm) return true;          // a pending delete (or a profile the store lacks)
+        if(!cb) continue;                   // unconfigured on both sides: its meta is noise
+        var ne = document.getElementById('awg_pf_name_' + n);
+        var nm = pfNameSan(ne ? ne.value : pfNameDec(awgCsNorm(custom_settings[pfKey(n, 'name')]) || ''));
+        if(nm !== pfNameSan(pfNameDec(awgCsNorm(awgCsBase[pfKey(n, 'name')]) || ''))) return true;
+        var fe = document.getElementById('awg_pf_fo_' + n);
+        var fo = fe ? !!fe.checked : (awgCsNorm(custom_settings[pfKey(n, 'fo')]) !== '0');
+        if(fo !== (awgCsNorm(awgCsBase[pfKey(n, 'fo')]) !== '0')) return true;
+    }
+    var fw = document.getElementById('awg_failover');
+    var fv = fw ? !!fw.checked : (awgCsNorm(custom_settings.awg_failover) === '1');
+    return fv !== (awgCsNorm(awgCsBase.awg_failover) === '1');
+}
+function pfUpdateDirtyHint(){
+    var el = document.getElementById('awg_pf_dirty');
+    if(el) el.style.display = pfBarDirty() ? '' : 'none';
 }
 
 // Re-render only when the backend-reported active/auto pair changed — a blind re-render on
-// every 5s status poll would eat the user's in-progress typing in the name inputs.
+// every 5s status poll would eat the user's in-progress typing in the name inputs. During a save
+// the render waits for the save's end (pfRenderBar), and the key stays old until it draws.
 function pfRenderBarIfChanged(){
     var active = pfActiveNow();
     var auto = !!(awgPfStatus && awgPfStatus.auto);
@@ -2268,47 +2917,115 @@ function pfRenderBarIfChanged(){
 }
 
 function pfSelect(n){
-    if(n === awgPfSel) return;
+    if(n === awgPfSel || awgFormBusy()) return;
     if(pfFormSerialize() !== awgPfSnapshot && !confirm(T('MSG_PF_UNSAVED', pfName(awgPfSel)))) return;
     awgPfSel = n;
     pfLoadForm(n);
 }
 
 function pfAdd(){
-    var free = 0;
-    for(var n = 1; n <= AWG_PF_MAX; n++){ if(!pfConfigured(n)){ free = n; break; } }
+    if(awgFormBusy()){ awgFormBusyRefuse(); return; }
+    // Append (C5): the first free slot AFTER the highest configured one, so the new profile is
+    // numbered last and no existing #k shifts; the lowest free slot only when the tail is full.
+    var hi = 0, free = 0, n;
+    for(n = 1; n <= AWG_PF_MAX; n++){ if(pfConfigured(n)) hi = n; }
+    if(hi < AWG_PF_MAX) free = hi + 1;
+    else { for(n = 1; n <= AWG_PF_MAX; n++){ if(!pfConfigured(n)){ free = n; break; } } }
     if(!free){ alert(T('MSG_PF_FULL', AWG_PF_MAX)); return; }
+    // An unconfigured slot holds nothing worth keeping — but a pre-1.5.26 store may still carry a
+    // deleted profile's name/fo there, which the new profile would silently inherit (D3).
+    if(free !== awgPfSel) pfWipeSlot(free);
     pfSelect(free);
     if(awgPfSel === free) importConfig();   // selection may have been cancelled (unsaved edits)
 }
 
+// Delete = IMMEDIATE (1.5.26): its own settings save (event awgpfsave — the backend only logs it,
+// the tunnel is not restarted), so a delete can't sit unnoticed until some later Apply, and a
+// reload can't bring the profile back. Pending per-slot names / failover flags ride along; the
+// global failover toggle and every other unapplied edit do not.
 function pfDelete(n){
-    if(n === pfActiveNow()){ alert(T('MSG_PF_DEL_ACTIVE')); return; }
-    if(!confirm(T('MSG_PF_DELETE_CONFIRM', pfName(n)))) return;
-    pfHarvestBar();
-    pfWipeSlot(n);
-    if(n === awgPfSel){
-        awgPfSel = pfActiveNow();
-        pfLoadForm(awgPfSel);
-    } else {
-        pfRenderBar();
+    if(awgFormBusy()){ awgFormBusyRefuse(); return; }
+    var ls = awgLastStatus;
+    if(awgTransitionActive || (ls && (ls.starting || ls.stopping))){ alert(T('MSG_PF_WAIT_TRANSITION')); return; }
+    var act = pfActiveNow();
+    if(n === act){ alert(T('MSG_PF_DEL_ACTIVE')); return; }
+    // Under a failover override the USER's primary is not the running slot, yet deleting it
+    // would leave the pointer on an empty slot (D6). Only a profile that exists (here or in the
+    // store) can be the primary — the unsaved new row must always reach its discard below.
+    if((pfConfigured(n) || pfConfiguredIn(awgCsBase, n)) &&
+       ((n === pfUser() && pfUser() !== act) || (awgPfStatus && n === awgPfStatus.user && awgPfStatus.user !== act))){
+        alert(T('MSG_PF_DEL_PRIMARY'));
+        return;
     }
+    // The unsaved new row: nothing of it is on the router — just drop it here.
+    if(!pfConfigured(n) && !pfConfiguredIn(awgCsBase, n)){
+        if(!confirm(T('MSG_PF_DISCARD_NEW', pfName(n)))) return;
+        pfWipeSlot(n);
+        if(n === awgPfSel){ awgPfSel = act; pfLoadForm(awgPfSel); } else pfRenderBar();
+        return;
+    }
+    if(!confirm(T('MSG_PF_DELETE_CONFIRM', pfName(n)))) return;
+    // Everything typed in the bar goes into the model (the global toggle stays PENDING there —
+    // fixFinal below keeps it out of this POST, and the redraw after the save keeps showing it).
+    pfHarvestBar();
+    var snap = awgSettingsSnapshot();
+    var wasSel = (n === awgPfSel);
+    pfWipeSlot(n);
+    var started = awgSave({
+        mode: 'normal', check: 'full', action: 'start_awgpfsave',
+        // The global failover toggle is NOT part of a delete: post the stored value (the model
+        // keeps the pending one for the next Apply).
+        fixFinal: function(f){
+            if(awgCsBase.hasOwnProperty('awg_failover')) f.awg_failover = awgCsBase.awg_failover;
+            else delete f.awg_failover;
+        },
+        done: function(res, info){
+            var stands = (res === 'verified' || res === 'verified-late' || res === 'unverified' ||
+                          res === 'unknown' || res === 'truncated' || res === 'overflow');
+            if(!stands){
+                awgSettingsRestore(snap);
+                pfSetBarMsg('');
+                pfRenderBar(true);
+                awgSaveNotify(res, info, T('TAIL_DELETE'));
+                return;
+            }
+            // The deletion stands — saved, or (overflow) PENDING in the model for the next Apply,
+            // which the P9 hint keeps visible. The pointer must still name a configured slot (K13,
+            // as at load — the guards above keep this a no-op). A deleted edited slot hands the form
+            // to the running profile, so the next Apply can't store the deleted fields back.
+            pfUserFix();
+            if(wasSel){ awgPfSel = pfActiveNow(); pfLoadForm(awgPfSel); }
+            var ok = (res === 'verified' || res === 'verified-late' || res === 'unverified');
+            pfSetBarMsg(ok ? T('LBL_PF_DELETED') : '');
+            pfRenderBar(true);
+            updateFirstRun();
+            if(res === 'overflow'){
+                var o = info.ovf;
+                // One value too long (o.key) or the whole object over 8 KB: either way the row is gone
+                // here while the router still holds the profile — say so before the field's own text
+                // (MSG_PF_DEL_PENDING_OVER's {0}/{1} are TOTAL bytes, so it can't carry a per-value cut).
+                alert(o.key ? (T('MSG_PF_DEL_PENDING_KEY') + '\n\n' + awgOverflowMsg(o))
+                            : (T('MSG_PF_DEL_PENDING_OVER', o.total, AWG_CS_TOTAL_MAX) + awgOverflowBreakdown(o.obj, o.live)));
+            } else if(!ok) awgSaveNotify(res, info);
+        }
+    });
+    if(!started){ awgSettingsRestore(snap); awgFormBusyRefuse(); return; }
+    pfSetBarMsg(T('LBL_PF_DELETING'));
+    pfRenderBar(true);   // the row is gone; drawn disabled while the save runs
 }
 
 // «Switch to» = one submit that persists everything (incl. the form's pending edits) with
-// the new awg_profile_active and fires start_awgswitch → the backend restarts the tunnel on
-// the target slot. The restart-style transition is driven from applyConfig.
+// the new awg_profile_active and fires start_awgswitch<SLOT> → the backend restarts the tunnel on
+// that slot (the slot rides the event, so a save the firmware discarded or another writer
+// overwrote can't restart the CURRENT profile instead). applyConfig sets the pointer inside its
+// own snapshot, so any refusal rolls it back; the transition starts only once the save landed.
 function pfSwitch(n){
     if(!pfConfigured(n)) return;
+    if(awgFormBusy()){ awgFormBusyRefuse(); return; }
+    var ls = awgLastStatus;
+    if(awgTransitionActive || (ls && (ls.starting || ls.stopping || ls.geo_busy))){ alert(T('MSG_PF_SWITCH_BUSY')); return; }
     if(!confirm(T('MSG_PF_SWITCH_CONFIRM', pfName(n)))) return;
-    // Flip the local pointer only for the duration of the submit attempt: a validation
-    // failure inside applyConfig must NOT leave it flipped, or the next plain «Apply»
-    // would silently re-point the backend's config at the other slot without a restart.
-    var prev = custom_settings.awg_profile_active;
-    custom_settings.awg_profile_active = String(n);
-    awgPfSwitchTo = n;
-    if(!applyConfig('start_awgswitch')) custom_settings.awg_profile_active = prev;
-    awgPfSwitchTo = 0;
+    applyConfig('start_awgswitch', { switchTo: n });
 }
 
 function loadSettings(){
@@ -2322,6 +3039,16 @@ function loadSettings(){
             custom_settings[lk] = custom_settings[ok];
         delete custom_settings[ok];
     }
+    // Orphan meta (D3): a ≤1.5.25 delete could leave a slot's name/fo behind, and a profile added
+    // to that slot later inherited the old name. Drop it from the MODEL (right after the legacy
+    // carry-forward above, which can make slot 1 configured) — the base keeps it, so the next save
+    // removes it from the store without reading as a conflict.
+    for(var on = 1; on <= AWG_PF_MAX; on++){
+        if(!pfConfigured(on)){ delete custom_settings[pfKey(on, 'name')]; delete custom_settings[pfKey(on, 'fo')]; }
+    }
+    // A pointer at an empty slot follows the backend's K13 fallback (after the carry-forward and
+    // the sweep above, which decide what is configured; before the form picks its slot from it).
+    pfUserFix();
     // Config form = the user's chosen profile slot (I1-I5 reassembly from the slot's chunked
     // initdata happens inside pfLoadForm; the profile bar renders there too).
     awgPfSel = pfUser();
@@ -2352,13 +3079,22 @@ function forceApply(){
 function awgApplyBtns(){
     return document.querySelectorAll('input[onclick^="saveSettings"], input[onclick^="forceApply"]');
 }
-function awgSetApplyBusy(busy){
+// Idempotent: the button's own label is remembered only on the first busy call, so «Checking…»
+// (the live-store read) followed by «Applying…» (the POST) still restores «Apply» at the end.
+function awgSetApplyBusy(busy, label){
     var b = awgApplyBtns();
     for(var i = 0; i < b.length; i++){
         b[i].disabled = busy;
-        if(busy){ b[i]._lbl = b[i].value; b[i].value = T('BTN_APPLYING'); }
-        else if(b[i]._lbl){ b[i].value = b[i]._lbl; }
+        if(busy){
+            if(!b[i]._awgBusy){ b[i]._lbl = b[i].value; b[i]._awgBusy = true; }
+            b[i].value = label || T('BTN_APPLYING');
+        } else if(b[i]._awgBusy){ b[i].value = b[i]._lbl; b[i]._awgBusy = false; }
     }
+}
+// awgSave busyUI for the Apply family (Apply / Save and restart / Switch to).
+function awgApplyBusyUI(phase){
+    if(phase === 'check') awgSetApplyBusy(true, T('BTN_CHECKING'));
+    else if(phase === 'idle') awgSetApplyBusy(false);
 }
 function awgShowAck(msg, ok){
     var ids = ['awg_ack_top', 'awg_ack_bottom'];
@@ -2399,11 +3135,38 @@ function updateFirstRun(){
     if(sb){ sb.disabled = !activeOk; sb.title = !activeOk ? T('TITLE_IMPORT_FIRST') : ''; }
 }
 
-function applyConfig(actionScript){
+// o.switchTo: «Switch to» that slot (the pointer is set inside the snapshot, so every refusal
+// rolls it back; the action becomes start_awgswitch<slot>).
+function applyConfig(actionScript, o){
+    o = o || {};
+    if(awgFormBusy()){ awgFormBusyRefuse(true); return false; }
+    var sw = o.switchTo || 0;
+    // The bar's typed values go into the model first — exactly what any bar re-render does — so
+    // a refused save rolls back to a model that still holds them (the bar is redrawn from it).
+    pfHarvestBar();
+    // Every refusal below rolls custom_settings back to this snapshot (awgSettingsSnapshot).
+    var snap = awgSettingsSnapshot(), pfSnap = awgPfSnapshot, ptrAuto = awgPfPtrAuto;
+    var wdEl = document.getElementById('awg_wd_hint');
+    var wdPrev = (wdEl && wdEl.style.display !== 'none') ? (wdEl.textContent || '') : '';
+    // Every restore also redraws the bar FROM the restored model (noHarvest): pfStoreForm's
+    // empty-form wipe clears that slot's name input, and a refusal that left the blank input on
+    // screen let the next harvesting render delete the name the rollback had just brought back.
+    // The model was harvested before the snapshot, so typed bar values survive this redraw. The
+    // pointer's provenance goes back with the pointer (pfUserFix below may have repaired it).
+    function rollback(){ awgSettingsRestore(snap); awgPfSnapshot = pfSnap; awgPfPtrAuto = ptrAuto; pfRenderBar(true); updateFirstRun(); }
+    // «Switch to» the row whose form was just emptied: its row still looks configured, but
+    // pfStoreForm would read the empty form as a delete — the click would wipe the profile and
+    // point the store at an empty slot. Refused before anything is touched (the target must be a
+    // profile that exists: pfSwitch checked the model, and only the edited slot can be wiped).
+    if(sw && sw === awgPfSel && pfFormEmpty()){
+        awgFlagField('awg_iface_p1', T('MSG_PF_SWITCH_EMPTY', pfName(sw)));
+        return false;
+    }
     // Serialize the config form into the profile slot it edits (field validation + the
     // per-slot chunked I1-I5 initdata live inside; a blocked save also blocks the submit).
-    if(!pfStoreForm(awgPfSel)) return false;
-    // Profile bar state (names, per-slot failover flags, the global toggle) rides along.
+    if(!pfStoreForm(awgPfSel)){ rollback(); return false; }
+    // Profile bar state (names, per-slot failover flags, the global toggle) rides along; again
+    // after pfStoreForm, whose empty-form wipe clears that slot's name input.
     pfHarvestBar();
 
     // Save default policy and clients
@@ -2414,7 +3177,7 @@ function applyConfig(actionScript){
     // legacy unsuffixed keys (id 1) / id-suffixed keys (id>=2), plus the awg_geo_policies
     // registry. geoSerializePolicies captures the visible tab first and validates the files
     // budget; bail (no submit) if it's exceeded.
-    if(!geoSerializePolicies()) return false;
+    if(!geoSerializePolicies()){ rollback(); return false; }
     custom_settings.awg_geo_autoupdate = document.getElementById('geo_autoupdate').checked ? '1' : '0';
     custom_settings.awg_block_ipv6_dns = document.getElementById('awg_block_ipv6_dns').checked ? '1' : '0';
     custom_settings.awg_no_dns_intercept = document.getElementById('awg_no_dns_intercept').checked ? '1' : '0';
@@ -2442,37 +3205,69 @@ function applyConfig(actionScript){
     custom_settings.awg_update_via_awg = document.getElementById('awg_update_via_awg').checked ? '1' : '0';
     // (Antifilter lists are saved per-policy by geoSerializePolicies above.)
     // (Per-field validation of the config form ran inside pfStoreForm above.)
+    // Not a switch: the pointer must still name a configured slot (K13 — an empty-form wipe may
+    // have emptied the one it names; inside the snapshot, so a refusal rolls this back too).
+    if(sw) custom_settings.awg_profile_active = String(sw);
+    else pfUserFix();
 
-    // Whole-store size guard: the page POSTs the ENTIRE custom_settings object and the
-    // firmware caps one request body at ~64 KB (we budget 52000 URL-encoded, like the .ipk
-    // uploader) — 5 profiles with huge I1-I5 junk blobs can genuinely reach it. Refuse with
-    // a named cause instead of letting the firmware truncate the store silently.
-    var postLen = encodeURIComponent(JSON.stringify(custom_settings)).length;
-    if(postLen > 50000){
-        alert(T('MSG_SETTINGS_TOO_BIG', Math.round(postLen / 1024)));
-        return false;
-    }
-
-    // Submit via the shared helper so we get a completion callback for the ack, and disable
-    // the Apply buttons meanwhile so an impatient second tap can't queue a redundant
-    // firewall rebuild / tunnel restart under the backend lock.
-    awgWdHint('');   // the "press Apply to save" note is fulfilled by this very submit
-    awgSetApplyBusy(true);
-    // Sync the header icon. «Применить» (awgsaveconf) only rebuilds the firewall — no tunnel
-    // cycle — so a light fast-probe suffices. «Сохранить и перезапустить» (awgforceapply) and a
-    // profile switch really do do_stop; do_start, so give them the same guarded amber transition.
-    var restartish = (actionScript === 'start_awgforceapply' || actionScript === 'start_awgswitch');
-    awgSignalWidget(restartish ? 'restart' : 'refresh');
-    awgPostSettings(actionScript, null, null, function(ok){
-        awgSetApplyBusy(false);
-        awgShowAck(ok ? T('ACK_SAVED') : T('ACK_SEND_FAILED'), ok);
+    // Post through the save pipeline (awgSave): live-store conflict check, the store-limit guard
+    // on the object the firmware would really receive (the firmware silently cuts any value over
+    // ~3000 bytes and discards the WHOLE save over 8192 bytes — see AWG_CS_*), then a read-back
+    // that says whether the save landed. The Apply buttons stay disabled meanwhile so an
+    // impatient second tap can't queue a redundant firewall rebuild / tunnel restart.
+    var isForce = (actionScript === 'start_awgforceapply');
+    var swConn;
+    var started = awgSave({
+        mode: 'normal', check: 'full',
+        // The switch target rides as an extra too: a LEGACY save lets an untouched pointer follow
+        // the backend's user (awgCsBuildFinal) — for a switch that would post the CURRENT profile
+        // and the backend would refuse start_awgswitch<N> as «did not reach the store».
+        extra: sw ? { awg_profile_active: String(sw) } : null,
+        action: sw ? ('start_awgswitch' + sw) : actionScript,
+        busyUI: awgApplyBusyUI,
+        onSubmit: function(){
+            awgSetApplyBusy(true);
+            awgWdHint('');   // the "press Apply to save" note is fulfilled by this very submit
+            // Sync the header icon. «Применить» (awgsaveconf) only rebuilds the firewall — no
+            // tunnel cycle — so a light fast-probe suffices; «Сохранить и перезапустить» really
+            // does do_stop; do_start. A switch signals only once its save has landed (done).
+            if(sw) swConn = awgLastStatus ? awgLastStatus.conn_start : undefined;
+            else awgSignalWidget(isForce ? 'restart' : 'refresh');
+        },
+        done: function(res, info){
+            awgSetApplyBusy(false);
+            var landed = (res === 'verified' || res === 'verified-late' || res === 'unverified');
+            if(!landed && res !== 'unknown' && res !== 'truncated'){
+                rollback();   // bar + first-run redrawn inside
+                if(wdPrev) awgWdHint(wdPrev);
+                awgSaveNotify(res, info, sw ? T('TAIL_SWITCH') : (isForce ? T('TAIL_FORCEAPPLY') : ''));
+                return;
+            }
+            // The model now equals what was written (awgSave): redraw the bar from it — a profile
+            // saved just now gets its «Switch to» (D8).
+            pfRenderBar(true);
+            updateFirstRun();
+            if(sw && res !== 'truncated'){
+                // The pointer is in the store: show the target in the form and follow the switch
+                // in the guarded transition (P13 — it resolves on the NEW connection only, and
+                // reports a switch the busy router skipped). The form stayed editable during the
+                // flight, and pfStoreForm froze awgPfSnapshot at entry: anything typed since is
+                // unsaved, so the reload asks first (as pfSelect does). A form already on the target
+                // shows what was just stored — nothing to reload, the late edits stay dirty-armed.
+                // Declining keeps the old slot's edits in the form; the switch itself stands.
+                if(awgPfSel !== sw &&
+                   (pfFormSerialize() === awgPfSnapshot || confirm(T('MSG_PF_UNSAVED', pfName(awgPfSel))))){
+                    awgPfSel = sw;
+                    pfLoadForm(sw);
+                }
+                awgSignalWidget('restart');
+                awgEnterTransition('restart', { n: sw, cs: swConn, t0: Date.now() });
+            }
+            if(res === 'unknown' || res === 'truncated'){ awgSaveNotify(res, info); return; }
+            awgShowAck((res === 'verified-late' && !sw) ? T('ACK_SAVED_BUSY') : T('ACK_SAVED'), true);
+        }
     });
-    if(actionScript === 'start_awgswitch'){
-        // Show the target profile in the form (its stored values just rode the POST) and
-        // drive the page into the guarded restart transition — same UX as «Перезапустить».
-        if(awgPfSwitchTo){ awgPfSel = awgPfSwitchTo; pfLoadForm(awgPfSel); }
-        awgEnterTransition('restart');
-    }
+    if(!started){ rollback(); awgFormBusyRefuse(true); return false; }
     // No full-page reload: status + log refresh live via polling. Reloading after a
     // form POST makes the browser prompt to resubmit the form ("resubmit form").
     return true;
@@ -2659,6 +3454,8 @@ function geoCaptureActive(){
     p.excIps = awgCsv('geo_exc_ips');
     p.excFiles = serializeGeoFiles('exc');
     p.excUrls = serializeGeoUrls('exc');
+    // The rows now hold what survived (partial line already dropped at render): nothing is "cut" anymore.
+    p.filesCut = p.excFilesCut = p.urlsCut = p.excUrlsCut = false;
 }
 // Render the active policy object into the visible panel fields.
 function geoRenderActive(){
@@ -2669,8 +3466,8 @@ function geoRenderActive(){
     set('awg_geo_v2fly', p.v2fly);
     set('geo_custom_domains', p.customDomains);
     set('geo_custom_ips', p.customIps);
-    loadGeoFiles(p.files);
-    loadGeoUrls(p.urls);
+    loadGeoFiles(p.files, '', p.filesCut);
+    loadGeoUrls(p.urls, '', p.urlsCut);
     var sel = (p.antifilter || '').split(','), boxes = document.querySelectorAll('.af_list');
     for(var i=0;i<boxes.length;i++) boxes[i].checked = sel.indexOf(boxes[i].value) !== -1;
     // Mode (include/exclude) + exclusions block.
@@ -2679,8 +3476,8 @@ function geoRenderActive(){
     if(mr) mr.checked = true;
     set('geo_exc_domains', p.excDomains);
     set('geo_exc_ips', p.excIps);
-    loadGeoFiles(p.excFiles, 'exc');
-    loadGeoUrls(p.excUrls, 'exc');
+    loadGeoFiles(p.excFiles, 'exc', p.excFilesCut);
+    loadGeoUrls(p.excUrls, 'exc', p.excUrlsCut);
     updateGeoModeHint();
 }
 // Swap the mode hint text to match the selected include/exclude radio.
@@ -2793,57 +3590,118 @@ function geoHydratePolicies(){
             customDomains: custom_settings[geoKeyJs(pid,'custom_domains')] || '',
             customIps: custom_settings[geoKeyJs(pid,'custom_ips')] || '',
             files: custom_settings[geoKeyJs(pid,'custom_files')] || '',
-            urls: custom_settings[geoKeyJs(pid,'custom_urls')] || '',
+            urls: geoNormUrlsB64(custom_settings[geoKeyJs(pid,'custom_urls')] || ''),
+            // The firmware reader returns at most 2999 bytes of a value: at that length it was cut.
+            filesCut: (custom_settings[geoKeyJs(pid,'custom_files')] || '').length >= 2999,
+            urlsCut: (custom_settings[geoKeyJs(pid,'custom_urls')] || '').length >= 2999,
+            excFilesCut: (custom_settings[geoKeyJs(pid,'exc_files')] || '').length >= 2999,
+            excUrlsCut: (custom_settings[geoKeyJs(pid,'exc_urls')] || '').length >= 2999,
             antifilter: custom_settings[geoKeyJs(pid,'antifilter_lists')] || '',
             mode: (custom_settings[geoKeyJs(pid,'mode')] === 'direct') ? 'direct' : 'vpn',
             excDomains: custom_settings[geoKeyJs(pid,'exc_domains')] || '',
             excIps: custom_settings[geoKeyJs(pid,'exc_ips')] || '',
             excFiles: custom_settings[geoKeyJs(pid,'exc_files')] || '',
-            excUrls: custom_settings[geoKeyJs(pid,'exc_urls')] || ''
+            excUrls: geoNormUrlsB64(custom_settings[geoKeyJs(pid,'exc_urls')] || '')
         });
     }
     geoActiveIdx = 0;
 }
-// Serialize geoPolicies[] back into custom_settings; returns false if the files budget is blown.
+// First URL in a stored custom_urls/exc_urls value (base64 of \n-joined URLs) that the backend
+// would ignore — it fetches only http(s):// links — or '' when all are fine.
+function geoBadUrl(b64){
+    var txt = '';
+    try { txt = decodeURIComponent(escape(atob(b64 || ''))); } catch(e){ return ''; }
+    var a = txt.split('\n');
+    for(var i = 0; i < a.length; i++){
+        var u = a[i].replace(/\s+/g, '');
+        if(u && !/^https?:\/\/([^\/?#@]*@)?([A-Za-z0-9._~%-]+|\[[0-9A-Fa-f:.]+\])(:\d+)?([\/?#]|$)/.test(u)) return u;
+    }
+    return '';
+}
+// Normalize one URL the way the backend fetches (lowercase http(s):// scheme): "HTTPS://x" is
+// lowercased and a bare "example.com/list.txt" (or host:port/...) gets https://. Anything else
+// that looks like a scheme or a local path — "mailto:", "C:\…", "http:/x" — is left as typed so
+// geoBadUrl names it instead of it turning into a bogus https:// "host".
+function geoNormUrl(u){
+    u = String(u || '').replace(/\s+/g, '');
+    if(!u) return '';
+    var sm = /^([a-z][a-z0-9+.-]*):\/\//i.exec(u);
+    if(sm) return sm[1].toLowerCase() + u.slice(sm[1].length);
+    if(/^[a-z][a-z0-9+.-]*:(?!\d)/i.test(u) || u.indexOf('\\') !== -1) return u;
+    return 'https://' + u.replace(/^\/+/, '');
+}
+// geoNormUrl over a stored custom_urls/exc_urls value (base64 of \n-joined URLs), so a legacy
+// "HTTPS://…" on a tab that is never opened is not refused as bad on the next Apply.
+function geoNormUrlsB64(b64){
+    if(!b64) return '';
+    var txt;
+    try { txt = decodeURIComponent(escape(atob(b64))); } catch(e){ return b64; }
+    var a = txt.split('\n'), out = [], ch = false;
+    for(var i = 0; i < a.length; i++){
+        var n = geoNormUrl(a[i]);
+        if(n !== a[i]) ch = true;
+        if(n) out.push(n);
+    }
+    if(!ch) return b64;
+    try { return btoa(unescape(encodeURIComponent(out.join('\n')))); } catch(e){ return b64; }
+}
+// Serialize geoPolicies[] back into custom_settings; returns false (after telling the user and
+// showing the offending tab) when a policy's files can't fit the firmware store or a URL is bad.
 function geoSerializePolicies(){
     geoCaptureActive();
-    var totalFiles = 0, gp, p, suf, si;
+    var gp, p, suf, si, bad;
     var sufs = ['v2fly','v2fly_ip','custom_domains','custom_ips','custom_files','custom_urls','antifilter_lists',
                 'mode','exc_domains','exc_ips','exc_files','exc_urls'];
+    // Files are stored as ONE settings value per tab and channel, and the firmware cuts a value
+    // at ~3000 bytes (see AWG_CS_*): refuse here, naming the tab, instead of saving a list that
+    // comes back cut mid-line (the pre-1.5.24 «files don't save» report).
     for(gp=0; gp<geoPolicies.length; gp++){
         p = geoPolicies[gp];
-        totalFiles += (p.files || '').length + (p.excFiles || '').length;
-        custom_settings[geoKeyJs(p.id,'v2fly')] = p.v2fly || '';
-        custom_settings[geoKeyJs(p.id,'v2fly_ip')] = p.v2flyIp || '';
-        custom_settings[geoKeyJs(p.id,'custom_domains')] = p.customDomains || '';
-        custom_settings[geoKeyJs(p.id,'custom_ips')] = p.customIps || '';
-        custom_settings[geoKeyJs(p.id,'custom_files')] = p.files || '';
-        custom_settings[geoKeyJs(p.id,'custom_urls')] = p.urls || '';
-        custom_settings[geoKeyJs(p.id,'antifilter_lists')] = p.antifilter || '';
-        custom_settings[geoKeyJs(p.id,'mode')] = (p.mode === 'direct') ? 'direct' : 'vpn';
-        custom_settings[geoKeyJs(p.id,'exc_domains')] = p.excDomains || '';
-        custom_settings[geoKeyJs(p.id,'exc_ips')] = p.excIps || '';
-        custom_settings[geoKeyJs(p.id,'exc_files')] = p.excFiles || '';
-        custom_settings[geoKeyJs(p.id,'exc_urls')] = p.excUrls || '';
+        var fl = [[p.files, ''], [p.excFiles, T('GEO_FILES_EXC_SUFFIX')]];
+        for(si=0; si<fl.length; si++){
+            var n = awgUtf8Len(fl[si][0] || '');
+            if(n > AWG_CS_VALUE_MAX){
+                if(gp !== geoActiveIdx) geoSwitchTo(gp);
+                alert(T('MSG_GEO_FILES_TOO_BIG', fl[si][1], geoDecodeName(p.name), n, AWG_CS_VALUE_MAX));
+                return false;
+            }
+        }
+        bad = geoBadUrl(p.urls) || geoBadUrl(p.excUrls);
+        if(bad){
+            if(gp !== geoActiveIdx) geoSwitchTo(gp);
+            alert(T(/^https?:\/\/[^\/?#]*[^\x00-\x7f]/.test(bad) ? 'MSG_GEO_URL_IDN' : 'MSG_GEO_URL_BAD', geoDecodeName(p.name), bad));
+            return false;
+        }
+    }
+    // Empty fields are deleted rather than stored as '' (the page never reads an empty value back,
+    // the backend treats empty == missing, and every byte counts against the shared 8 KB cap);
+    // mode 'vpn' is the default on both sides, so only 'direct' is stored.
+    var put = function(k, v){ if(v) custom_settings[k] = v; else delete custom_settings[k]; };
+    for(gp=0; gp<geoPolicies.length; gp++){
+        p = geoPolicies[gp];
+        put(geoKeyJs(p.id,'v2fly'), p.v2fly);
+        put(geoKeyJs(p.id,'v2fly_ip'), p.v2flyIp);
+        put(geoKeyJs(p.id,'custom_domains'), p.customDomains);
+        put(geoKeyJs(p.id,'custom_ips'), p.customIps);
+        put(geoKeyJs(p.id,'custom_files'), p.files);
+        put(geoKeyJs(p.id,'custom_urls'), p.urls);
+        put(geoKeyJs(p.id,'antifilter_lists'), p.antifilter);
+        put(geoKeyJs(p.id,'mode'), (p.mode === 'direct') ? 'direct' : '');
+        put(geoKeyJs(p.id,'exc_domains'), p.excDomains);
+        put(geoKeyJs(p.id,'exc_ips'), p.excIps);
+        put(geoKeyJs(p.id,'exc_files'), p.excFiles);
+        put(geoKeyJs(p.id,'exc_urls'), p.excUrls);
     }
     custom_settings.awg_geo_policies = geoPolicies.map(function(x){ return x.id + ':' + x.name; }).join(';');
-    // Free the settings budget: blank keys of policies that existed at load but were removed.
+    // Free the settings budget: drop the keys of policies that existed at load but were removed.
     for(var li=0; li<geoLoadedIds.length; li++){
         var oid = geoLoadedIds[li];
         if(geoPolicyIndexById(oid) === -1){
-            for(si=0; si<sufs.length; si++) custom_settings[geoKeyJs(oid,sufs[si])] = '';
+            for(si=0; si<sufs.length; si++) delete custom_settings[geoKeyJs(oid,sufs[si])];
         }
     }
-    // Budget guard: across N policies the per-policy keys (domains/IPs/URLs/files/antifilter)
-    // add up, and Merlin silently truncates a POST body over ~64 KB. Check the WHOLE serialized
-    // store (not just files) against the same ~52000-char cap the upload path uses, so a stack
-    // of large lists across tabs can't corrupt settings on Apply. (Files keep their own message.)
-    if(totalFiles > 40000){ alert(T('MSG_GEO_FILES_TOO_BIG')); return false; }
-    try {
-        if(encodeURIComponent(JSON.stringify(custom_settings)).length > 50000){
-            alert(T('MSG_GEO_FILES_TOO_BIG')); return false;
-        }
-    } catch(e){}
+    // The whole-store limits (other long fields, the 8 KB total) are checked by the callers right
+    // before they POST, once every other setting has been folded in (awgSettingsOverflow).
     return true;
 }
 
@@ -2939,6 +3797,7 @@ function loadGeoSettings(){
 
 function updateGeoLists(){
     if(awgGeoBusy) return;
+    if(awgFormBusy()){ awgFormBusyRefuse(); return; }
     var btn = document.getElementById('btn_geo_update');
     var isDownload = btn && btn.value === T('BTN_GEO_DOWNLOAD');
     var msg = isDownload
@@ -2949,20 +3808,43 @@ function updateGeoLists(){
         msg += T('MSG_WIPE_BEFORE_UPDATE');
     }
     if(!confirm(msg)) return;
+    var snap = awgSettingsSnapshot();
     // Capture the geo policies (incl. a just-added tab + unsaved active-tab edits) into
     // custom_settings, so the backend downloads the CURRENT matrix, not the last-Applied one.
-    if(!geoSerializePolicies()) return;
-    var log = document.getElementById('awg_log');
-    if(log) log.textContent = T('MSG_GEO_LOADING_WAIT');
-    awgSetGeoBusy(true);
+    if(!geoSerializePolicies()){ awgSettingsRestore(snap); return; }
     // Carry the current "download via VPN" choice even without a prior Apply.
     syncViaVpnToggles();
-    // NB this path DOES carry settings (see just above), so it must post the object. It
-    // therefore still writes a page-load snapshot of everything ELSE — a known limitation of the
-    // firmware's whole-object custom_settings API; only paths with no settings intent can clear.
-    document.getElementById('amng_custom').value = JSON.stringify(custom_settings);
-    document.form.action_script.value = "start_awgupdategeo";
-    awgSubmitForm();
+    // A normal settings save (awgSave): same store-limit guard and live-store check as Apply — an
+    // over-limit POST is discarded whole by the firmware, and the backend would then download the
+    // PREVIOUS matrix while the page claims the new one.
+    var log = document.getElementById('awg_log');
+    var logPrev = log ? log.textContent : '';
+    var started = awgSave({
+        mode: 'normal', check: 'full', action: 'start_awgupdategeo',
+        busyUI: awgBtnBusyUI(btn),
+        onSubmit: function(){
+            if(log) log.textContent = T('MSG_GEO_LOADING_WAIT');
+            awgSetGeoBusy(true);
+        },
+        done: function(res, info){
+            if(res === 'verified' || res === 'unverified') return;
+            if(res === 'verified-late'){ awgShowAck(T('ACK_SAVED_BUSY'), true); return; }
+            if(res === 'unknown' || res === 'truncated'){ awgSaveNotify(res, info); return; }
+            // Not saved. The model goes back; the geo tabs keep the edits for the next Apply. No bar
+            // redraw: this path never harvested the bar, so names / failover ticks typed but not yet
+            // applied live only in its inputs — a noHarvest render would wipe them, and the restore
+            // touches no bar key (a status-driven redraw asked for during the save runs once it has
+            // ended, harvesting those inputs first — pfRenderBar).
+            awgSettingsRestore(snap);
+            // A discarded save still fired the event: the router IS downloading — the previously
+            // saved lists — so the busy UI stays (updateStatusUI ends it on geo_busy=false).
+            if(res === 'discarded'){ awgSaveNotify(res, info, T('TAIL_GEO')); return; }
+            if(awgGeoBusy) awgSetGeoBusy(false);
+            if(log && log.textContent === T('MSG_GEO_LOADING_WAIT')) log.textContent = logPrev;
+            awgSaveNotify(res, info);
+        }
+    });
+    if(!started){ awgSettingsRestore(snap); awgFormBusyRefuse(); }
     // No reload: geo progress and result show live in the log + status via polling.
 }
 
@@ -3120,12 +4002,55 @@ function awgSignalWidget(kind){
 // The immediate awgRefreshStatus() lets a router that just came back correct the UI at once.
 function awgActionRecover(pollId){
     clearInterval(pollId);
+    if(pollId === awgPoll){ awgPoll = null; awgTransitionActive = false; }
     setOfflineUI();
     if(!statusTimer) statusTimer = setInterval(awgRefreshStatus, 5000);
     awgRefreshStatus();
 }
+// True from awgEnterTransition until that transition resolves / recovers / is abandoned. The
+// guards test THIS, never awgPoll (only the next transition ever reset that).
+var awgTransitionActive = false;
+// Leave a transition: hand the UI to the steady poll with this status.
+function awgTransitionEnd(poll, s){
+    clearInterval(poll);
+    if(poll === awgPoll){ awgPoll = null; awgTransitionActive = false; }
+    updateStatusUI(s);
+    if(statusTimer) clearInterval(statusTimer);
+    statusTimer = setInterval(awgRefreshStatus, 5000);
+    document.getElementById('btn_start').disabled = false;
+    document.getElementById('btn_stop').disabled = false;
+    document.getElementById('btn_restart').disabled = false;
+}
+
+// A profile switch the router skipped or that failed (P13): a yellow note under the status, with
+// «Retry the switch» for the skipped case — an EMPTY post of start_awgswitch<slot>: the pointer is
+// already in the store, and the backend accepts the switch exactly when it is. (Never «Restart»:
+// under a failover override a plain restart brings the backup profile back, not this one.)
+var awgSwitchWarnSlot = 0, awgSwitchWarnConn = null;
+function awgSwitchWarn(kind, n, s){
+    var el = document.getElementById('awg_switch_warn');
+    awgSwitchWarnSlot = kind ? n : 0;
+    awgSwitchWarnConn = (kind && s) ? s.conn_start : null;
+    if(!el) return;
+    if(!kind){ el.style.display = 'none'; el.innerHTML = ''; return; }
+    var html = escHtml(T(kind === 'skipped' ? 'MSG_SWITCH_SKIPPED' : 'MSG_SWITCH_FAILED'));
+    if(kind === 'skipped')
+        html += '<div style="margin-top:8px;"><input type="button" class="button_gen" value="' + escHtml(T('BTN_SWITCH_RETRY')) + '" onclick="awgRetrySwitch(' + n + ');"></div>';
+    el.innerHTML = html;
+    el.style.display = '';
+}
+function awgRetrySwitch(n){
+    if(awgFormBusy()){ awgFormBusyRefuse(); return; }
+    var ls = awgLastStatus;
+    if(awgTransitionActive || (ls && (ls.starting || ls.stopping))){ alert(T('MSG_PF_SWITCH_BUSY')); return; }
+    var cs = ls ? ls.conn_start : undefined;
+    if(awgPostSettings('start_awgswitch' + n, false, null, function(){}) === false) return;
+    awgSignalWidget('restart');
+    awgEnterTransition('restart', { n: n, cs: cs, t0: Date.now() });
+}
 
 function awgAction(action){
+    if(awgFormBusy()){ awgFormBusyRefuse(); return; }
     // Plain actions (start/stop/restart) carry NO settings: clear the hidden amng_custom, or
     // the submit would re-post the snapshot left there by the LAST settings flow — with
     // profiles that stale snapshot could silently revert an awg_profile_active switched
@@ -3146,7 +4071,13 @@ function awgAction(action){
 // ('start'|'stop'|'restart') and poll until the backend settles. Split out of awgAction so it can
 // run WITHOUT (re)firing the action — that's how a widget-initiated start/stop flips THIS page in
 // lockstep (see window.awgPageSignal) instead of lagging up to one 5s steady poll.
-function awgEnterTransition(kind){
+// sw = { n: target slot, cs: conn_start before the switch, t0: when its save landed } turns it into
+// a SWITCH transition (P13): the old tunnel still reads running=true until the backend gets to the
+// switch — it may queue behind another lock holder for 30 s+ (switch_req says it is on its way) —
+// so it resolves only on a NEW connection of the target profile. No phase at all for 45 s and the
+// same connection = the busy router skipped it; a phase seen and then a steady non-resolved state
+// for 4 s = it failed.
+function awgEnterTransition(kind, sw){
     var badge = document.getElementById('awg_badge');
     var isStop = (kind === 'stop');
     var expect = !isStop;
@@ -3154,6 +4085,9 @@ function awgEnterTransition(kind){
     // Stop periodic refresh and any prior in-flight action poll
     if(statusTimer){ clearInterval(statusTimer); statusTimer = null; }
     if(awgPoll){ clearInterval(awgPoll); awgPoll = null; }
+    awgTransitionActive = true;
+    awgSwitchWarn('');
+    var seen = false, steadySince = 0;
     // Supersede any status read still in flight (steady refresh or a prior action poll) so its
     // pre-click result can't repaint the UI after we've shown the transitional state below.
     awgActionGen++;
@@ -3180,34 +4114,52 @@ function awgEnterTransition(kind){
         var xhr = new XMLHttpRequest();
         xhr.open('GET', '/user/awg_status.htm?_=' + Date.now(), true);
         xhr.timeout = 3000;
+        // A newer action superseded this poll — abandon it (the new action owns the UI).
+        function superseded(){
+            if(myGen === awgActionGen) return false;
+            clearInterval(poll);
+            if(poll === awgPoll){ awgPoll = null; awgTransitionActive = false; }
+            return true;
+        }
         xhr.onload = function(){
-            // A newer action superseded this poll — abandon it (the new action owns the UI).
-            if(myGen !== awgActionGen){ clearInterval(poll); return; }
+            if(superseded()) return;
             try {
                 var s = JSON.parse(xhr.responseText);
-                // Resolve only when the backend reports the expected final state AND no transition
-                // flag is still set. The !starting/!stopping guard is what makes «Перезапустить»
-                // safe: a restart is do_stop→do_start, and the pre-teardown running=true (still ===
-                // expect=true) would otherwise resolve us instantly, hand the UI to the steady poll,
-                // which then catches the brief fully-stopped moment and shows a clickable «Запустить».
-                var ready = (s.running === expect && !s.starting && !s.stopping);
-                if(ready || attempts >= 90){
-                    clearInterval(poll);
-                    updateStatusUI(s);
-                    statusTimer = setInterval(awgRefreshStatus, 5000);
-                    document.getElementById('btn_start').disabled = false;
-                    document.getElementById('btn_stop').disabled = false;
-                    document.getElementById('btn_restart').disabled = false;
+                awgLastStatus = s;
+                var ready;
+                if(sw){
+                    var phase = !!(s.starting || s.stopping || (s.switch_req > 0 && s.switch_req == sw.n));
+                    if(phase) seen = true;
+                    ready = !!(s.running && !s.starting && !s.stopping && String(s.conn_start) !== String(sw.cs) &&
+                               s.profile && s.profile.user == sw.n);
+                    if(!ready && !phase){
+                        if(!seen && String(s.conn_start) === String(sw.cs) && Date.now() - sw.t0 >= 45000){
+                            awgTransitionEnd(poll, s); awgSwitchWarn('skipped', sw.n, s); return;
+                        }
+                        if(seen){
+                            if(!steadySince) steadySince = Date.now();
+                            else if(Date.now() - steadySince >= 4000){ awgTransitionEnd(poll, s); awgSwitchWarn('failed', sw.n, s); return; }
+                        }
+                    } else steadySince = 0;
+                } else {
+                    // Resolve only when the backend reports the expected final state AND no
+                    // transition flag is still set. The !starting/!stopping guard is what makes
+                    // «Перезапустить» safe: a restart is do_stop→do_start, and the pre-teardown
+                    // running=true (still === expect=true) would otherwise resolve us instantly,
+                    // hand the UI to the steady poll, which then catches the brief fully-stopped
+                    // moment and shows a clickable «Запустить».
+                    ready = (s.running === expect && !s.starting && !s.stopping);
                 }
+                if(ready || attempts >= 90) awgTransitionEnd(poll, s);
             } catch(e){
                 if(attempts >= 90){ awgActionRecover(poll); }
             }
         };
-        xhr.onerror = function(){ if(myGen !== awgActionGen){ clearInterval(poll); return; } if(attempts >= 90){ awgActionRecover(poll); } };
+        xhr.onerror = function(){ if(superseded()) return; if(attempts >= 90){ awgActionRecover(poll); } };
         // Without an ontimeout, a router that only times out (typical while a half-started
         // tunnel is breaking routing/DNS) never reaches the attempts>=90 recovery and the
         // poll wedges forever — leaving the page stuck mid-transition. Mirror onerror.
-        xhr.ontimeout = function(){ if(myGen !== awgActionGen){ clearInterval(poll); return; } if(attempts >= 90){ awgActionRecover(poll); } };
+        xhr.ontimeout = function(){ if(superseded()) return; if(attempts >= 90){ awgActionRecover(poll); } };
         xhr.send();
     }, 2000);
     awgPoll = poll;
@@ -3236,27 +4188,40 @@ function awgCopyText(text, done){
 // modal. The modal's "Copy diagnostic data" copies the diagnostics PLUS the
 // current log, wrapped for Telegram — the copy happens inside the click, so it's reliable.
 var awgDiagText = '';
+var awgDiagSeq = 0;
+// Require the completion footer, not a marker quoted somewhere in the diagnostic body.
+function awgDiagMarkOf(txt){
+    var m = /(?:^|\r?\n)\[DIAG_DONE ([a-z0-9-]+)\]\r?\n\[DIAG_DONE\]\s*$/.exec(String(txt || ''));
+    return m ? m[1] : null;
+}
 function awgRunDiag(btn){
+    if(awgFormBusy()){ awgFormBusyRefuse(); return; }
     if(btn){ if(btn._dlbl == null) btn._dlbl = btn.value; btn.value = T('DIAG_COLLECTING'); btn.disabled = true; }
     awgDiagText = '';
     awgOpenDiag(T('DIAG_COLLECTING_WAIT'));
+    // Carry a unique request ID in the event, never in custom_settings. A changed server
+    // token alone cannot distinguish this run from a previous slow run finishing after a retry.
+    // The sequence also separates clicks within one clock tick; randomness separates tabs.
+    var token = Date.now().toString(36) + '-' + (++awgDiagSeq).toString(36) + '-' + Math.random().toString(36).slice(2, 12);
+    var url = '/user/awg_diag_' + token + '.htm';
     // Diag carries NO settings, so clear the hidden field rather than re-posting the page-load
     // snapshot (1.5.13). It used to do a "no-op save", which is not a no-op at all: the firmware
     // writes the whole object back, reverting anything changed since this page loaded (the
     // server page in another tab, a CLI profile switch). Same reasoning as awgAction above.
     var acd = document.getElementById('amng_custom');
     if(acd) acd.value = '';
-    document.form.action_script.value = 'start_awgdiag';
+    document.form.action_script.value = 'start_awgdiag' + token;
     awgSubmitForm();
     var t0 = Date.now();
     (function tick(){
         var x = new XMLHttpRequest();
-        x.open('GET', '/user/awg_diag.htm?_=' + Date.now(), true);
+        x.open('GET', url + '?_=' + Date.now(), true);
         x.timeout = 4000;
         x.onload = function(){
             var txt = x.responseText || '';
-            if(txt.indexOf('[DIAG_DONE]') !== -1){ awgDiagFinish(btn, txt, false); return; }
-            if(Date.now() - t0 > 45000){ awgDiagFinish(btn, txt, true); return; }
+            if(x.status === 200 && awgDiagMarkOf(txt) === token){ awgDiagFinish(btn, txt, false); return; }
+            // Missing files, HTTP errors, partial bodies and other runs never become a report.
+            if(Date.now() - t0 > 45000){ awgDiagFinish(btn, null, true); return; }
             setTimeout(tick, 1500);
         };
         x.onerror = x.ontimeout = function(){
@@ -3268,7 +4233,7 @@ function awgRunDiag(btn){
 }
 function awgDiagFinish(btn, txt, timedOut){
     if(btn){ btn.disabled = false; if(btn._dlbl != null){ btn.value = btn._dlbl; btn._dlbl = null; } }
-    var report = String(txt || '').replace(/\[DIAG_DONE\]/g, '').replace(/\s+$/, '');
+    var report = String(txt || '').replace(/\[DIAG_DONE[^\]]*\]/g, '').replace(/\s+$/, '');
     awgDiagText = report;
     var body = document.getElementById('awg_diag_body');
     if(body){
@@ -3456,25 +4421,57 @@ function awgAnalyzeResumeCheck(){
 function awgAnalyzeToggle(){
     if(awgAnalyzeActive) awgAnalyzeStop(); else awgAnalyzeStart();
 }
+// Start pins the device in awg_analyze_device — and ONLY that: an 'onlyExtra' save posts the live
+// store plus this one key (never this page's unapplied edits). awgAnalyzeStarting spans the whole
+// save; closing the modal meanwhile sets awgAnalyzeCancel (see awgCloseAnalyze): before the POST
+// nothing is sent, after it the capture the router may already have started is stopped.
+var awgAnalyzeStarting = false, awgAnalyzeCancel = false;
 function awgAnalyzeStart(){
-    if(!awgAnalyzeIp) return;
-    // NB this path DOES carry settings (see just above), so it must post the object. It
-    // therefore still writes a page-load snapshot of everything ELSE — a known limitation of the
-    // firmware's whole-object custom_settings API; only paths with no settings intent can clear.
-    custom_settings.awg_analyze_device = awgAnalyzeIp;
-    document.getElementById('amng_custom').value = JSON.stringify(custom_settings);
-    document.form.action_script.value = 'start_awganalyzestart';
-    awgSubmitForm();
-    awgAnalyzeActive = true;
-    awgAnalyzeSetToggle(true);
-    var rows = document.getElementById('awg_analyze_rows');
-    if(rows) rows.innerHTML = '';
-    awgAnalyzeShowEmpty(T('ANALYZE_WAITING'));
-    if(awgAnalyzeTimer) clearInterval(awgAnalyzeTimer);
-    awgAnalyzeTimer = setInterval(awgAnalyzePoll, 1500);
-    setTimeout(awgAnalyzePoll, 700);
+    if(!awgAnalyzeIp || awgAnalyzeStarting) return;
+    if(awgFormBusy()){ awgFormBusyRefuse(); return; }
+    var ip = awgAnalyzeIp, submitted = false;
+    awgAnalyzeCancel = false;
+    awgAnalyzeStarting = true;
+    var started = awgSave({
+        mode: 'onlyExtra', check: 'total', extra: { awg_analyze_device: ip }, action: 'start_awganalyzestart',
+        busyUI: awgBtnBusyUI(document.getElementById('awg_analyze_toggle')),
+        abort: function(){ return awgAnalyzeCancel; },
+        onSubmit: function(){
+            submitted = true;
+            awgAnalyzeActive = true;
+            awgAnalyzeSetToggle(true);
+            var rows = document.getElementById('awg_analyze_rows');
+            if(rows) rows.innerHTML = '';
+            awgAnalyzeShowEmpty(T('ANALYZE_WAITING'));
+            if(awgAnalyzeTimer) clearInterval(awgAnalyzeTimer);
+            awgAnalyzeTimer = setInterval(awgAnalyzePoll, 1500);
+            setTimeout(awgAnalyzePoll, 700);
+        },
+        done: function(res, info){
+            awgAnalyzeStarting = false;
+            // Every post-submit result means the event may have fired on the router.
+            if(awgAnalyzeCancel){ if(submitted) awgAnalyzeStopQuiet(); return; }
+            if(res === 'verified-late'){ awgAnalyzeShowAck(T('ACK_SAVED_BUSY'), false); return; }
+            if(res === 'verified' || res === 'unverified') return;
+            if(res === 'unknown' || res === 'truncated'){ awgSaveNotify(res, info); return; }
+            // A discarded save still fired the event — with the OLD stored device: stop that
+            // capture at once, and show the analyzer as stopped.
+            if(res === 'discarded') awgAnalyzeStopQuiet();
+            awgSaveNotify(res, info, T('TAIL_ANALYZE'));
+        }
+    });
+    if(!started){ awgAnalyzeStarting = false; awgFormBusyRefuse(); }
+}
+// Stop a capture the page no longer shows (an aborted / discarded start): an empty post, and the
+// analyzer UI back to «stopped».
+function awgAnalyzeStopQuiet(){
+    awgPostSettings('start_awganalyzestop', false, null, function(){});
+    awgAnalyzeActive = false;
+    awgAnalyzeSetToggle(false);
+    if(awgAnalyzeTimer){ clearInterval(awgAnalyzeTimer); awgAnalyzeTimer = null; }
 }
 function awgAnalyzeStop(){
+    if(awgFormBusy()){ awgFormBusyRefuse(); return; }
     // Stop carries no settings (unlike Start, which pins awg_analyze_device) — clear, don't
     // re-post the page-load snapshot. See awgAction / awgRunDiag (1.5.13).
     var aca = document.getElementById('amng_custom');
@@ -3790,7 +4787,14 @@ function awgAsnLsSave(){
     } catch(e){}
 }
 function awgCloseAnalyze(){
-    if(awgAnalyzeActive) awgAnalyzeStop();
+    // A start still in its save: cancel it (awgAnalyzeStart's done stops what it may have
+    // started). A running capture while another save holds the form: stop it once that ends —
+    // closing must never leave a hidden capture (+ dnsmasq query logging) running.
+    if(awgAnalyzeStarting) awgAnalyzeCancel = true;
+    else if(awgAnalyzeActive){
+        if(awgFormBusy()) awgAfterSave(function(){ if(awgAnalyzeActive) awgAnalyzeStop(); });
+        else awgAnalyzeStop();
+    }
     if(awgAnalyzeTimer){ clearInterval(awgAnalyzeTimer); awgAnalyzeTimer = null; }
     var m = document.getElementById('awg_analyze_modal');
     if(m) m.style.display = 'none';
@@ -3962,7 +4966,7 @@ function awgRefreshLog(){
         if(x.status !== 200 || !x.responseText) return;
         var box = document.getElementById('awg_log');
         if(!box) return;
-        var lines = x.responseText.replace(/\[DIAG_DONE\]/g, '').replace(/\s+$/, '').split(/\r?\n/);
+        var lines = x.responseText.replace(/\[DIAG_DONE[^\]]*\]/g, '').replace(/\s+$/, '').split(/\r?\n/);
         if(lines.length > 80) lines = lines.slice(-80);
         var atBottom = (box.scrollHeight - box.scrollTop - box.clientHeight) < 30;
         box.textContent = awgDecodePct(lines.join('\n'));
@@ -4093,24 +5097,31 @@ function updateStatusUI(s){
     awgConnUptime = parseInt(s.conn_uptime, 10) || 0;
     awgTickUptime();
 
-    // Config profiles: sync the local pointer, render the status row + refresh the bar.
+    awgLastStatus = s;
+    // Config profiles: render the status row + refresh the bar. The status never writes the
+    // model's pointer any more (D9): the status file can lag the store, and a pointer changed
+    // elsewhere is exactly what the save pipeline's conflict check must see (awgSave).
     if(s.profile && s.profile.active >= 1){
         awgPfStatus = s.profile;
-        // Keep the local copy of the user's persisted choice fresh, so a tab opened before a
-        // switch made elsewhere (CLI, another tab) can't silently revert the pointer with its
-        // next full-object Apply POST. Skipped mid-transition: the backend may not have
-        // processed the in-flight switch settings yet.
-        if(!s.starting && !s.stopping && s.profile.user >= 1)
-            custom_settings.awg_profile_active = String(s.profile.user);
+        pfRecoverLegacyNames(s.profile);
         var pfRow = document.getElementById('awg_profile_row');
         var pfCell = document.getElementById('awg_profile_cell');
         if(pfRow && pfCell){
-            var pfCfgCount = 0;
-            if(s.profile.list){
-                for(var pfi = 0; pfi < s.profile.list.length; pfi++){ if(s.profile.list[pfi].cfg) pfCfgCount++; }
+            // «name (k/N)» with ORDINALS over the configured slots (C5) — never a slot number;
+            // the name comes from the active slot's list entry (the backend sends it decoded,
+            // empty when unnamed).
+            var pfCfg = [], pfActName = '', pfl = s.profile.list || [];
+            for(var pfi = 0; pfi < pfl.length; pfi++){
+                var pfe = pfl[pfi] || {}, pfs = pfe.n || (pfi + 1);
+                if(!pfe.cfg) continue;
+                pfCfg.push(pfs);
+                if(pfs == s.profile.active) pfActName = String(pfe.name || '');
             }
-            if(pfCfgCount > 1 || s.profile.auto){
-                var ptxt = escHtml(s.profile.name || ('#' + s.profile.active)) + ' <span style="color:#b6bdc7;">(' + s.profile.active + '/' + pfCfgCount + ')</span>';
+            var pfK = 0;
+            for(var pfj = 0; pfj < pfCfg.length; pfj++){ if(pfCfg[pfj] == s.profile.active){ pfK = pfj + 1; break; } }
+            if(pfCfg.length > 1 || s.profile.auto){
+                var ptxt = escHtml(pfActName || T('PF_UNNAMED', pfK || '?'));
+                if(pfK) ptxt += ' <span style="color:#b6bdc7;">(' + pfK + '/' + pfCfg.length + ')</span>';
                 if(s.profile.auto) ptxt += ' <span style="color:#f0ad4e;">&middot; ' + escHtml(T('LBL_PF_AUTO')) + '</span>';
                 pfCell.innerHTML = ptxt;
                 pfRow.style.display = '';
@@ -4118,6 +5129,11 @@ function updateStatusUI(s){
                 pfRow.style.display = 'none';
             }
         }
+        // A skipped/failed switch note goes once the switch happened after all, or the user's
+        // choice moved on.
+        if(awgSwitchWarnSlot && (s.profile.user != awgSwitchWarnSlot ||
+           (s.running && !s.starting && !s.stopping && s.profile.active == awgSwitchWarnSlot && String(s.conn_start) !== String(awgSwitchWarnConn))))
+            awgSwitchWarn('');
         pfRenderBarIfChanged();
     }
 
@@ -4199,7 +5215,7 @@ function updateStatusUI(s){
         else if(awgGeoBusySeen && s.geo_busy === false) awgSetGeoBusy(false);
     }
     var geoBtn = document.getElementById('btn_geo_update');
-    if(geoBtn && !awgGeoBusy){
+    if(geoBtn && !awgGeoBusy && !geoBtn._awgChk){   // (_awgChk: awgSave is reading the store for it)
         geoBtn.disabled = false;
         if(s.geo_downloaded){
             geoBtn.value = T('BTN_GEO_UPDATE_NOW');
@@ -4224,12 +5240,36 @@ function updateStatusUI(s){
     renderCoexistWarning(s);
     renderKernelUnsupWarning(s);
     renderCtfBlockWarning(s);
+    renderMemSqueezeWarning(s);
     renderXrayCaptureWarning(s);
     renderFwVpnWarning(s);
     renderDnsGeoWarning(s);
     renderGeoMatchallWarning(s);
     renderNoHandshakeWarning(s);
     renderConfPendingWarning(s);
+}
+
+// Legacy spaced names (D2): a name stored raw before 1.5.26 («My Phone») reached this page cut at
+// its first space («My»), while the backend still reads the whole line and reports it decoded in
+// status. Where the model holds exactly that first word and the stored value is not in the new
+// encoded form (no '%'), put the full name back into the model (and the input, unless the user is
+// typing in it) — the unsaved-changes hint then shows it, and the next save stores it encoded.
+function pfRecoverLegacyNames(p){
+    if(awgFormBusy() || !p || !p.list) return;
+    for(var i = 0; i < p.list.length; i++){
+        var it = p.list[i] || {}, sl = it.n || (i + 1);
+        if(!it.cfg || typeof it.name !== 'string' || it.name.indexOf(' ') === -1) continue;
+        if(sl < 1 || sl > AWG_PF_MAX || !pfConfigured(sl)) continue;
+        var key = pfKey(sl, 'name'), bv = awgCsBase[key];
+        if(bv != null && String(bv).indexOf('%') !== -1) continue;
+        if(pfNameDec(custom_settings[key] || '') !== it.name.split(' ')[0]) continue;
+        var enc = pfNameEnc(it.name);
+        if(!enc || enc === custom_settings[key]) continue;
+        custom_settings[key] = enc;
+        var ne = document.getElementById('awg_pf_name_' + sl);
+        if(ne && document.activeElement !== ne) ne.value = pfNameDec(enc);
+        pfUpdateDirtyHint();
+    }
 }
 
 // Warn when a co-resident proxy/DPI tool (Xray/XRAYUI, zapret, ...) is running AND the
@@ -4317,10 +5357,11 @@ function renderCtfBlockWarning(s){
 // down; the page reconnects after it's back (CTF then off, banner gone, tunnel startable).
 function awgDisableCtf(btn){
     if(awgCtfDisabling) return;
+    if(awgFormBusy()){ awgFormBusyRefuse(); return; }
     if(!confirm(T('CTF_DISABLE_CONFIRM'))) return;
     awgCtfDisabling = true;
     if(btn){ btn.disabled = true; btn.value = T('CTF_DISABLING'); }
-    awgPostSettings('start_awgctfdisable', null, 2, function(){});
+    awgPostSettings('start_awgctfdisable', false, 2, function(){});   // no settings to carry
 }
 
 // "Stop Xray": stop the co-resident XRAYUI through its OWN entry point (backend do_xray_stop ->
@@ -4345,6 +5386,26 @@ function renderFwVpnWarning(s){
         el.style.background = '#3a331a'; el.style.borderColor = '#d9c34f'; el.style.color = '#e8dca0';
         el.innerHTML = T('FWVPN_ENABLED', detail);
     }
+    el.style.display = '';
+}
+
+// Memory envelope at its floor (yellow). On a strict-overcommit firmware
+// (vm.overcommit_memory=2) with little commit headroom the RUNNING daemon was launched with
+// its soft heap ceiling on the 64MiB floor and its buffer pool on the 512 x 64KB liveness
+// floor. A sustained inbound burst then walks through the soft limit into a Go OOM abort,
+// the watchdog restarts the daemon, and the user sees "the VPN drops every few minutes" —
+// with nothing in the UI explaining why. The levers that work are box-side (swap raises
+// CommitLimit 1:1; stopping user-space memory consumers lowers Committed_AS). Backend (only
+// while the tunnel runs): status.mem_squeeze = "floor" (no swap) | "tight" (swap present) |
+// "", mem_detail = "<GOMEMLIMIT MiB>|<pool cap>|<swap MiB>".
+function renderMemSqueezeWarning(s){
+    var el = document.getElementById('awg_mem_warn');
+    if(!el) return;
+    var st = (s && s.mem_squeeze) || '';
+    if(st !== 'floor' && st !== 'tight'){ el.style.display = 'none'; el.innerHTML = ''; return; }
+    var d = String((s && s.mem_detail) || '').split('|');
+    el.innerHTML = T(st === 'floor' ? 'MEM_SQUEEZE_NOSWAP' : 'MEM_SQUEEZE_SWAP',
+                     escHtml(d[0] || '?'), escHtml(d[1] || '?'), escHtml(d[2] || '0'));
     el.style.display = '';
 }
 
@@ -4417,10 +5478,11 @@ function renderNoHandshakeWarning(s){
 
 function awgStopXray(btn){
     if(awgXrayStopping) return;
+    if(awgFormBusy()){ awgFormBusyRefuse(); return; }
     if(!confirm(T('XRAY_STOP_CONFIRM'))) return;
     awgXrayStopping = true;
     if(btn){ btn.disabled = true; btn.value = T('XRAY_STOPPING'); }
-    awgPostSettings('start_awgxraystop', null, 2, function(){
+    awgPostSettings('start_awgxraystop', false, 2, function(){   // no settings to carry
         setTimeout(awgRefreshStatus, 2500);
         setTimeout(function(){ awgXrayStopping = false; awgRefreshStatus(); }, 6000);
     });
@@ -4444,6 +5506,7 @@ function setOfflineUI(){
 }
 
 function importConfig(){
+    if(awgFormBusy()){ awgFormBusyRefuse(); return; }
     var fileInput = document.getElementById('awg_config_file');
     if(!fileInput){
         fileInput = document.createElement('input');
@@ -4606,13 +5669,16 @@ function parseConfig(text, fileName){
     var gotEp = !!((document.getElementById('awg_peer_endpoint') || {}).value);
     var recognized = gotPk || gotPub || gotEp;
     // Default the edited slot's name from the filename (providers name files by country), but
-    // ONLY when it has no name yet — never clobber one the user typed. Set the row's name input
-    // (if the row is rendered) AND the stored key, so it survives the pfRenderBar() harvest.
+    // ONLY when it has no name yet — never clobber one the user typed. Harvest the bar FIRST: a
+    // name typed into the row but not yet harvested lives only in the input (D11). Set the row's
+    // name input (if the row is rendered) AND the stored (encoded) key, so it survives the
+    // pfRenderBar() harvest.
     if(recognized && fileName){
+        pfHarvestBar();
         var nm = pfCleanFileName(fileName);
         var nameKey = pfKey(awgPfSel, 'name');
         if(nm && !custom_settings[nameKey]){
-            custom_settings[nameKey] = nm;
+            custom_settings[nameKey] = pfNameEnc(nm);
             var ne = document.getElementById('awg_pf_name_' + awgPfSel);
             if(ne) ne.value = nm;
         }
@@ -4645,7 +5711,9 @@ function awgCsv(id){
     return el ? String(el.value || '').replace(/["']/g, '').replace(/[\s,]+/g, ',').replace(/^,+|,+$/g, '') : '';
 }
 
-function addGeoFileRow(name, content, kind){
+// `warn` (optional): a notice shown under the textarea — set when the stored value came back cut
+// by the firmware (see loadGeoFiles); it clears as soon as the user edits the content.
+function addGeoFileRow(name, content, kind, warn){
     var tbody = document.getElementById(kind === 'exc' ? 'awg_exc_files_rows' : 'awg_geo_files_rows');
     if(!tbody) return;
     var tr = document.createElement('tr');
@@ -4657,10 +5725,15 @@ function addGeoFileRow(name, content, kind){
                 '<input type="button" class="button_gen" value="✕" title="' + escHtml(T('BTN_REMOVE')) + '" aria-label="' + escHtml(T('BTN_REMOVE')) + '" onclick="removeGeoRow(this);" style="padding:2px 9px;">' +
             '</div>' +
             '<textarea class="geo_file_content awg-geo-ta" rows="3" placeholder="example.com&#10;1.2.3.0/24" spellcheck="false" autocapitalize="off" autocorrect="off"></textarea>' +
+            (warn ? '<div class="awg-hint geo_file_warn" style="color:#ffcc00;">' + escHtml(warn) + '</div>' : '') +
         '</td>';
     tbody.appendChild(tr);
     var ta = tr.querySelector('.geo_file_content');
-    if(ta) ta.value = content || '';   // set via .value so content isn't HTML-parsed
+    if(ta){
+        ta.value = content || '';   // set via .value so content isn't HTML-parsed
+        if(warn) ta.addEventListener('input', function(){ var w = tr.querySelector('.geo_file_warn'); if(w) w.style.display = 'none'; tr.removeAttribute('data-raw'); });
+    }
+    return tr;
 }
 
 function addGeoUrlRow(url, kind){
@@ -4674,7 +5747,7 @@ function addGeoUrlRow(url, kind){
                 '<input type="button" class="button_gen" value="✕" title="' + escHtml(T('BTN_REMOVE')) + '" aria-label="' + escHtml(T('BTN_REMOVE')) + '" onclick="removeGeoRow(this);" style="padding:2px 9px;">' +
             '</div>' +
         '</td>';
-    tbody.appendChild(tr);
+    tbody.insertBefore(tr, tbody.querySelector('tr.geo_url_warn'));   // above a "cut" warning row, if any
 }
 
 function removeGeoRow(btn){
@@ -4689,7 +5762,7 @@ function geoFileLoad(btn){
     if(!row) return;
     var fi = document.createElement('input');
     fi.type = 'file';
-    fi.accept = '.txt,.lst,.conf,.csv';
+    fi.accept = '.txt,.lst,.list,.cidr,.conf,.csv,text/plain';
     fi.style.display = 'none';
     document.body.appendChild(fi);
     fi.onchange = function(){
@@ -4699,6 +5772,8 @@ function geoFileLoad(btn){
             reader.onload = function(e){
                 var ta = row.querySelector('.geo_file_content');
                 if(ta) ta.value = String(e.target.result || '');
+                var w = row.querySelector('.geo_file_warn'); if(w) w.style.display = 'none';
+                row.removeAttribute('data-raw');
                 var nm = row.querySelector('.geo_file_name');
                 if(nm && !nm.value){ nm.value = sanitizeGeoName(f.name.replace(/\.[^.]*$/, '')); }
             };
@@ -4711,14 +5786,22 @@ function geoFileLoad(btn){
 
 function serializeGeoFiles(kind){
     var rows = document.querySelectorAll('#' + (kind === 'exc' ? 'awg_exc_files_rows' : 'awg_geo_files_rows') + ' tr');
-    var parts = [];
+    var parts = [], used = {}, j;
+    for(j = 0; j < rows.length; j++){
+        var un = rows[j].querySelector('.geo_file_name');
+        if(un && un.value) used[sanitizeGeoName(un.value)] = true;
+    }
     for(var i = 0; i < rows.length; i++){
         var nmEl = rows[i].querySelector('.geo_file_name');
         var ctEl = rows[i].querySelector('.geo_file_content');
         if(!nmEl || !ctEl) continue;
         var name = sanitizeGeoName(nmEl.value);
         var content = ctEl.value;
-        if(!name || !content.replace(/\s+/g, '')) continue;   // skip nameless/empty rows
+        var raw = rows[i].getAttribute('data-raw');
+        if(raw && name && !content){ parts.push(name + ',' + raw); continue; }   // damaged, untouched: keep as stored
+        if(!content.replace(/\s+/g, '')) continue;   // skip empty rows
+        // A pasted list without a name used to be dropped SILENTLY on save — name it instead.
+        if(!name){ for(j = 1; used['file' + j]; j++){} name = 'file' + j; used[name] = true; nmEl.value = name; }
         var b64;
         try { b64 = btoa(unescape(encodeURIComponent(content))); } catch(e){ continue; }
         parts.push(name + ',' + b64);
@@ -4730,43 +5813,102 @@ function serializeGeoUrls(kind){
     var inputs = document.querySelectorAll('#' + (kind === 'exc' ? 'awg_exc_url_rows' : 'awg_geo_url_rows') + ' .geo_url');
     var urls = [];
     for(var i = 0; i < inputs.length; i++){
-        var u = String(inputs[i].value || '').replace(/\s+/g, '');
-        if(u) urls.push(u);
+        // Normalize what the backend accepts (it fetches only lowercase-scheme http(s)://): a bare
+        // "example.com/list.txt" gets https://, "HTTPS://" is lowercased. Both used to be dropped
+        // by the router without a word. Written back so the user sees what will be fetched.
+        var u = geoNormUrl(inputs[i].value);
+        if(!u) continue;
+        if(inputs[i].value !== u) inputs[i].value = u;
+        urls.push(u);
     }
     if(!urls.length) return '';
     try { return btoa(unescape(encodeURIComponent(urls.join('\n')))); } catch(e){ return ''; }
 }
 
-function loadGeoFiles(data, kind){
+function loadGeoFiles(data, kind, cut){
     var tbody = document.getElementById(kind === 'exc' ? 'awg_exc_files_rows' : 'awg_geo_files_rows');
     if(!tbody) return;
     tbody.innerHTML = '';
     if(data == null) data = custom_settings.awg_geo_custom_files || '';
     if(!data) return;
-    var entries = data.split(';');
-    for(var i = 0; i < entries.length; i++){
+    // A value at the firmware reader's 2999-byte cap was CUT (see AWG_CS_*): its last file lost
+    // its tail, usually mid-line, and any files after it are gone. atob used to throw on that
+    // (for some name lengths) and the row came back EMPTY — the next Apply then dropped the file
+    // for good; for other lengths the half-line was re-saved as data ("…/24" cut to "/2" = a
+    // quarter of IPv4). Decode what survived, drop the partial line, and say so on the row.
+    // `cut` comes from the STORED value (geoHydratePolicies): rows re-rendered from unsaved edits
+    // must never be cut again. If the cut fell inside a following file's name, that file is gone:
+    // the warning then goes on the last row shown.
+    var entries = data.split(';'), last = -1, i, shown = null;
+    for(i = 0; i < entries.length; i++) if(entries[i]) last = i;
+    var tailcut = !!cut && /[;=]$/.test(data);
+    if(tailcut) cut = false;
+    for(i = 0; i < entries.length; i++){
         if(!entries[i]) continue;
         var ci = entries[i].indexOf(',');
-        if(ci < 0) continue;
-        var name = entries[i].slice(0, ci);
-        var content = '';
-        try { content = decodeURIComponent(escape(atob(entries[i].slice(ci + 1)))); } catch(e){ content = ''; }
-        addGeoFileRow(name, content, kind);
+        if(ci < 0 || ci === 0){
+            if(cut && i === last && shown){ var sw = shown.querySelector('.geo_file_warn'); if(!sw) addGeoFileWarn(shown, T('GEO_FILE_CUT')); }
+            continue;
+        }
+        var name = entries[i].slice(0, ci), b64 = entries[i].slice(ci + 1);
+        var content = '', warn = '', raw = '';
+        if(cut && i === last){
+            content = geoB64DecodeLoose(b64).replace(/\n?[^\n]*$/, '');
+            warn = T('GEO_FILE_CUT');
+        } else if(tailcut && i === last){
+            content = geoB64DecodeLoose(b64);
+        } else {
+            try { content = decodeURIComponent(escape(atob(b64))); } catch(e){ content = ''; warn = T('GEO_FILE_UNREADABLE'); raw = b64; }
+        }
+        shown = addGeoFileRow(name, content, kind, warn);
+        if(raw && shown) shown.setAttribute('data-raw', raw);
     }
+    if(tailcut && shown && !shown.querySelector('.geo_file_warn')) addGeoFileWarn(shown, T('GEO_FILE_CUT'));
+}
+// Put a warning line under an existing file row (used when the file after it was cut away).
+function addGeoFileWarn(tr, msg){
+    var td = tr.querySelector('td'); if(!td) return;
+    var d = document.createElement('div');
+    d.className = 'awg-hint geo_file_warn'; d.style.color = '#ffcc00'; d.textContent = msg;
+    td.appendChild(d);
+}
+// Decode as much of a (possibly truncated) base64 UTF-8 text as survives — the backend b64d rule:
+// stray characters dropped, the stream ends at its first '=', padding repaired (a 2/3-char tail
+// gets its '='s back — a cut between the two '=' loses nothing; a lone 1-char tail is dropped),
+// and a multi-byte character split by the cut is trimmed.
+function geoB64DecodeLoose(b64){
+    b64 = String(b64 || '').replace(/[^A-Za-z0-9+\/=]/g, '');
+    var eq = b64.indexOf('='); if(eq !== -1) b64 = b64.slice(0, eq);
+    var r = b64.length % 4;
+    if(r === 1) b64 = b64.slice(0, -1); else if(r) b64 += (r === 2 ? '==' : '=');
+    var bin = '';
+    try { bin = atob(b64); } catch(e){ return ''; }
+    for(var k = 0; k < 4 && k <= bin.length; k++){
+        try { return decodeURIComponent(escape(bin.slice(0, bin.length - k))); } catch(e){}
+    }
+    return '';
 }
 
-function loadGeoUrls(data, kind){
+function loadGeoUrls(data, kind, cut){
     var tbody = document.getElementById(kind === 'exc' ? 'awg_exc_url_rows' : 'awg_geo_url_rows');
     if(!tbody) return;
     tbody.innerHTML = '';
     if(data == null) data = custom_settings.awg_geo_custom_urls || '';
     if(!data) return;
     var txt = '';
-    try { txt = decodeURIComponent(escape(atob(data))); } catch(e){ txt = ''; }
+    // A value the firmware cut (flag from geoHydratePolicies) keeps all but its partial last URL.
+    if(cut) txt = geoB64DecodeLoose(data).replace(/\n?[^\n]*$/, '');
+    else { try { txt = decodeURIComponent(escape(atob(data))); } catch(e){ txt = geoB64DecodeLoose(data); } }
     var urls = txt.split('\n');
     for(var i = 0; i < urls.length; i++){
         var u = urls[i].replace(/\s+/g, '');
         if(u) addGeoUrlRow(u, kind);
+    }
+    if(cut){
+        var wtr = document.createElement('tr');
+        wtr.className = 'geo_url_warn';
+        wtr.innerHTML = '<td><div class="awg-hint" style="color:#ffcc00;">' + escHtml(T('GEO_URLS_CUT')) + '</div></td>';
+        tbody.appendChild(wtr);
     }
 }
 
@@ -4995,12 +6137,15 @@ function initAutocompleteIp(){
                 <div id="awg_coexist_warn" style="display:none; margin:8px 0 2px 0; padding:9px 12px; background:#3a2e1a; border:1px solid #f0ad4e; border-radius:5px; color:#f0ad4e; font-size:12px; line-height:1.5;"></div>
                 <div id="awg_kernel_warn" style="display:none; margin:8px 0 2px 0; padding:9px 12px; background:#3a331a; border:1px solid #d9c34f; border-radius:5px; color:#e8dca0; font-size:12px; line-height:1.5;"></div>
                 <div id="awg_ctf_warn" style="display:none; margin:8px 0 2px 0; padding:9px 12px; background:#3a1a1a; border:1px solid #d9534f; border-radius:5px; color:#e8a0a0; font-size:12px; line-height:1.5;"></div>
+                <div id="awg_mem_warn" style="display:none; margin:8px 0 2px 0; padding:9px 12px; background:#3a331a; border:1px solid #d9c34f; border-radius:5px; color:#e8dca0; font-size:12px; line-height:1.5;"></div>
                 <div id="awg_xray_warn" style="display:none; margin:8px 0 2px 0; padding:9px 12px; background:#3a2e1a; border:1px solid #f0ad4e; border-radius:5px; color:#f0d9a8; font-size:12px; line-height:1.5;"></div>
                 <div id="awg_geo_matchall_warn" style="display:none; margin:8px 0 2px 0; padding:9px 12px; background:#3a1a1a; border:1px solid #d9534f; border-radius:5px; color:#e8a0a0; font-size:12px; line-height:1.5;"></div>
                 <div id="awg_fwvpn_warn" style="display:none; margin:8px 0 2px 0; padding:9px 12px; border:1px solid; border-radius:5px; font-size:12px; line-height:1.5;"></div>
                 <div id="awg_dnsgeo_warn" style="display:none; margin:8px 0 2px 0; padding:9px 12px; background:#3a331a; border:1px solid #d9c34f; border-radius:5px; color:#e8dca0; font-size:12px; line-height:1.5;"></div>
                 <div id="awg_nohs_warn" style="display:none; margin:8px 0 2px 0; padding:9px 12px; background:#3a331a; border:1px solid #d9c34f; border-radius:5px; color:#e8dca0; font-size:12px; line-height:1.5;"></div>
                 <div id="awg_confpend_warn" style="display:none; margin:8px 0 2px 0; padding:9px 12px; background:#3a331a; border:1px solid #d9c34f; border-radius:5px; color:#e8dca0; font-size:12px; line-height:1.5;"></div>
+                <!-- Skipped / failed profile switch (awgSwitchWarn) -->
+                <div id="awg_switch_warn" style="display:none; margin:8px 0 2px 0; padding:9px 12px; background:#3a331a; border:1px solid #d9c34f; border-radius:5px; color:#e8dca0; font-size:12px; line-height:1.5;"></div>
 
                 <!-- Peers Table -->
                 <div class="awg-section" data-i18n="SEC_CONNECTED_PEERS">Connected peers</div>
@@ -5182,7 +6327,7 @@ function initAutocompleteIp(){
                 <tr>
                     <th>ContentPaddingAddition</th>
                     <td><input type="text" class="input_6_table" id="awg_cpa" maxlength="21" placeholder="10-40" aria-label="ContentPaddingAddition"> <span data-i18n="UNIT_BYTES">bytes</span>
-                        <div class="awg-hint" data-i18n="HINT_AWG3_RANGE">A single number or a "lo-hi" range.</div></td>
+                        <div class="awg-hint" data-i18n="HINT_AWG3_CPA">A single number or a "lo-hi" range: extra bytes per data packet. A padded packet never exceeds the largest one sent since the peer's last reply (500 B minimum), so the biggest packets go unpadded.</div></td>
                 </tr>
                 <tr>
                     <th>RekeyAfterTime</th>
@@ -5225,7 +6370,7 @@ function initAutocompleteIp(){
                             <option value="on">on</option>
                             <option value="off">off</option>
                         </select>
-                        <div class="awg-hint" data-i18n="HINT_AWG31_DC">Never send WireGuard cookie replies (a load-protection message DPI can fingerprint). Affects this side only — safe with any peer.</div></td>
+                        <div class="awg-hint" data-i18n="HINT_AWG31_DC">Never send WireGuard cookie replies (a load-protection message DPI can fingerprint). Affects this side only — safe with any peer. Trade-off: this side loses its handshake-flood protection.</div></td>
                 </tr>
                 </table>
                 <div id="awg31_unsupported" style="display:none; margin-top:8px; padding:6px 10px; border:1px solid #7a6a3a; background:#4a4230; border-radius:3px; font-size:11px; color:#e8dfc8;"
@@ -5436,7 +6581,7 @@ function initAutocompleteIp(){
                     </td>
                 </tr>
                 <tr><td colspan="2">
-                    <div class="awg-hint" data-i18n-html="HINT_GEO_CUSTOM_FORMAT">One entry per line. A domain (<code>example.com</code>) is routed via DNS; an IP or CIDR subnet (<code>1.2.3.0/24</code>) is added to the ipset. Lines starting with <code>#</code> are comments. A URL must return a plain-text list in this format.</div>
+                    <div class="awg-hint" data-i18n-html="HINT_GEO_CUSTOM_FORMAT">One entry per line. A domain (<code>example.com</code>) is routed via DNS; an IPv4 address or CIDR subnet (<code>1.2.3.0/24</code>) is added to the ipset (IPv6 is skipped). Text after <code>#</code> is a comment. A URL must return a plain-text list in this format. Files live inside the firmware's settings store, which holds only <b>about 2 KB of text per tab (~150 lines)</b> — put a bigger list online (e.g. a GitHub raw link) and add it as a URL source: those have no size limit.</div>
 
                     <div style="margin-top:8px; font-weight:bold; font-size:12px;" data-i18n="TH_GEO_FILES">Custom files</div>
                     <table width="100%" border="0" cellpadding="0" cellspacing="0" style="table-layout:fixed;"><tbody id="awg_geo_files_rows"></tbody></table>
@@ -5593,18 +6738,12 @@ function initAutocompleteIp(){
             <select id="awg_install_mode" onchange="awgModeUI();" class="awg-modal-input" aria-label="Install method" data-i18n-aria="ARIA_INSTALL_MODE">
                 <option value="auto" data-i18n="OPT_INSTALL_AUTO">Automatic (latest)</option>
                 <option value="version" data-i18n="OPT_INSTALL_VERSION">Choose version</option>
-                <option value="file" data-i18n="OPT_INSTALL_FILE">Manually from file</option>
+                <option value="file" data-i18n="OPT_INSTALL_FILE">From a local file (over SSH)</option>
             </select>
             <input type="text" id="awg_version_input" placeholder="e.g. 1.1.49" data-i18n-ph="PH_VERSION" maxlength="12" class="awg-modal-input" aria-label="Version to install" data-i18n-aria="ARIA_VERSION_TO_INSTALL" style="width:100px; display:none;">
-            <input type="file" id="awg_ipk_file" accept=".ipk" aria-label=".ipk file to install" data-i18n-aria="ARIA_IPK_FILE" style="display:none; color:#e0e0e0; max-width:100%;">
             <input type="button" id="awg_install_btn" class="button_gen" value="Install" data-i18n-val="BTN_INSTALL" onclick="installUpdate();">
         </div>
-        <div id="awg_manual_progress" style="display:none; padding:0 18px 12px;">
-            <div style="height:10px; background:#1c2226; border:1px solid #555; border-radius:5px; overflow:hidden;">
-                <div id="awg_manual_bar" style="height:100%; width:0%; background:#cf0a2c; transition:width 0.2s;"></div>
-            </div>
-            <div id="awg_manual_msg" style="font-size:11px; opacity:0.85; margin-top:5px;"></div>
-        </div>
+        <div id="awg_file_help" style="display:none; padding:0 18px 12px; font-size:12px; line-height:1.55;"></div>
         <div style="padding:12px 18px; border-top:1px solid #444; display:flex; align-items:center; flex-wrap:wrap; gap:8px;">
             <span id="awg_modal_status" style="font-size:12px; opacity:0.75; margin-right:auto;"></span>
             <input type="button" class="button_gen" value="Check for updates" data-i18n-val="BTN_CHECK_UPDATES" onclick="checkForUpdate();">

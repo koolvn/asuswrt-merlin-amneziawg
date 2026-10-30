@@ -4,7 +4,7 @@
 # Userspace amneziawg-go, per-device policy routing, GeoIP/GeoSite
 # =============================================================
 
-AWG_VERSION="1.5.23"
+AWG_VERSION="1.5.30"
 ADDON_DIR="/jffs/addons/amneziawg"
 AWG_DIR="/opt/amneziawg"
 CONF="$AWG_DIR/awg0.conf"
@@ -37,11 +37,6 @@ ANALYZE_DNS_LOG="/tmp/awg_analyze_dns.log"       # dnsmasq query log, only while
 ANALYZE_DNS_CONF="$AWG_DIR/dnsmasq_analyze.conf" # temp dnsmasq snippet enabling query logging
 ANALYZE_MAX_SECONDS=600                           # auto-stop safety cap (10 min)
 ANALYZE_MAX_ENTRIES=200                           # ring-buffer size for the on-page table
-# Manual .ipk upload (web UI): base64 text is appended here chunk-by-chunk (awgupload
-# event), then decoded + installed (awgmanualinstall). Progress/result the UI polls:
-AWG_UPLOAD_B64="/tmp/amneziawg_manual.ipk.b64"
-AWG_UPLOAD_SEQ="/tmp/.amneziawg_manual.seq"
-AWG_UPLOAD_STATUS="/www/user/awg_upload.htm"
 STARTING_FLAG="/tmp/.awg_starting"
 STOPPING_FLAG="/tmp/.awg_stopping"
 GEO_BUSY_FLAG="/tmp/.awg_geo_busy"
@@ -82,6 +77,12 @@ DNSMASQ_INCLUDE="/jffs/configs/dnsmasq.conf.add"
 DNSRELOAD_SIG="/tmp/.awg_dnsmasq_sig"   # md5 of the geo conf last loaded into dnsmasq (skip needless restarts); tmpfs = reboot-volatile like dnsmasq's own state
 DNSRELOAD_DEFER="/tmp/.awg_dnsreload_defer"     # updater window: reload jobs record PENDING + exit instead of fighting a busy rc (see dnsreload_deferred)
 DNSRELOAD_PENDING="/tmp/.awg_dnsreload_pending" # >=1 reload was swallowed while DEFER was up; the updater fires exactly one at the end
+PRERSLV_STATE="/tmp/.awg_preresolve_state"      # geo pre-resolve progress "<setgen> <list-md5> <done> <total> <since>" — resume/skip across reload jobs (1.5.27)
+PRERSLV_EEX="/tmp/.awg_preresolve_eex"          # "set ip" pairs whose add hit EEXIST in the current run — their timeouts are refreshed when the run completes
+PRERSLV_RETRY="/tmp/.awg_preresolve_retry"      # "domain sets" whose lookup was refused / unanswered in the current run — retried once when the run completes
+GEOSET_GEN="/tmp/.awg_geoset_gen"               # token that changes whenever our geo sets lose their fed entries (destroyed, or created empty)
+PRERSLV_FRESH_S=86400                           # = the sets' default entry timeout: a feed older than this has aged out of the sets and is redone
+GEOSTATIC_SIG="/tmp/.awg_geostatic_sig"         # geo_static_sig of the last rebuild: a change invalidates the pre-resolve cursor (see geo_swap_window_close)
 SCRIPT_NAME="amneziawg"
 RT_TABLE=300
 AWG_CHAIN="AWG"
@@ -93,6 +94,14 @@ LOCKDIR="/tmp/.awg_lock"
 # never truncate each other's launch log or overwrite each other's exit-status file.
 DAEMON_LOG="/tmp/awg_daemon.log"
 DAEMON_RC="/tmp/awg_daemon.rc"
+# "<GOMEMLIMIT>|<pool cap>" the running daemon was ACTUALLY launched with (written by
+# launch_daemon). A recompute while the tunnel is up would count the daemon's own commit
+# against itself and quote a ceiling it never got — readers use this file instead.
+DAEMON_TUNE="/tmp/awg_daemon.tune"
+# Excerpt of the last Go crash trace (panic / fault). DAEMON_LOG is truncated on every
+# launch, and the watchdog relaunches within minutes — without this copy the traceback of
+# a crash worth reporting is gone before anyone reads the incident.
+DAEMON_CRASH="/tmp/awg_daemon.crash"
 # --- AWG server role (amneziawg_server.sh) — read-only coexistence constants ---
 # The client script needs limited visibility into the server instance: per-peer policy
 # routing (server peers are policy sources exactly like LAN devices), the mangle
@@ -187,9 +196,17 @@ ipset(){
 # --- Helpers ---
 
 log_msg(){
-    logger -t "$SCRIPT_NAME" "$1"
+    # Neutralize ASP-tag openers ("<" followed by "%" or "#") ONCE, for both sinks: the journal
+    # lands in /www/user/awg_log.htm directly and, via syslog, in the status JSON and the diag —
+    # every .htm/.asp under /www/user runs through the firmware's ASP evaluator, which LIVELOCKS
+    # the single-threaded httpd on an unterminated "< %" and swaps "< #...# >" for dictionary text.
+    # User text reaches this function (profile names, pasted endpoints, dnsmasq errors). Fork-free
+    # in the common (clean) case: the case-guard runs before any sed.
+    local _m="$1"
+    case "$_m" in *\<[%#]*) _m=$(printf '%s' "$_m" | sed 's/<\([%#]\)/< \1/g') ;; esac
+    logger -t "$SCRIPT_NAME" "$_m"
     # Real-time on-page log (web-readable, polled by the UI); reset per user action.
-    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$UI_LOG" 2>/dev/null
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $_m" >> "$UI_LOG" 2>/dev/null
 }
 
 # Clear the on-page log at the start of a user-facing operation
@@ -213,8 +230,124 @@ awg_incident(){
     fi
 }
 
+# Read one custom_settings value exactly as the FIRMWARE's own reader sees it. Merlin writes each
+# record with snprintf(line, 3040, "%s %s\n"): a key+value longer than 3037 bytes is cut at 3039
+# bytes AND LOSES ITS NEWLINE, so the NEXT key lands glued onto the same physical line. The page's
+# reader (fgets(line, 3040)) re-syncs exactly at that 3039-byte boundary and still sees the glued
+# key; a plain per-line `$1==key` never did (field 2026-09, 1.5.22: a long «Свои файлы» value
+# swallowed awg_geo_custom_urls — the page showed the URL, the router never fetched it). So split
+# every over-long physical line into 3039-byte records first, then match "key " at record start.
+# A key present twice resolves to the LAST copy, like the page (json-c: the later add replaces).
+# LC_ALL=C: byte offsets, whichever awk (busybox / Entware gawk) is first on PATH.
 get_setting(){
-    awk -v key="$1" '$1==key{sub(/^[^ ]+ /,"");print;exit}' "$SETTINGS" 2>/dev/null
+    LC_ALL=C awk -v key="$1" '
+        function hit(r) { if (index(r, key " ") == 1) { v = substr(r, length(key) + 2); f = 1 } }
+        { r = $0
+          while (length(r) > 3039) { hit(substr(r, 1, 3039)); r = substr(r, 3040) }
+          hit(r) }
+        END { if (f) print v }' "$SETTINGS" 2>/dev/null
+}
+
+# Is $2 (the value of setting $1) one the firmware cut? Two fingerprints: its writer cuts a record
+# at 3039 bytes, leaving exactly 3038-len(key) value bytes; and the pre-1.5.24 page, which could
+# only read back 2999 bytes, re-saved such a cut view re-encoded — 2999..3001 chars. (An intact
+# 3000/3001-char value is flagged too; the page itself can only show it cut, so nothing is lost
+# that the next page save wouldn't lose anyway.)
+setting_is_cut(){
+    case "${#2}" in 2999|3000|3001) return 0 ;; esac
+    [ "${#2}" -eq $((3038 - ${#1})) ]
+}
+
+# Base64-decode stdin -> stdout. Merlin's busybox is built WITHOUT the base64 applet (config_base:
+# "# CONFIG_BASE64 is not set", every branch) and a default Entware adds none — so the bare
+# `base64 -d 2>/dev/null` this script used to call decoded NOTHING on such boxes, silently:
+# GeoCustom URL sources were never fetched, pasted files never loaded, and I1-I5 never reached
+# awg0.conf (bench GT-AX6000 @ 3006.102.8: "base64: not found"). Chain: base64 -> the firmware's
+# own openssl (always shipped) -> a pure-awk decoder. Non-alphabet bytes are ignored, the stream
+# ends at its first '=' (openssl reads interior padding differently from base64/awk), and the
+# padding is then REPAIRED ("forgiving base64": a 2/3-char tail gets its '='s back, a lone
+# 1-char tail is dropped) — so a value the firmware truncated, even between its two '=', still
+# decodes every byte it holds, identically on all three. The awk path is text-only (a NUL byte may be lost on some
+# busybox builds) — every caller decodes text. Callers that decode in a pipeline or $( ) should
+# run b64d_init first in their own shell, so the probe result is inherited, not re-run per call.
+b64d_init(){
+    [ -n "$AWG_B64D" ] && return 0
+    if [ "$(echo aGk= | base64 -d 2>/dev/null)" = hi ]; then AWG_B64D=base64
+    elif [ "$(echo aGk= | openssl base64 -d -A 2>/dev/null)" = hi ]; then AWG_B64D=openssl
+    else AWG_B64D=awk; fi
+}
+b64d(){
+    b64d_init
+    LC_ALL=C awk '{ gsub(/[^A-Za-z0-9+\/=]/, ""); s = s $0 }
+        END { p = index(s, "="); if (p > 0) s = substr(s, 1, p - 1)
+              n = length(s); r = n % 4
+              if (r == 1) s = substr(s, 1, n - 1); else if (r == 2) s = s "=="; else if (r == 3) s = s "="
+              if (s != "") print s }' |
+    case "$AWG_B64D" in
+        base64)  base64 -d 2>/dev/null ;;
+        openssl) openssl base64 -d -A 2>/dev/null ;;
+        *) LC_ALL=C awk '
+            BEGIN { a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+                    for (i = 0; i < 64; i++) v[substr(a, i + 1, 1)] = i }
+            { s = s $0 }
+            END { n = length(s)
+                  for (i = 1; i + 3 <= n; i += 4) {
+                      c3 = substr(s, i + 2, 1); c4 = substr(s, i + 3, 1)
+                      x = v[substr(s, i, 1)] * 262144 + v[substr(s, i + 1, 1)] * 4096 + v[c3] * 64 + v[c4]
+                      printf "%c", int(x / 65536)
+                      if (c3 != "=") printf "%c", int(x / 256) % 256
+                      if (c4 != "=") printf "%c", x % 256
+                  } }' ;;
+    esac
+}
+
+# First 16 hex of sha256("<url>\n") — the shared-pool file name of a GeoCustom URL source. Falls
+# back to the firmware's openssl where busybox has no sha256sum applet; same digest, so files
+# already downloaded under the old names keep them.
+url_key(){
+    local h
+    h=$(echo "$1" | sha256sum 2>/dev/null | awk '{print $1}')
+    [ -n "$h" ] || h=$(echo "$1" | openssl dgst -sha256 2>/dev/null | awk '{print $NF}')
+    echo "$h" | cut -c1-16
+}
+
+# Install the rewritten settings file $1 only if it holds exactly $2 lines. busybox grep/awk can
+# exit 0 after a FAILED write (ENOSPC on a full JFFS), and a blind `> tmp && mv` then installed a
+# truncated or empty custom_settings.txt — every addon's settings gone. Refuse, keep the original.
+settings_commit(){
+    local tmp="$1" want="$2" got
+    got=$(wc -l < "$tmp" 2>/dev/null)
+    if [ -n "$got" ] && [ "$got" -eq "${want:-0}" ] 2>/dev/null && mv "$tmp" "$SETTINGS" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$tmp" 2>/dev/null
+    log_msg "WARNING: could not rewrite $SETTINGS (disk full?) — left it unchanged"
+    return 1
+}
+
+# The writers below edit custom_settings.txt by PHYSICAL line (grep -v "^key "), but get_setting
+# also sees a key the firmware glued onto an over-long line (see get_setting) — which a per-line
+# writer can never match: clear_setting was a no-op for it, and set_setting/migrate_watchdog_hosts
+# appended a second copy, so migrate_watchdog_hosts would have rewritten the file on every run,
+# i.e. every minute. Before editing, re-frame the file the way the firmware reader does: every line
+# over 3039 bytes becomes 3039-byte records, one per line. A cut value stays cut (that data never
+# reached the flash), but each glued key is a normal line again — exactly what the page already
+# sees. No rewrite at all when nothing is glued. The re-framed copy must carry every byte of the
+# original (only newlines are added) or it is not installed — see settings_commit for why.
+settings_unglue(){
+    local tmp
+    [ -f "$SETTINGS" ] || return 0
+    LC_ALL=C awk 'length($0) > 3039 { f = 1; exit } END { exit !f }' "$SETTINGS" 2>/dev/null || return 0
+    tmp="$SETTINGS.awgtmp.$$"
+    LC_ALL=C awk '{ r = $0; while (length(r) > 3039) { print substr(r, 1, 3039); r = substr(r, 3040) }
+                    if (r != "") print r }' "$SETTINGS" > "$tmp" 2>/dev/null
+    if [ -s "$tmp" ] && [ "$(tr -d '\n' < "$tmp" | wc -c)" -eq "$(tr -d '\n' < "$SETTINGS" | wc -c)" ] \
+       && mv "$tmp" "$SETTINGS" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$tmp" 2>/dev/null
+    log_msg "WARNING: could not re-frame $SETTINGS (disk full?) — left it unchanged"
+    return 1
 }
 
 # Remove a custom-settings line. Used for one-shot keys (e.g. awg_update_version) so a
@@ -222,10 +355,11 @@ get_setting(){
 clear_setting(){
     local key="$1" tmp
     [ -f "$SETTINGS" ] || return 0
+    settings_unglue || return 1
     grep -q "^$key " "$SETTINGS" 2>/dev/null || return 0
     tmp="$SETTINGS.awgtmp.$$"
-    grep -v "^$key " "$SETTINGS" > "$tmp" 2>/dev/null && mv "$tmp" "$SETTINGS"
-    rm -f "$tmp" 2>/dev/null
+    grep -v "^$key " "$SETTINGS" > "$tmp" 2>/dev/null
+    settings_commit "$tmp" "$(grep -vc "^$key " "$SETTINGS" 2>/dev/null)"
 }
 
 # Rename one custom_settings key, carrying its value to $new (only if $new isn't already
@@ -233,15 +367,17 @@ clear_setting(){
 _awg_rename_setting(){
     local old="$1" new="$2" val tmp
     [ -f "$SETTINGS" ] || return 0
-    grep -q "^$old " "$SETTINGS" 2>/dev/null || return 0   # nothing stored under the old key
+    grep -q "$old " "$SETTINGS" 2>/dev/null || return 0     # nothing stored under the old key (glued included)
+    settings_unglue || return 1
+    grep -q "^$old " "$SETTINGS" 2>/dev/null || return 0
     if grep -q "^$new " "$SETTINGS" 2>/dev/null; then
         clear_setting "$old"                               # new key already set -> just drop the stale line
         return 0
     fi
     val=$(get_setting "$old")
     tmp="$SETTINGS.awgtmp.$$"
-    { grep -v "^$old " "$SETTINGS"; echo "$new $val"; } > "$tmp" 2>/dev/null && mv "$tmp" "$SETTINGS"
-    rm -f "$tmp" 2>/dev/null
+    { grep -v "^$old " "$SETTINGS"; echo "$new $val"; } > "$tmp" 2>/dev/null
+    settings_commit "$tmp" $(( $(grep -vc "^$old " "$SETTINGS" 2>/dev/null) + 1 ))
 }
 
 # One-time migration of the credential-flavored keys used up to 1.1.88 to neutral names.
@@ -266,9 +402,249 @@ migrate_watchdog_hosts(){
     val=$(get_setting awg_watchdog_hosts)
     case "$val" in *" "*) ;; *) return 0 ;; esac
     val=$(printf '%s' "$val" | tr -s ' ' ',')
+    settings_unglue || return 1   # a glued copy would survive the grep -v below and re-trigger this forever
     tmp="$SETTINGS.awgtmp.$$"
-    { grep -v "^awg_watchdog_hosts " "$SETTINGS"; echo "awg_watchdog_hosts $val"; } > "$tmp" 2>/dev/null && mv "$tmp" "$SETTINGS"
-    rm -f "$tmp" 2>/dev/null
+    { grep -v "^awg_watchdog_hosts " "$SETTINGS"; echo "awg_watchdog_hosts $val"; } > "$tmp" 2>/dev/null
+    settings_commit "$tmp" $(( $(grep -vc "^awg_watchdog_hosts " "$SETTINGS" 2>/dev/null) + 1 ))
+}
+
+# The store rescues that must land before a page reads the store back and re-saves a cut view
+# (every page POSTs the whole object it loaded). ONE framing-aware awk pass detects all three, so
+# a clean store costs a single awk per invocation — both dispatches run this first, i.e. every
+# minute from the status crons. It prints a flag per defect found; nothing = a no-op:
+#  w  whitespace inside the AWG-server peer store (awgs_peers + its awgs_peers1..10 chunks),
+#     rewritten to '_' below. Same class as migrate_watchdog_hosts, with a worse blast radius: the
+#     firmware stores a spaced value intact, but the page's read-back (sscanf "%2999s") cuts it at
+#     the FIRST whitespace — one peer named "My phone" cut the WHOLE store at "My", and the next
+#     save of EITHER page persisted the cut. The server page now maps whitespace in names to '_';
+#     this rescues stores saved before that. LENGTH-PRESERVING (one byte for one byte), so it
+#     never moves a chunk boundary — the o pass below judges the sizes.
+#  o  a peer-store chunk over 2900 bytes — the last one included: nothing since 1.5.26 writes one,
+#     and a last chunk over 2999 bytes is read back cut too (silently: its tail is e.g. the psk) —
+#     see _srv_peers_rechunk. Walks the chunks the way the readers do (awgs_peers, then 1..10 up
+#     to the first empty one); last copy wins. A too-SHORT chunk is left alone on purpose: no
+#     writer makes one, it is a cut view some page re-saved, and the page's chunk check is the
+#     only thing that still notices that — re-splitting would hide the damage, not repair it.
+#  n  a raw config-profile name holding whitespace — see migrate_profile_names.
+# `grep -c ''` counts an unterminated last line too (a record the firmware cut at 3039 bytes
+# loses its newline) — awk newline-terminates every line it prints, so the counts must match.
+migrate_server_peers(){
+    local tmp flags
+    [ -f "$SETTINGS" ] || return 0
+    flags=$(LC_ALL=C awk '
+        function scan(r,   sp, k, v) { sp = index(r, " "); if (sp < 2) return; k = substr(r, 1, sp - 1)
+                                       if (k ~ /^awgs_peers([1-9]|10)?$/) { v = substr(r, sp + 1); pk[k] = v; if (v ~ /[[:space:]]/) w = "w" }
+                                       else if (k ~ /^awg_pf[1-5]_name$/ && substr(r, sp + 1) ~ /[[:space:]]/) n = "n" }
+        { r = $0; while (length(r) > 3039) { scan(substr(r, 1, 3039)); r = substr(r, 3040) }
+          scan(r) }
+        END { for (i = 0; i <= 10; i++) { k = "awgs_peers" (i ? i : ""); if (pk[k] == "") break
+                  if (length(pk[k]) > 2900) o = "o" }
+              printf "%s%s%s", w, o, n }' "$SETTINGS" 2>/dev/null)
+    [ -n "$flags" ] || return 0
+    case "$flags" in *n*) migrate_profile_names ;; esac
+    case "$flags" in *w*)
+        settings_unglue || return 1   # a glued chunk must be its own line before the per-line rewrite
+        tmp="$SETTINGS.awgtmp.$$"
+        LC_ALL=C awk '{ sp = index($0, " "); k = (sp > 1) ? substr($0, 1, sp - 1) : ""
+                        if (k ~ /^awgs_peers([1-9]|10)?$/) { v = substr($0, sp + 1); gsub(/[[:space:]]/, "_", v); print k " " v }
+                        else print }' "$SETTINGS" > "$tmp" 2>/dev/null
+        settings_commit "$tmp" "$(grep -c '' "$SETTINGS" 2>/dev/null)" || return 1
+        log_msg "AWG server peer store: whitespace in peer names replaced by '_' (the settings read-back cut the store at the first space)"
+    esac
+    case "$flags" in *o*) _srv_peers_rechunk ;; esac
+    return 0
+}
+
+# Re-split the peer store into chunks of at most 2900 BYTES, never inside a UTF-8 character —
+# byte for byte what the 1.5.26 page writes (awgsSplitBytes: greedy, so every chunk but the last
+# is 2897-2900 bytes, the only sizes its chunk check accepts). Pages up to 1.5.25 cut the store
+# every 2900 CHARACTERS: ~17 peers with Cyrillic names made a chunk over 2999 bytes, which the
+# page reads back cut, so the boundary peer (in the last chunk: e.g. its psk) lost its tail on
+# the next save of either page — and the 1.5.26 page's chunk check refuses every server save
+# instead, a lockout only SSH could lift. The readers (srv_peers_raw, server_peer_policy_entries,
+# the page) just concatenate the chunks, so moving the boundaries is lossless for an intact store.
+# A store the firmware already cut lost that data for good — and the re-split would erase the only
+# evidence the page has of it: the page finds a cut junction (and flags the entry across it,
+# whatever its field count) from the chunk SIZES alone, which this pass normalizes. So the cut is
+# judged HERE, per chain chunk, by the fingerprints setting_is_cut uses: its writer left exactly
+# 3038-len(key) bytes, or a page (a client Apply) re-saved the 2999-byte read-back view — a
+# character that view split re-encoded as U+FFFD, up to 3001 bytes; that U+FFFD is dropped. The
+# entry spanning such a junction (the chunk's end, the list's end for the last one) glues its HEAD
+# (what the cut chunk kept) to a TAIL resumed past the lost bytes — from anywhere in a peer, a
+# private key or psk included. Whole, it must meet the page's own shape (serializePeers: 8-9
+# fields, a dotted-quad IP, the policy/mode/flag tokens, 44-char keys); one that does is KEPT, with
+# a softer WARNING: a cut inside the name still leaves a working peer, and the fingerprint can hit
+# an intact chunk too (3028 bytes that only lost the record's newline, a 3000-byte one the page
+# could not read whole). One that does not is split at the junction and each side is judged ON ITS
+# OWN — a stub, a label, a journal line takes nothing from the tail unless the tail meets the shape
+# by itself (then its text up to the first '|' is provably a name: every other field is followed
+# by a token, a key or the flag, never by a dotted-quad IP. Found in the 1.5.26 review: a head
+# holding no '|' took the private key after the junction as its name — into the store, the
+# journal and the syslog the diag carries):
+#  - the head is CUT DOWN to its name and IP — the IP only when its closing '|' survived too (one
+#    the cut ran into may read as a wrong address: 10.9.0.1 of 10.9.0.18), a lone name fragment
+#    gets a '|' so the page cannot take it for a whitespace cut. Left whole, the page showed it as
+#    a healthy peer (a 36-char psk, two peers merged into one) and its next save persisted it;
+#    with fewer than 8 fields its own damaged-entry check takes over again — the red banner names
+#    it (same label: name + IP) and the next server save drops it once the user confirms. Removing
+#    it here instead would delete user data with no trace but a journal line the next user action
+#    resets. A head that meets the shape with all three keys (the cut fell after its psk) is kept;
+#  - the tail is KEPT as a peer of its own when it meets the shape: the lost bytes ended inside
+#    the next peer's name, its IP and keys all survived (glued to the head, it was cut down with it
+#    and no line named it). Anything else is DROPPED: it holds no name or whole IP of its own — at
+#    most keys and an IP fragment, which no peer can be rebuilt from.
+# Each judgement is a WARNING. Bytes that are not valid UTF-8 (a character the writer's cut split
+# in two) are DROPPED: the page would decode each to U+FFFD, 3 bytes on its next save, and read
+# the chunk as oversize again. Leftover chunk keys (orphans past the first empty one included) are
+# removed. Refuses — store untouched — when the result would need more than the 11 chunk keys
+# (impossible under the 8 KB POST cap).
+_srv_peers_rechunk(){
+    local out rc tmp n keep notes
+    settings_unglue || return 1   # after this every record is its own line: no framing needed below
+    out=$(LC_ALL=C awk '
+        BEGIN { for (i = 1; i < 256; i++) ord[sprintf("%c", i)] = i }
+        function key_ok(x) { return length(x) == 44 && x ~ /^[A-Za-z0-9+\/]+=$/ }   # a cut changes the length, not the alphabet
+        function ip_ok(x,   q, j) { if (split(x, q, ".") != 4) return 0
+                                    for (j = 1; j <= 4; j++) if (q[j] !~ /^[0-9]+$/ || length(q[j]) > 3 || q[j] + 0 > 255) return 0
+                                    return 1 }
+        function peer_ok(e,   f, m) { m = split(e, f, "|")
+                                      return (m == 8 || m == 9) && ip_ok(f[2]) && f[3] ~ /^(direct|vpn_all|vpn_geo(_[0-9]+)?)?$/ &&
+                                             f[4] ~ /^(full|lan)?$/ && f[5] ~ /^[01]$/ && key_ok(f[6]) &&
+                                             (f[7] == "" || key_ok(f[7])) && (f[8] == "" || key_ok(f[8])) && (m == 8 || f[9] ~ /^[01]?$/) }
+        # A head cut right after the "|" that ends its privkey meets the shape too (the psk is optional): kept only with a psk.
+        function keys_whole(e,   f) { return peer_ok(e) && split(e, f, "|") >= 8 && f[8] != "" }
+        # The page label (awgsPeerLabel): the (partial) name, 24 characters at most, + the IP if it survived.
+        function label(e,   f, nm, i, x, cn) { split(e, f, "|"); nm = ""; cn = 0
+                                          for (i = 1; i <= length(f[1]); i++) { x = substr(f[1], i, 1)
+                                              if ((ord[x] < 128 || ord[x] >= 192) && ++cn > 24) { nm = nm "..."; break }
+                                              nm = nm x }
+                                          return "\047" (nm == "" ? "?" : nm) "\047" (ip_ok(f[2]) ? " (" f[2] ")" : "") }
+        { sp = index($0, " "); if (sp < 2) next; k = substr($0, 1, sp - 1)
+          if (k ~ /^awgs_peers([1-9]|10)?$/) pk[k] = substr($0, sp + 1) }
+        END { s = ""; nj = 0
+              for (i = 0; i <= 10; i++) { k = "awgs_peers" (i ? i : ""); v = pk[k]; if (v == "") break
+                  L = length(v); cut = (L == 3038 - length(k) || (L >= 2999 && L <= 3001))
+                  if (cut && L <= 3001 && substr(v, L - 2) == "\357\277\275") v = substr(v, 1, L - 3)
+                  s = s v
+                  if (cut) { jk[++nj] = k; jl[nj] = L; jb[nj] = length(s)   # jb: bytes of s before the junction
+                             # ju: UTF-16 units kept (what the old page split by: a 4-byte char counts 2).
+                             # A non-last 1.5.25 chunk that lost nothing holds exactly 2900 of them.
+                             u = 0; nb = length(v)
+                             for (x = 1; x <= nb; x++) { o = ord[substr(v, x, 1)]; if (o >= 240) u += 2; else if (o < 128 || o >= 192) u++ }
+                             ju[nj] = u } }
+              if (s == "") exit 1
+              # Validity as a browser decodes it (WHATWG): the lead byte sets the length and the
+              # range of the 2nd byte (no overlongs, no surrogates, nothing past U+10FFFF).
+              n = split(s, b, ""); nc = 0; kb = 0; bad = 0; q = 1
+              for (i = 1; i <= n; ) {
+                  while (q <= nj && jb[q] < i) jc[q++] = nc   # jc: characters kept before the junction
+                  o = ord[b[i]]; w = (o < 128) ? 1 : (o < 194) ? 0 : (o < 224) ? 2 : (o < 240) ? 3 : (o < 245) ? 4 : 0
+                  lo = 128; hi = 191
+                  if (o == 224) lo = 160; else if (o == 237) hi = 159; else if (o == 240) lo = 144; else if (o == 244) hi = 143
+                  ok = (w > 0 && i + w - 1 <= n)
+                  for (j = 1; ok && j < w; j++) { c = ord[b[i + j]]; if (c < lo || c > hi) ok = 0; lo = 128; hi = 191 }
+                  if (!ok) { bad++; i++; continue }
+                  ch = b[i]; for (j = 1; j < w; j++) ch = ch b[i + j]
+                  i += w; cs[++nc] = ch; kb += w
+              }
+              if (kb > 11 * 2900) exit 1   # can never fit the 11 keys: refuse before the per-junction scans
+              while (q <= nj) jc[q++] = nc
+              # The entry across each cut junction, the last junction first (gone[] = chars cut off,
+              # add[i] = ASCII put in after char i, nosep[a] = the ";" at a taken out). Entries at two
+              # junctions never overlap: a cut chunk holds 750+ chars, a judged entry at most 600.
+              nn = 0
+              for (q = nj; q >= 1; q--) {
+                  j = jc[q]
+                  for (a = j; a > 0 && (cs[a] != ";" || (a in gone)); a--) ;
+                  for (z = j + 1; z <= nc && (cs[z] != ";" || (z in gone)); z++) ;
+                  what = "chunk " jk[q] " (" jl[q] " bytes)"
+                  # a real entry is under 300 bytes; a longer one is no peer (and building it would cost O(n^2))
+                  if (z - a > 600) { note[++nn] = what " looks cut by the firmware inside an entry too long to be a peer — check the list on the AWG server page"; continue }
+                  h = ""; for (i = a + 1; i <= j; i++) if (!(i in gone)) h = h cs[i]   # the head: what the cut chunk kept
+                  t = ""; for (i = j + 1; i < z; i++) if (!(i in gone)) t = t cs[i]    # the tail: past the lost bytes
+                  if (h t == "") { note[++nn] = what " looks cut by the firmware between two peers — a peer missing from the list is gone; re-create it on the AWG server page"; continue }
+                  # A whole-looking entry is kept as it is only when it cannot be a splice of two
+                  # peers: nothing after it (t empty), nothing lost at the junction (an intact chunk
+                  # that merely matches the cut fingerprint), or a junction inside the NAME (no "|"
+                  # in the head: the IP and every key then come from one peer). Otherwise a pass
+                  # means the lost bytes were exactly one entry and the fields past the junction
+                  # belong to the NEXT peer (its privkey/psk under the pubkey of this one) — judge apart.
+                  if (peer_ok(h t) && (t == "" || ju[q] == 2900 || index(h, "|") == 0)) { note[++nn] = what " looks cut by the firmware, but the peer at that point, " label(h t) ", still reads as complete — if its name or tunnel IP is wrong, re-create it on the AWG server page"; continue }
+                  # Apart from here on: nothing of the tail may reach the stub or the label of the head.
+                  tn = ""
+                  if (h == "") m = what " had been cut by the firmware between two peers"
+                  else if (keys_whole(h)) m = what " had been cut by the firmware right after peer " label(h) ", which still reads as complete — kept it; check its settings on the AWG server page"
+                  else {
+                      # Cut down to name|ip — fewer than 8 fields is the shape the page flags itself
+                      # (same label, but listed as damaged, not healthy). p1/p2: the 1st/2nd "|" of the head.
+                      p1 = p2 = 0
+                      for (i = a + 1; i <= j && !p2; i++) if (!(i in gone) && cs[i] == "|") { if (p1) p2 = i; else p1 = i }
+                      for (i = (p2 ? p2 : p1 ? p1 + 1 : j + 1); i <= j; i++) gone[i] = 1
+                      st = ""; for (i = a + 1; i <= j; i++) if (!(i in gone)) st = st cs[i]
+                      if (!p1) { add[j] = "|"; st = st "|" }
+                      m = what " had been cut by the firmware inside peer " label(st) " — cut that entry down to its name and IP, so the AWG server page lists it as damaged (its next save drops it once you confirm); re-create the peer there"
+                  }
+                  if (h != "" && peer_ok(t)) {
+                      add[j] = add[j] ";"
+                      tn = what ": the peer right after that cut, " label(t) ", still reads as complete — kept it as a peer of its own (its name may have lost its beginning); check it on the AWG server page"
+                  } else if (t != "") {
+                      for (i = j + 1; i < z; i++) gone[i] = 1
+                      if (h == "") nosep[a] = 1   # a = j here: the ";" the cut chunk ended with (else an empty entry is left)
+                      m = m "; the rest after the cut held no name or whole IP of its own and was dropped — " (h == "" ? "a peer missing from the list is gone; re-create it on the AWG server page" : "re-create any other peer missing from the list too")
+                  }
+                  note[++nn] = m; if (tn != "") note[++nn] = tn
+              }
+              np = 0; p = ""; pl = 0
+              for (i = 1; i <= nc; i++) {
+                  if (!(i in gone) && !(i in nosep)) { w = length(cs[i]); if (pl + w > 2900) { pc[np++] = p; p = ""; pl = 0 }
+                                                       p = p cs[i]; pl += w }
+                  if (i in add) for (x = 1; x <= length(add[i]); x++) { if (pl + 1 > 2900) { pc[np++] = p; p = ""; pl = 0 }
+                                                                        p = p substr(add[i], x, 1); pl++ } }
+              if (p != "") pc[np++] = p
+              if (np < 1 || np > 11) exit 1
+              for (i = 0; i < np; i++) print "awgs_peers" (i ? i : "") " " pc[i]
+              for (i = 1; i <= nn; i++) print "! WARNING: AWG server peer store: " note[i]
+              exit (bad ? 3 : 0) }' "$SETTINGS" 2>/dev/null); rc=$?
+    { [ "$rc" = 0 ] || [ "$rc" = 3 ]; } || return 0
+    notes=$(printf '%s\n' "$out" | sed -n 's/^! //p')
+    out=$(printf '%s\n' "$out" | grep '^awgs_peers')
+    case "$out" in "awgs_peers "*) ;; *) return 0 ;; esac
+    n=$(printf '%s\n' "$out" | grep -c '')
+    # The lines kept, counted BEFORE the rewrite: an unreadable store must not turn into a store
+    # holding nothing but the new chunks (settings_commit only checks the count it is given).
+    keep=$(LC_ALL=C grep -Evc '^awgs_peers([1-9]|10)? ' "$SETTINGS" 2>/dev/null)
+    case "$keep" in ''|*[!0-9]*) return 1 ;; esac
+    tmp="$SETTINGS.awgtmp.$$"
+    { LC_ALL=C grep -Ev '^awgs_peers([1-9]|10)? ' "$SETTINGS"; printf '%s\n' "$out"; } > "$tmp" 2>/dev/null
+    settings_commit "$tmp" $((keep + n)) || return 1
+    log_msg "AWG server peer store: re-split into $n chunk(s) of at most 2900 bytes (pages up to 1.5.25 split it by characters; a chunk over 2999 bytes reads back cut)"
+    [ "$rc" = 3 ] && log_msg "WARNING: AWG server peer store: dropped bytes that were not valid UTF-8 (a character the firmware cut in two) — check the peer list on the AWG server page"
+    [ -n "$notes" ] && printf '%s\n' "$notes" | while IFS= read -r l; do [ -n "$l" ] && log_msg "$l"; done
+    return 0
+}
+
+# Rewrite legacy RAW config-profile names (awg_pf1..5_name) to the page's C4 encoding: '%' ->
+# %25, trimmed, every whitespace run -> %20. Same class as migrate_watchdog_hosts: the firmware
+# stores "Home NL" intact, but its read-back cuts the value at the first whitespace, so the next
+# save of any page but the client page (the server page, another addon — each POSTs the whole
+# store it read back) wrote "Home" and the tail was gone for good; the client page's own recovery
+# (pfRecoverLegacyNames) only helps while that page is the first to save. No "already encoded"
+# skip: the encoder never emits whitespace, so a stored name holding any is raw text and is
+# encoded WHOLE — a raw '%' ("50% off") must become %25, else the decode (pf_scan: %20 then %25;
+# the page: one pass) would turn a raw "%20" into a space. Detection lives in migrate_server_peers'
+# shared pass; this is the rewrite, run only when that pass flagged a name. Line count is kept (an
+# all-blank name keeps its line with an empty value — the reader skips it like an absent key).
+migrate_profile_names(){
+    local tmp
+    settings_unglue || return 1   # a glued name must be its own line before the per-line rewrite
+    tmp="$SETTINGS.awgtmp.$$"
+    LC_ALL=C awk '{ sp = index($0, " "); k = (sp > 1) ? substr($0, 1, sp - 1) : ""
+                    if (k ~ /^awg_pf[1-5]_name$/) { v = substr($0, sp + 1)
+                        if (v ~ /[[:space:]]/) { gsub(/%/, "%25", v); sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v)
+                                                 gsub(/[[:space:]]+/, "%20", v); print k " " v; next } }
+                    print }' "$SETTINGS" > "$tmp" 2>/dev/null
+    settings_commit "$tmp" "$(grep -c '' "$SETTINGS" 2>/dev/null)" \
+        && log_msg "Config profile names: spaces now stored as %20 (the settings read-back cut a name at its first space)"
 }
 
 # Write (add or replace) one custom-settings line — the backend counterpart of the page's
@@ -276,10 +652,12 @@ migrate_watchdog_hosts(){
 # profile switch). Same temp+rename shape as clear_setting; on the rare race with an httpd
 # settings POST the last writer wins — acceptable for a manual, one-shot key.
 set_setting(){
-    local key="$1" val="$2" tmp
+    local key="$1" val="$2" tmp n=0
+    settings_unglue || return 1
     tmp="$SETTINGS.awgtmp.$$"
-    { grep -v "^$key " "$SETTINGS" 2>/dev/null; echo "$key $val"; } > "$tmp" && mv "$tmp" "$SETTINGS"
-    rm -f "$tmp" 2>/dev/null
+    { grep -v "^$key " "$SETTINGS" 2>/dev/null; echo "$key $val"; } > "$tmp" 2>/dev/null
+    [ -f "$SETTINGS" ] && n=$(grep -vc "^$key " "$SETTINGS" 2>/dev/null)
+    settings_commit "$tmp" $(( ${n:-0} + 1 ))
 }
 
 # =============================================================
@@ -295,9 +673,16 @@ set_setting(){
 # pointer — deliberately kept OFF the settings file, so an auto-switch never fights the
 # page's full-object settings POST (a stale open tab would silently revert a persisted
 # pointer) and a reboot naturally falls back to the user's primary profile.
+# NUMBERING: stored slot numbers are STABLE — nothing ever renumbers them. Everything a USER
+# reads (journal, incidents, CLI) names a profile by its ORDINAL instead: the 1-based position
+# among CONFIGURED slots in slot order — exactly what the page's profile bar shows (slot 3 is
+# "#2" while slot 2 is empty). Only diag prints the slot next to it ("slot 3 = #2"). Printing
+# slot numbers ("profile 3", the status row's "(3/2)") named things the user could not find.
 AWG_PF_MAX=5
-PF_OVERRIDE="/tmp/.awg_profile_override"
+PF_OVERRIDE="/tmp/.awg_profile_override"    # "<slot> <fp>" — see profile_resolve
 FAILOVER_STATE="/tmp/.awg_failover_state"   # "<circle_start_slot> <hops>" while a failover incident is walking the circle
+RUNNING_PF="/tmp/.awg_running_pf"           # "<slot> <fp>" the RUNNING daemon was built from (do_start; do_stop removes it)
+SWITCH_REQ="/tmp/.awg_switch_req"           # "<slot> <epoch>" while an ACCEPTED profile switch restarts (status "switch_req")
 
 pf_key(){
     # $1 = slot, $2 = field. META fields are always slot-prefixed; DATA fields of slot 1 keep
@@ -315,31 +700,185 @@ profile_configured(){
     [ -n "$(pf_slot_get "$1" iface_p1)" ] && [ -n "$(pf_slot_get "$1" peer_endpoint)" ]
 }
 
-profile_name(){
-    local n
-    n=$(pf_slot_get "$1" name)
-    [ -n "$n" ] && echo "$n" || echo "Profile $1"
+# One pass over the store for the per-slot profile view — the ONLY reader of profile NAMES.
+# Prints one line per slot (or only slot $1): "<slot> TAB <cfg 0|1> TAB <fo 0|1> TAB <name>".
+# Same record framing and last-copy-wins rule as get_setting; cfg matches profile_configured
+# (iface_p1 AND peer_endpoint non-empty); fo is 0 only for a stored "0" (absent = in the circle).
+# <name> is DECODED and SANITIZED here, once for every consumer (status JSON, journal, incidents,
+# CLI, diag). The page stores ' ' as %20 and '%' as %25 because the firmware's settings read-back
+# cuts a value at its first whitespace ("Home NL" came back as "Home" and the next save of any
+# page persisted the cut); %20-then-%25 replacement equals the page's single-pass decode for
+# everything its encoder emits ("%2520" -> "%20"), and a legacy raw name decodes to itself.
+# '<' and '>' become spaces (a legacy name must never carry an ASP tag into a /www/user file) and
+# control bytes are dropped (they would break the status JSON) — the page's sanitizer never lets
+# either through. A missing store reads as /dev/null so every slot still gets its line.
+pf_scan(){
+    local _src="$SETTINGS"
+    [ -f "$_src" ] || _src=/dev/null
+    LC_ALL=C awk -v max="$AWG_PF_MAX" -v only="$1" '
+        function hit(r,   sp, k) { sp = index(r, " "); if (sp < 2) return
+                                   k = substr(r, 1, sp - 1); if (k in want) val[k] = substr(r, sp + 1) }
+        BEGIN { for (n = 1; n <= max; n++) { d = (n == 1) ? "awg_" : "awg_pf" n "_"; m = "awg_pf" n "_"
+                    want[d "iface_p1"] = 1; want[d "peer_endpoint"] = 1; want[m "name"] = 1; want[m "fo"] = 1 }
+                for (i = 1; i < 32; i++) ctl[i] = sprintf("%c", i)
+                ctl[32] = sprintf("%c", 127) }
+        { r = $0
+          while (length(r) > 3039) { hit(substr(r, 1, 3039)); r = substr(r, 3040) }
+          hit(r) }
+        END { for (n = 1; n <= max; n++) {
+                  if (only != "" && n != only + 0) continue
+                  d = (n == 1) ? "awg_" : "awg_pf" n "_"; m = "awg_pf" n "_"
+                  nm = val[m "name"]
+                  gsub(/%20/, " ", nm); gsub(/%25/, "%", nm); gsub(/[<>]/, " ", nm)
+                  if (nm ~ /[^ -~]/)
+                      for (i = 1; i <= 32; i++) while ((p = index(nm, ctl[i])) > 0) nm = substr(nm, 1, p - 1) substr(nm, p + 1)
+                  printf "%d\t%d\t%d\t%s\n", n, (val[d "iface_p1"] != "" && val[d "peer_endpoint"] != ""), (val[m "fo"] != "0"), nm } }' "$_src" 2>/dev/null
 }
 
+# Everything the user-facing labels need about slot $1, from ONE pf_scan, into globals (no
+# subshell, so callers read them directly): AWG_PI_CFG (0|1), AWG_PI_ORD (ordinal, empty when the
+# slot is unconfigured), AWG_PI_NAME (decoded name, empty when unset), AWG_PI_COUNT (configured
+# profiles in total). NB the heredoc-fed loop runs in THIS shell — a pipe would lose the globals.
+profile_info(){
+    local n c f nm k=0
+    AWG_PI_CFG=0; AWG_PI_ORD=""; AWG_PI_NAME=""
+    while IFS='	' read -r n c f nm; do
+        [ "$c" = 1 ] && k=$((k + 1))
+        if [ "$n" = "$1" ]; then
+            AWG_PI_CFG=$c; AWG_PI_NAME=$nm
+            [ "$c" = 1 ] && AWG_PI_ORD=$k
+        fi
+    done <<EOF
+$(pf_scan)
+EOF
+    AWG_PI_COUNT=$k
+}
+
+# The label formats, from the AWG_PI_* of the last profile_info. None of them may print a BARE
+# slot number (the user cannot find slot numbers anywhere): an unconfigured slot says so.
+#   label: the name, "Profile #<ord>" when unnamed        (CLI, diag)
+#   desc:  "#<ord> (<name>)", "#<ord>" when unnamed       (journal lines)
+#   iref:  "#<ord> «<name>» (slot N)"                     (incident log — survives renames/deletes)
+_pi_label(){
+    if [ "$AWG_PI_CFG" != 1 ]; then printf 'slot %s (not configured)\n' "$1"
+    elif [ -n "$AWG_PI_NAME" ]; then printf '%s\n' "$AWG_PI_NAME"
+    else printf 'Profile #%s\n' "$AWG_PI_ORD"; fi
+}
+_pi_desc(){
+    if [ "$AWG_PI_CFG" != 1 ]; then printf 'slot %s (not configured)\n' "$1"
+    elif [ -n "$AWG_PI_NAME" ]; then printf '#%s (%s)\n' "$AWG_PI_ORD" "$AWG_PI_NAME"
+    else printf '#%s\n' "$AWG_PI_ORD"; fi
+}
+_pi_iref(){
+    if [ "$AWG_PI_CFG" != 1 ]; then printf 'slot %s (not configured)\n' "$1"
+    elif [ -n "$AWG_PI_NAME" ]; then printf '#%s «%s» (slot %s)\n' "$AWG_PI_ORD" "$AWG_PI_NAME" "$1"
+    else printf '#%s (slot %s)\n' "$AWG_PI_ORD" "$1"; fi
+}
+profile_label(){ profile_info "$1"; _pi_label "$1"; }
+profile_desc(){ profile_info "$1"; _pi_desc "$1"; }
+profile_iref(){ profile_info "$1"; _pi_iref "$1"; }
+# Decoded, sanitized stored name of slot $1 — EMPTY when unset (the status JSON's profile.name
+# and list items; the page renders its own localized "unnamed" text).
+profile_name_raw(){ profile_info "$1"; [ -n "$AWG_PI_NAME" ] && printf '%s\n' "$AWG_PI_NAME"; return 0; }
+# Ordinal of slot $1 — EMPTY for an unconfigured slot.
+profile_ordinal(){ profile_info "$1"; [ -n "$AWG_PI_ORD" ] && echo "$AWG_PI_ORD"; return 0; }
+# Slot of the <n>-th configured profile (the number the user typed, e.g. CLI `profile 2`).
+profile_slot_of_ordinal(){
+    local n c f nm k=0
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    while IFS='	' read -r n c f nm; do
+        [ "$c" = 1 ] || continue
+        k=$((k + 1))
+        [ "$k" -eq "$1" ] && { echo "$n"; return 0; }
+    done <<EOF
+$(pf_scan)
+EOF
+    return 1
+}
+# Space-separated configured slots in slot order.
+profile_configured_slots(){
+    local n c f nm out=""
+    while IFS='	' read -r n c f nm; do
+        [ "$c" = 1 ] && out="$out${out:+ }$n"
+    done <<EOF
+$(pf_scan)
+EOF
+    echo "$out"
+}
+
+# The user's persisted choice. A pointer at an UNCONFIGURED slot (a deleted profile, a store
+# edited by hand or by another page) resolves to the LOWEST configured slot instead of
+# materializing an empty config; the store itself is never written here (do_start says so once
+# in the journal). The fallback scan only runs when the pointer is dead — the steady-state cost
+# over the old reader is the one profile_configured check.
 profile_user(){
-    local p
+    local p s
     p=$(get_setting awg_profile_active)
     case "$p" in ''|*[!0-9]*) p=1 ;; esac
     { [ "$p" -ge 1 ] && [ "$p" -le "$AWG_PF_MAX" ]; } || p=1
+    if ! profile_configured "$p"; then
+        for s in $(profile_configured_slots); do p=$s; break; done
+    fi
     echo "$p"
 }
 
-# The slot the tunnel actually materializes: a valid failover override wins, else the user's
-# choice. An override pointing at an unconfigured/deleted slot is ignored.
-profile_effective(){
-    local p
-    p=$(cat "$PF_OVERRIDE" 2>/dev/null | tr -cd '0-9')
-    if [ -n "$p" ] && [ "$p" -ge 1 ] && [ "$p" -le "$AWG_PF_MAX" ] && profile_configured "$p"; then
-        echo "$p"
-        return
-    fi
-    profile_user
+# Fingerprint of a profile's IDENTITY: "<first 12 hex of md5(private key)>@<peer public key>".
+# Pins the failover override (and the running-profile record) to the CONFIG, not to a slot
+# number: a slot deleted and re-used for a different provider must not silently inherit an
+# override pointing at "slot 3". The endpoint is deliberately NOT part of it — editing the
+# running backup's endpoint must keep the override. Not secret-bearing (48 bits of a digest of
+# the key, plus a public key); no spaces. pf_fp_of <priv> <pub> is the one formatter (do_start
+# records the conf it materialized with it); pf_fp <slot> reads the store — empty for an
+# unconfigured slot.
+pf_fp_of(){
+    local h
+    h=$(printf '%s' "$1" | md5sum 2>/dev/null)
+    h=${h%% *}
+    [ ${#h} -ge 12 ] || return 0
+    printf '%s@%s\n' "${h%"${h#????????????}"}" "$2"
 }
+pf_fp(){
+    local pre v
+    case "$1" in [1-9]) [ "$1" -le "$AWG_PF_MAX" ] || return 0 ;; *) return 0 ;; esac
+    pre="awg_pf$1_"; [ "$1" = 1 ] && pre="awg_"
+    [ -f "$SETTINGS" ] || return 0
+    v=$(LC_ALL=C awk -v a="${pre}iface_p1" -v b="${pre}peer_p1" -v c="${pre}peer_endpoint" '
+        function hit(r) { if (index(r, a " ") == 1) va = substr(r, length(a) + 2)
+                          else if (index(r, b " ") == 1) vb = substr(r, length(b) + 2)
+                          else if (index(r, c " ") == 1) vc = substr(r, length(c) + 2) }
+        { r = $0
+          while (length(r) > 3039) { hit(substr(r, 1, 3039)); r = substr(r, 3040) }
+          hit(r) }
+        END { if (va != "" && vc != "") { gsub(/[ \t]/, "", vb); printf "%s\t%s\n", va, vb } }' "$SETTINGS" 2>/dev/null)
+    [ -n "$v" ] || return 0
+    pf_fp_of "${v%%	*}" "${v#*	}"
+}
+
+# The slot the tunnel actually materializes: a valid failover override wins, else the user's
+# choice. Override format "<slot> <fp>": honored only while that slot is configured AND still
+# holds the SAME config (pf_fp) — a deleted-and-reused slot, or a backup whose keys were swapped,
+# drops back to the user's choice instead of silently running a different config. A bare "<slot>"
+# (written before 1.5.26) keeps the old rule: honored while the slot is configured.
+# profile_resolve sets AWG_PF_EFF (and AWG_PF_EFF_FP when the check already computed the
+# fingerprint — update_status reuses it) WITHOUT a subshell; profile_effective echoes the slot.
+profile_resolve(){
+    local p="" fp="" cur
+    AWG_PF_EFF=""; AWG_PF_EFF_FP=""
+    if [ -f "$PF_OVERRIDE" ]; then
+        # `read` reports failure on a file without a trailing newline AFTER filling the vars
+        # (the /proc/<pid>/cmdline trap) — never gate on its status.
+        { read -r p fp < "$PF_OVERRIDE"; } 2>/dev/null
+        case "$p" in [1-9]) [ "$p" -le "$AWG_PF_MAX" ] || p="" ;; *) p="" ;; esac
+        if [ -n "$p" ] && [ -z "$fp" ]; then
+            profile_configured "$p" && AWG_PF_EFF=$p
+        elif [ -n "$p" ]; then
+            cur=$(pf_fp "$p")
+            [ -n "$cur" ] && [ "$cur" = "$fp" ] && { AWG_PF_EFF=$p; AWG_PF_EFF_FP=$cur; }
+        fi
+    fi
+    [ -n "$AWG_PF_EFF" ] || AWG_PF_EFF=$(profile_user)
+}
+profile_effective(){ profile_resolve; echo "$AWG_PF_EFF"; }
 
 # One field of the EFFECTIVE profile — for single-shot callers. Multi-field consumers
 # (generate_config) resolve the slot once and use pf_slot_get to keep the fork count down.
@@ -349,102 +888,161 @@ pf_get(){ pf_slot_get "$(profile_effective)" "$1"; }
 # Called ONLY from the post-start health check's failure branch — the single point where
 # "this profile's tunnel demonstrably passes no traffic" is known (DNS-only failures fail
 # open upstream and never reach it; the update window and the CTF gate live in do_start,
-# which every hop goes through anyway). Picks the next configured, failover-enabled slot
-# after the EFFECTIVE one (circular by slot number), records the hop in FAILOVER_STATE and
-# writes PF_OVERRIDE — the caller then restarts, and the NEW profile's own health check
-# decides whether to hop again. Returns 1 (caller falls back to the classic rollback) when
-# the feature is off, there are <2 candidates, or the circle is complete — every candidate
-# tried once this incident. On give-up both state files are cleared, so the watchdog's
-# backoff retries start from the user's primary profile and may walk a fresh circle.
-# $1 = the health-check failure reason (for the incident log).
+# which every hop goes through anyway). A PURE PICKER: it writes nothing. The hop itself (the
+# override, the circle state, the journal line and the incident) is committed by do_stop UNDER
+# THE OPERATION LOCK, and only if the failing start is still the current one (the health check
+# passes its generation) — an unlocked write here once let a stale health check re-point a
+# tunnel a newer switch/start already owned.
+# $1 = the slot the FAILING start materialized (not profile_effective at failure time: a switch
+# saved meanwhile would move the circle). Echoes the next configured, failover-enabled slot after
+# it (circular by slot number); "giveup" when the circle is complete — wrapped back to the slot
+# the incident started on, or every candidate tried once (the start slot need not be a
+# candidate, e.g. an fo=0 profile); nothing when failover does not apply (off / <2 candidates).
 failover_next_profile(){
-    [ "$(get_setting awg_failover)" = "1" ] || return 1
-    local cur next n i cand start hops
-    cur=$(profile_effective)
-    cand=0
-    n=1
-    while [ "$n" -le "$AWG_PF_MAX" ]; do
-        if profile_configured "$n" && [ "$(pf_slot_get "$n" fo)" != "0" ]; then
-            cand=$((cand + 1))
-        fi
-        n=$((n + 1))
-    done
-    [ "$cand" -ge 2 ] || return 1
-    next=""
+    [ "$(get_setting awg_failover)" = "1" ] || return 0
+    local cur="$1" cands="" cand=0 next="" n c f nm i start="" hops=""
+    case "$cur" in [1-9]) ;; *) cur=$(profile_effective) ;; esac
+    while IFS='	' read -r n c f nm; do
+        [ "$c" = 1 ] && [ "$f" = 1 ] && { cands="$cands $n "; cand=$((cand + 1)); }
+    done <<EOF
+$(pf_scan)
+EOF
+    [ "$cand" -ge 2 ] || return 0
     i=1
     while [ "$i" -lt "$AWG_PF_MAX" ]; do
         n=$(( (cur - 1 + i) % AWG_PF_MAX + 1 ))
-        if profile_configured "$n" && [ "$(pf_slot_get "$n" fo)" != "0" ]; then
-            next=$n
-            break
-        fi
+        case "$cands" in *" $n "*) next=$n; break ;; esac
         i=$((i + 1))
     done
-    [ -n "$next" ] || return 1
+    [ -n "$next" ] || return 0
     # NB: `< file 2>/dev/null` would NOT silence a missing file (redirections apply left to
     # right) — guard on existence instead.
     if [ -f "$FAILOVER_STATE" ]; then read start hops < "$FAILOVER_STATE" 2>/dev/null; fi
     case "$start" in ''|*[!0-9]*) start=$cur; hops=0 ;; esac
     case "$hops" in ''|*[!0-9]*) hops=0 ;; esac
-    # Circle complete: wrapped back to the slot the incident started on, or (when that slot
-    # itself isn't a candidate — e.g. the user was on an fo=0 profile) every candidate tried.
     if [ "$next" = "$start" ] || [ "$hops" -ge "$cand" ]; then
-        log_msg "FAILOVER: profile circle complete ($hops switches, none passed the health check) — giving up; the watchdog keeps retrying the primary profile with backoff"
-        awg_incident "failover gave up: all candidate profiles failed the health check ($1)"
-        rm -f "$FAILOVER_STATE" "$PF_OVERRIDE"
-        return 1
+        echo giveup
+    else
+        echo "$next"
     fi
-    echo "$next" > "$PF_OVERRIDE"
-    printf '%s %s\n' "$start" "$((hops + 1))" > "$FAILOVER_STATE"
-    log_msg "FAILOVER: switching to config profile $next ($(profile_name "$next")) — hop $((hops + 1))"
-    awg_incident "health-check failover: profile $cur -> $next ($1)"
-    return 0
 }
 
 # --- Profile CLI (`amneziawg.sh profile …`) — SSH-side switching ---
+# Numbers are ORDINALS (what the page shows); `diag` mode adds the stable slot ("slot 3 = #2").
 profile_cli_list(){
-    local n eff usr ep nm mark fo
+    local mode="$1" n c f nm k=0 eff usr eo uo ep mark fol lbl
     eff=$(profile_effective)
     usr=$(profile_user)
-    if [ -f "$PF_OVERRIDE" ] && [ "$eff" != "$usr" ]; then
-        echo "Config profiles (active: $eff — failover override; user's primary: $usr):"
+    profile_info "$eff"; eo=$AWG_PI_ORD
+    profile_info "$usr"; uo=$AWG_PI_ORD
+    if [ -z "$eo" ]; then
+        echo "Config profiles: none configured"
+    elif [ "$eff" != "$usr" ]; then
+        # eff differs from the user's choice only while a VALID failover override is in effect.
+        echo "Config profiles (active: #$eo — failover override; user's primary: #${uo:-?}):"
     else
-        echo "Config profiles (active: $eff):"
+        echo "Config profiles (active: #$eo):"
     fi
-    n=1
-    while [ "$n" -le "$AWG_PF_MAX" ]; do
-        if profile_configured "$n"; then
-            ep=$(pf_slot_get "$n" peer_endpoint)
-            nm=$(profile_name "$n")
-            mark=" "; [ "$n" = "$eff" ] && mark="*"
-            fo=""; [ "$(pf_slot_get "$n" fo)" = "0" ] && fo=" [failover: off]"
-            printf '%s %s. %s — %s%s\n' "$mark" "$n" "$nm" "$ep" "$fo"
+    while IFS='	' read -r n c f nm; do
+        [ "$c" = 1 ] || continue
+        k=$((k + 1))
+        ep=$(pf_slot_get "$n" peer_endpoint)
+        mark=" "; [ "$n" = "$eff" ] && mark="*"
+        fol=""; [ "$f" = 0 ] && fol=" [failover: off]"
+        lbl=$nm; [ -n "$lbl" ] || lbl="Profile #$k"
+        if [ "$mode" = diag ]; then
+            printf '%s slot %s = #%s «%s» — %s%s\n' "$mark" "$n" "$k" "$lbl" "$ep" "$fol"
+        else
+            printf '%s %s. %s — %s%s\n' "$mark" "$k" "$lbl" "$ep" "$fol"
         fi
-        n=$((n + 1))
-    done
+    done <<EOF
+$(pf_scan)
+EOF
     [ "$(get_setting awg_failover)" = "1" ] && echo "Auto-failover: on" || echo "Auto-failover: off"
 }
 
-profile_cli_switch(){
-    local tgt="$1" cur i n
-    cur=$(profile_effective)
-    if [ "$tgt" = "next" ]; then
-        tgt=""
-        i=1
-        while [ "$i" -lt "$AWG_PF_MAX" ]; do
-            n=$(( (cur - 1 + i) % AWG_PF_MAX + 1 ))
-            profile_configured "$n" && { tgt=$n; break; }
-            i=$((i + 1))
-        done
-        [ -n "$tgt" ] || { echo "No other configured profile to switch to."; return 1; }
+# The restart half of a profile switch (the service event and the CLI). $1 = the target slot —
+# already the user's SAVED choice; $2 = journal suffix. Publishes SWITCH_REQ while the restart
+# runs (the page's switch transition waits on it — see update_status), and names a failed
+# restart in the journal AND in AWG_SWITCH_ERR (the CLI prints it). Returns do_restart's rc:
+# 3 = could not stop (lock), 1 = the new profile did not start, 2 = superseded.
+profile_switch_restart(){
+    local slot="$1" sfx="$2" run="" rx rc tdesc rdesc=""
+    AWG_SWITCH_ERR=""
+    # What runs NOW — for the "still running" wording if the stop cannot take the lock. From the
+    # running record only: the store's pointer already names the TARGET at this point.
+    if is_running; then
+        [ -f "$RUNNING_PF" ] && { read -r run rx < "$RUNNING_PF"; } 2>/dev/null
+        case "$run" in
+            [1-9]) rdesc="profile $(profile_desc "$run")" ;;
+            *)     rdesc="the current profile" ;;   # started by a pre-1.5.26 version: no record
+        esac
     fi
-    case "$tgt" in ''|*[!0-9]*) echo "Bad profile number: $1"; return 1 ;; esac
-    { [ "$tgt" -ge 1 ] && [ "$tgt" -le "$AWG_PF_MAX" ]; } || { echo "Profile must be 1-$AWG_PF_MAX"; return 1; }
-    profile_configured "$tgt" || { echo "Profile $tgt is not configured (need at least a private key + endpoint)."; return 1; }
-    set_setting awg_profile_active "$tgt"
-    rm -f "$PF_OVERRIDE" "$FAILOVER_STATE"
-    log_msg "Switching to config profile $tgt ($(profile_name "$tgt")) [CLI]"
-    do_restart switch
+    tdesc=$(profile_desc "$slot")
+    log_msg "Switching to config profile $tdesc$sfx"
+    echo "$slot $(date +%s)" > "$SWITCH_REQ" 2>/dev/null
+    do_restart switch; rc=$?
+    rm -f "$SWITCH_REQ"
+    case $rc in
+        3) if [ -n "$rdesc" ]; then
+               AWG_SWITCH_ERR="ERROR: could not stop (another operation holds the lock) — $rdesc still running, $tdesc is saved"
+           else
+               AWG_SWITCH_ERR="ERROR: could not stop (another operation holds the lock) — nothing switched now; $tdesc is saved and comes up with the next start"
+           fi ;;
+        1) AWG_SWITCH_ERR="ERROR: profile $tdesc failed to start — the tunnel is DOWN, see above; the watchdog will retry" ;;
+    esac
+    [ -n "$AWG_SWITCH_ERR" ] && log_msg "$AWG_SWITCH_ERR"
+    # Republish now that the marker is gone. Every status write above ran while it still existed
+    # (do_restart's rc-3 branch, do_start's own write before a CTF / no-autostart / is_running
+    # return — all of them ahead of its EXIT trap), and nothing else may write one soon: the */1
+    # status cron is gone on a user-stopped box. A published "switch_req":<slot> with no restart
+    # behind it holds the page's switch transition «in progress» (no buttons) until its poll cap,
+    # and it never reports the failure. After the error line, so the status log tail carries it.
+    update_status
+    return $rc
+}
+
+# `profile <N>` = the N-th CONFIGURED profile (the ordinal the page and `profile list` show);
+# `profile slot:<S>` = the stable slot (for scripts: ordinals shift when a profile is deleted);
+# `profile next` = the next configured one after the active. The resolved target is echoed
+# before anything changes.
+profile_cli_switch(){
+    local tgt="$1" slot="" cur i n cfgs rc
+    cfgs=" $(profile_configured_slots) "
+    case "$tgt" in
+        next)
+            cur=$(profile_effective)
+            i=1
+            while [ "$i" -lt "$AWG_PF_MAX" ]; do
+                n=$(( (cur - 1 + i) % AWG_PF_MAX + 1 ))
+                case "$cfgs" in *" $n "*) slot=$n; break ;; esac
+                i=$((i + 1))
+            done
+            [ -n "$slot" ] || { echo "No other configured profile to switch to."; return 1; }
+            ;;
+        slot:*)
+            slot=${tgt#slot:}
+            case "$slot" in ''|*[!0-9]*) echo "Bad slot: $tgt (expected slot:1-$AWG_PF_MAX)"; return 1 ;; esac
+            { [ "$slot" -ge 1 ] && [ "$slot" -le "$AWG_PF_MAX" ]; } || { echo "Slot must be 1-$AWG_PF_MAX"; return 1; }
+            case "$cfgs" in *" $slot "*) ;; *) echo "Slot $slot is not configured (need at least a private key + endpoint)."; return 1 ;; esac
+            ;;
+        *)
+            case "$tgt" in ''|*[!0-9]*) echo "Bad profile number: $tgt"; return 1 ;; esac
+            slot=$(profile_slot_of_ordinal "$tgt")
+            if [ -z "$slot" ]; then
+                set -- $cfgs
+                echo "No profile #$tgt — $# configured (see: profile list)"
+                return 1
+            fi
+            ;;
+    esac
+    profile_info "$slot"
+    echo "#$AWG_PI_ORD = «$(_pi_label "$slot")» (slot $slot)"
+    set_setting awg_profile_active "$slot" || { echo "Could not save the profile choice (JFFS full?) — nothing switched"; return 1; }
+    # The override + circle are dropped by do_stop's `switch` token, under the lock.
+    profile_switch_restart "$slot" " [CLI]"; rc=$?
+    [ -n "$AWG_SWITCH_ERR" ] && echo "$AWG_SWITCH_ERR"
+    return $rc
 }
 
 # =============================================================
@@ -559,24 +1157,37 @@ geo_union_geoip(){ local id; for id in $(geo_ids); do selected_geoip "$id"; done
 # Union of antifilter list keys across all policies.
 geo_union_antifilter(){ local id; for id in $(geo_ids); do selected_antifilter "$id"; done | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' '; }
 # Union of GeoSite categories across all policies.
-geo_union_geosite(){ local id; for id in $(geo_ids); do get_setting "$(geo_key "$id" v2fly)" | tr ',' ' '; done | tr ' ' '\n' | sed 's/[^A-Za-z0-9_.-]//g' | grep -v '^$' | sort -u | tr '\n' ' '; }
+# '!' is part of real category names (geolocation-!cn, category-ai-!cn — the page offers them):
+# stripping it (1.2.0-1.5.26) silently selected the China-only twin (geolocation-cn) or nothing.
+geo_union_geosite(){ local id; for id in $(geo_ids); do get_setting "$(geo_key "$id" v2fly)" | tr ',' ' '; done | tr ' ' '\n' | sed 's/[^A-Za-z0-9_.!-]//g' | grep -v '^$' | sort -u | tr '\n' ' '; }
+# Decoded URL list of policy <id>'s channel <kind> (inc=custom_urls, exc=exc_urls), as stored. A
+# value the firmware cut (setting_is_cut) loses its last, partial URL — fetching "https://raw.gith"
+# could only fail and then sit in the 6h back-off forever. Run b64d_init in the caller first.
+policy_urls(){
+    local k v
+    if [ "${2:-inc}" = exc ]; then k=$(geo_key "$1" exc_urls); else k=$(geo_key "$1" custom_urls); fi
+    v=$(get_setting "$k"); [ -n "$v" ] || return 0
+    if setting_is_cut "$k" "$v"; then { printf '%s' "$v" | b64d; echo; } | sed '$d'; else printf '%s' "$v" | b64d; fi
+    printf '\n'
+}
 # Union of ALL policies' URLs across both channels (custom_urls + exc_urls), decoded, one valid
 # http(s) URL per line, deduped — every URL (include or exclusion) is fetched once into the
 # shared userurl_<hash> pool.
 geo_union_urls(){
     local id
+    b64d_init
     for id in $(geo_ids); do
-        get_setting "$(geo_key "$id" custom_urls)" | base64 -d 2>/dev/null; printf '\n'
-        get_setting "$(geo_key "$id" exc_urls)" | base64 -d 2>/dev/null; printf '\n'
+        policy_urls "$id" inc
+        policy_urls "$id" exc
     done | tr ' \t\r' '\n\n\n' | grep -E '^https?://' | sort -u
 }
 # sha256[:16] keys of policy <id>'s URLs for channel <kind> (inc=custom_urls, exc=exc_urls), one
 # per line — for per-policy/per-channel load + dnsmasq enumeration.
 policy_url_keys(){
-    local id="$1" kind="${2:-inc}" key u
-    [ "$kind" = exc ] && key=exc_urls || key=custom_urls
-    get_setting "$(geo_key "$id" "$key")" | base64 -d 2>/dev/null | tr ' \t\r' '\n\n\n' | grep -E '^https?://' | while read -r u; do
-        echo "$u" | sha256sum | awk '{print $1}' | cut -c1-16
+    local id="$1" kind="${2:-inc}" u
+    b64d_init
+    policy_urls "$id" "$kind" | tr ' \t\r' '\n\n\n' | grep -E '^https?://' | while read -r u; do
+        url_key "$u"
     done
 }
 
@@ -586,10 +1197,102 @@ policy_url_keys(){
 register_owned_set(){
     grep -qxF "$1" "$OWNED_SETS" 2>/dev/null || echo "$1" >> "$OWNED_SETS"
 }
+# Mark that the pre-resolve cursor no longer describes our geo sets — they were destroyed,
+# created empty, or rebuilt while a pre-resolve was feeding them — so the next reload feeds
+# from line 1 instead of skipping or resuming. A full run needs no memory of the old feed:
+# every entry it finds already present is refreshed at its end (see _prl_refresh), so its own
+# start is a true freshness clock. A plain hot Apply (staged swap + ipset_replay_dynamic) keeps
+# the fed entries and therefore keeps the token.
+geoset_gen_bump(){
+    local _g="" _x
+    { read -r _g < /proc/sys/kernel/random/uuid; } 2>/dev/null
+    [ -n "$_g" ] || { { read -r _g _x < /proc/uptime; } 2>/dev/null; _g="${_g}.$$"; }
+    echo "$_g" > "$GEOSET_GEN" 2>/dev/null
+    rm -f "$PRERSLV_STATE" "$PRERSLV_EEX" "$PRERSLV_RETRY" "$PRERSLV_RETRY.strike"
+}
+
+# Hot-Apply guard, part 1 (setup_firewall, before the first ipset_replay_dynamic). The staged
+# rebuild snapshots each live set's fed entries, loads statics for seconds (antifilter: tens of
+# seconds on armv7) and swaps; anything the pre-resolve adds to the OLD set in between dies
+# with it, while its cursor moves on. So ask a feeding pre-resolve to stop at its batch
+# boundary (it saves an exact cursor and yields; setup_firewall's own reload resumes it) and
+# wait for that — bounded, one lookup batch normally takes a second or two.
+geo_preresolve_quiesce(){
+    local _ph _x _i=0
+    while [ $_i -lt 20 ]; do
+        [ -d /tmp/.awg_dnsreload ] || return 0
+        _ph=""; { read -r _ph _x < /tmp/.awg_dnsreload/beat; } 2>/dev/null
+        [ "$_ph" = preresolve ] || return 0
+        true 2>/dev/null > /tmp/.awg_dnsreload/preempt
+        sleep 1; _i=$((_i + 1))
+    done
+}
+
+# Fingerprint of the settings AND downloaded CIDR content used by the static sets (GeoIP,
+# antifilter, custom IPs / files / URLs, both channels). A static /32 equal to a pre-resolved IP
+# (antifilter's ipresolve holds exactly such /32s) gets promoted to permanent by the static
+# `restore -!`; if that static source is later removed, the next swap drops the entry — and a
+# cursor that says "fed" would keep the pre-resolve from putting it back for a day.
+geo_static_sig(){
+    local id k f _inputs _sig
+    _inputs=$(
+        for id in $(geo_ids); do
+            for k in v2fly_ip antifilter_lists custom_ips custom_files custom_urls exc_ips exc_files exc_urls; do
+                echo "$id $k $(get_setting "$(geo_key "$id" "$k")")"
+            done
+        done
+        # setup_firewall prunes the shared pool first. Hash its downloaded CIDRs once each:
+        # an update of the SAME URL/list can remove a permanent /32 without changing a setting.
+        # Pasted-file CIDRs are regenerated later; their source settings are already above.
+        for f in "$GEO_DIR"/geoip/v2fly_*.cidr "$GEO_DIR"/geoip/userurl_*.cidr "$GEO_DIR"/antifilter/af_*.cidr; do
+            [ -f "$f" ] || continue
+            md5sum "$f" 2>/dev/null || exit 1
+        done
+        true
+    ) || return 1
+    _sig=$(printf '%s\n' "$_inputs" | md5sum 2>/dev/null) || return 1
+    _sig=${_sig%% *}
+    case "$_sig" in ''|*[!0-9a-f]*) return 1 ;; esac
+    [ ${#_sig} -eq 32 ] || return 1
+    echo "$_sig"
+}
+
+# Hot-Apply guard, part 2 (after the last swap). $1 = "<gen>|<state>" taken after the quiesce,
+# $2 = geo_static_sig taken before the rebuild. Invalidate the pre-resolve cursor (full re-feed
+# on the next reload) when the rebuild may have dropped fed entries the cursor counts as done:
+# a pre-resolve still fed during the window (a reload that took the lock meanwhile), or the
+# static sources changed. A generation that already moved (first-build rename) needs nothing.
+geo_swap_window_close(){
+    local _why="" _ph _x _old
+    [ "${1%%|*}" = "$(cat "$GEOSET_GEN" 2>/dev/null)" ] || _why="-"
+    if [ -z "$_why" ]; then
+        _ph=""; { read -r _ph _x < /tmp/.awg_dnsreload/beat; } 2>/dev/null
+        if [ "${1#*|}" != "$(cat "$PRERSLV_STATE" 2>/dev/null)" ] \
+           || { [ -d /tmp/.awg_dnsreload ] && [ "$_ph" = preresolve ]; }; then
+            _why="a geo pre-resolve was feeding while the sets were rebuilt"
+        fi
+    fi
+    _old=$(cat "$GEOSTATIC_SIG" 2>/dev/null)
+    if [ -z "$2" ]; then
+        rm -f "$GEOSTATIC_SIG"
+        [ -z "$_why" ] && _why="the static geo sources could not be fingerprinted"
+    elif [ "$2" != "$_old" ]; then
+        echo "$2" > "$GEOSTATIC_SIG" 2>/dev/null
+        [ -z "$_why" ] && _why="the static geo sources changed"
+    fi
+    case "$_why" in
+        ''|-) ;;
+        *) geoset_gen_bump
+           log_msg "Geo domain pre-resolve: will re-feed from the start at the next reload — $_why" ;;
+    esac
+    return 0
+}
+
 # Flush + destroy every geo set we created (incl. old names after an awg_ipset_name rename),
 # then clear the registry. Exact names only — foreign sets are untouched.
 destroy_owned_sets(){
     local s
+    geoset_gen_bump
     [ -f "$OWNED_SETS" ] || return 0
     while read -r s; do
         [ -z "$s" ] && continue
@@ -908,12 +1611,26 @@ wait_for_uapi(){
     return 1
 }
 
-# `$$` is the parent's PID in a detached POSIX subshell. acquire_lock reads
-# /proc/self/stat with the shell builtin to record the actual holder and its start ticks.
-# Serialize the short lock-directory transitions, not the operation itself. The guard
-# inode is permanent for this boot: unlinking it would let two flock users lock different
-# inodes. The subshell closes fd 9 before a daemon/background job can inherit it. Older
-# firmware without flock keeps the mkdir lock, but cannot safely force-reap a live holder.
+# NB on pids: `$$` inside a `( ) &` subshell is the PARENT shell's pid (POSIX), and several
+# lock takers run exactly there (ensure_geo's rebuild, the health check's do_stop, dnsmasq
+# reload jobs). Writing `echo $$` from those recorded a pid that dies seconds later — every
+# liveness probe then misread a LIVE lock as stale and stole it (observed in the field: two
+# pre-resolve jobs running unserialized with the lock dir gone). acquire_lock reads
+# /proc/self/stat with the builtin `read` instead: no fork, so it names the current (sub)shell.
+#
+# A LIVE holder can wedge too (a firmware call parked forever inside the lock — field case:
+# `cru d` → `nvram get` hung for ten hours mid-firewall-rebuild, base rules and geo sets gone,
+# every Apply/restart/watchdog tick bounced off "lock timeout" while the watchdog stood aside
+# because the holder was alive). The owner record therefore carries PID, kernel start ticks and
+# the uptime of ACQUISITION, so a holder past LOCK_STALE_S can be killed without ever
+# signalling a reused PID.
+#
+# lock_transition serializes the short lock-directory transitions (acquire, release, reclaim),
+# not the operation itself. The guard inode is permanent for this boot: unlinking it would let
+# two flock users lock different inodes. The subshell closes fd 9 before a daemon/background job
+# can inherit it. Firmware without flock keeps the plain mkdir lock but never force-reaps a live
+# holder (LOCK_REAP_SAFE=0): without the guard a reclaim could remove a lock acquired a moment
+# after the check.
 lock_transition(){
     if which flock >/dev/null 2>&1; then
         (
@@ -926,6 +1643,8 @@ lock_transition(){
     fi
 }
 
+# Field 22 of /proc/PID/stat (start time in clock ticks). The (comm) field is stripped first —
+# a spaced comm must not shift the columns.
 proc_start_time(){
     local _line
     case "$1" in ''|*[!0-9]*) return 1 ;; esac
@@ -938,8 +1657,8 @@ proc_start_time(){
     echo "$1"
 }
 
-# New owner records contain PID, kernel start ticks, and acquisition uptime. Never infer
-# lock duration from process age: geo downloads happen BEFORE acquiring the operation lock.
+# Seconds the operation lock has been held by PID $1. Never infer it from process age: geo
+# downloads happen BEFORE acquiring the operation lock.
 lock_age_s(){
     local _pid _start _since _up _rest
     { read -r _pid _start _since < "$LOCKDIR/owner"; } 2>/dev/null || return 1
@@ -951,7 +1670,6 @@ lock_age_s(){
 
 acquire_lock(){
     local tries=0 _self
-    # Builtin read opens /proc/self in THIS shell, including detached POSIX subshells.
     read -r _self < /proc/self/stat || return 1
     AWG_LOCK_PID=${_self%% *}
     AWG_LOCK_START=$(proc_start_time "$AWG_LOCK_PID") || return 1
@@ -961,11 +1679,10 @@ acquire_lock(){
         sleep 1
     done
 }
-
 _acquire_lock_once(){
     local _up _rest
     if [ -d "$LOCKDIR" ]; then
-        _operation_lock_busy && return 1
+        _operation_lock_busy acquire_lock && return 1
     fi
     mkdir "$LOCKDIR" 2>/dev/null || return 1
     read -r _up _rest < /proc/uptime
@@ -976,6 +1693,8 @@ _acquire_lock_once(){
     fi
 }
 
+# Owner-aware: only free the lock if WE hold it (pid + start ticks match what WE recorded), so
+# a stray release on an error path can't free a lock another concurrent actor acquired.
 release_lock(){
     local _tries=0 _rc
     while :; do
@@ -998,7 +1717,7 @@ _release_lock(){
 }
 
 LOCK_STALE_S=1800
-reclaim_wedged_lock(){ lock_transition _reclaim_wedged_lock "$@"; }
+# Runs under the transition guard only. Returns 0 when the lock was retired.
 _reclaim_wedged_lock(){
     local _hp="$1" _who="$2" _age _p _start _since _live
     [ "$LOCK_REAP_SAFE" = 1 ] || return 1
@@ -1023,10 +1742,13 @@ _reclaim_wedged_lock(){
     awg_incident "wedged operation lock holder (pid $_hp, held ${_age}s) killed by $_who"
 }
 
-# Called under the transition guard by both acquire and watchdog, so a dead-holder
-# cleanup cannot race the live-holder reaper or remove a freshly acquired directory.
+# True while an operation legitimately holds the lock. A dead holder's lock (a process killed
+# between acquire and release) and a wedged live holder's are reclaimed instead: a leaked lock
+# used to silence the watchdog FOREVER, which is precisely when self-heal matters most. Runs
+# under the transition guard, so a dead-holder cleanup cannot race the live-holder reaper or
+# remove a freshly acquired directory. $1 names the caller for the journal.
 operation_lock_busy(){
-    lock_transition _operation_lock_busy
+    lock_transition _operation_lock_busy "$1"
     # A contended/unreadable transition guard also means busy, never permission to heal.
     [ "$?" -ne 1 ]
 }
@@ -1035,12 +1757,15 @@ _operation_lock_busy(){
     [ -d "$LOCKDIR" ] || return 1
     _p=$(cat "$LOCKDIR/pid" 2>/dev/null)
     if [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null; then
-        _reclaim_wedged_lock "$_p" "lock check" && return 1
+        _reclaim_wedged_lock "$_p" "$1" && return 1
         return 0
     fi
     if [ -z "$_p" ]; then
-        [ -n "$(find "$LOCKDIR" -maxdepth 0 -mmin +5 2>/dev/null)" ] || return 0
+        # No pid file — either mid-acquire (mkdir happened a moment ago) or a crash in that
+        # window. Only treat as stale once the dir is demonstrably old.
+        file_older_than "$LOCKDIR" 300 || return 0
     fi
+    [ "$1" = acquire_lock ] || log_msg "$1: stale operation lock $LOCKDIR (holder ${_p:-unknown} is gone) — reclaiming"
     rm -rf "$LOCKDIR"
     return 1
 }
@@ -1081,22 +1806,21 @@ kill_tree(){
 # --- Bounded firmware calls --------------------------------------------------------------
 # `nvram` can block FOREVER on a lost envrams reply (wchan=__skb_wait_for_more_packets — the
 # binary has no timeout), and `cru` runs `nvram get http_username` inside itself, so it can
-# too. Two reapers already clean up AFTER such a hang (reap_stale_status, reap_stale_dnsreload,
-# reclaim_wedged_lock above); this bounds the call ITSELF, so no path — least of all one
-# holding LOCKDIR between a teardown and a rebuild — can park on it in the first place.
+# too. The reapers (reap_stale_status, reap_stale_dnsreload) clean up AFTER such a hang; this
+# bounds the call ITSELF, so no path — least of all one holding LOCKDIR between a teardown and
+# a rebuild — can park on it in the first place.
 # run_bounded SECS cmd [args…]: runs cmd detached with stdout captured, polls its liveness
 # every ~10 ms against a /proc/uptime deadline (NOT a tick count — each `usleep` is a fork
 # that costs ~20 ms on an aarch64 box, so counted ticks ran 3× long), then prints the output
-# and returns cmd's rc. On timeout the whole process tree
-# is killed (kill_tree — the wedged nvram inside cru is a grandchild), the event is logged +
-# recorded as an incident, nothing is printed and rc is 124 — callers already treat an empty
-# read as "unset" — except the decisions where "unset" would ACT unsafely
-# (fw_dns_redirect_active, setup_ipv6_block, _rc_settle, the rc_support install gate): those
-# test for rc 124 and fail safe. Cost per
-# call on an aarch64 box: ~20 ms (mktemp + fork + the poll granularity; measured on the
-# RT-AX88U PRO: 20 × `nv get` = 0.39 s) against ~3 ms for a bare nvram — fine for the */1
-# status cron's two or three reads. `usleep` is a busybox applet on every Merlin build we
-# know of; the fallback is a 1 s sleep.
+# and returns cmd's rc. On timeout the whole process tree is killed (kill_tree — the wedged
+# nvram inside cru is a grandchild), the event is logged + recorded as an incident, nothing is
+# printed and rc is 124 — callers already treat an empty read as "unset" — except the
+# decisions where "unset" would ACT unsafely (fw_dns_redirect_active, setup_ipv6_block,
+# _rc_settle, the rc_support install gate, the user-stop cron removal): those test for rc 124
+# and fail safe. Cost per call on an aarch64 box: ~20 ms (mktemp + fork + the poll
+# granularity; measured on an RT-AX88U PRO: 20 × `nv get` = 0.39 s) against ~3 ms for a bare
+# nvram — fine for the */1 status cron's two or three reads. `usleep` is a busybox applet on
+# every Merlin build we know of; the fallback is a 1 s sleep.
 NV_TIMEOUT_S=5
 CRU_TIMEOUT_S=10
 
@@ -1221,7 +1945,13 @@ fetch_with_mirrors(){
             ;;
         *) list="$url" ;;
     esac
-    for u in $list "https://ghproxy.net/$url" "https://gh-proxy.com/$url"; do
+    # The ghproxy mirrors proxy GitHub ONLY — for any other host (antifilter, a user's GeoCustom
+    # URL) they can't help, and they'd receive the user's private list URL (tokens included).
+    case "$url" in
+        https://github.com/*|https://raw.githubusercontent.com/*|https://gist.githubusercontent.com/*|https://objects.githubusercontent.com/*)
+            list="$list https://ghproxy.net/$url https://gh-proxy.com/$url" ;;
+    esac
+    for u in $list; do
         if curl -sfL $awg_bind --connect-timeout 6 --max-time "$mt" --retry 1 "$u" -o "$out" 2>/dev/null && [ -s "$out" ]; then
             return 0
         fi
@@ -1396,7 +2126,7 @@ download_geosite(){
 # the union of every policy's custom URLs).
 prune_custom_urls(){
     local sel f fkey u
-    sel=" $(geo_union_urls | while read -r u; do u=$(echo "$u" | tr -d ' \r'); [ -z "$u" ] && continue; echo "$u" | sha256sum | awk '{print $1}' | cut -c1-16; done | tr '\n' ' ') "
+    sel=" $(geo_union_urls | while read -r u; do u=$(echo "$u" | tr -d ' \r'); [ -z "$u" ] && continue; url_key "$u"; done | tr '\n' ' ') "
     for f in "$GEO_DIR"/domains/userurl_*.txt "$GEO_DIR"/geoip/userurl_*.cidr; do
         [ -f "$f" ] || continue
         fkey=$(basename "$f"); fkey=${fkey#userurl_}; fkey=${fkey%.txt}; fkey=${fkey%.cidr}
@@ -1407,8 +2137,12 @@ prune_custom_urls(){
 # Download the UNION of every policy's URL sources into the shared pool (one fetch per unique
 # URL). Each is classified into domains/userurl_<key>.txt + geoip/userurl_<key>.cidr,
 # key = first 16 hex of sha256(URL). Same URL in two policies => one download/file.
+# The download is classified into temp files first and only replaces the previous copy when it
+# yields usable entries: an HTML page (a github.com/…/blob/… link instead of the raw file, a
+# captive/error page served with HTTP 200) or a list with nothing routable used to be logged as a
+# success while it silently loaded zero entries — and it deleted the last good copy on the way.
 download_custom_urls(){
-    local urls url key tmp
+    local mode="$1" urls url key tmp prev
     urls=$(geo_union_urls)
     if [ -z "$urls" ]; then
         prune_custom_urls
@@ -1419,23 +2153,78 @@ download_custom_urls(){
         url=$(echo "$url" | tr -d ' \r')
         [ -z "$url" ] && continue
         case "$url" in http://*|https://*) ;; *) continue ;; esac
-        key=$(echo "$url" | sha256sum | awk '{print $1}' | cut -c1-16)
+        key=$(url_key "$url")
+        if [ -z "$key" ]; then
+            log_msg "Custom URL skipped: neither sha256sum nor openssl is available to name its files — $url"
+            continue
+        fi
         tmp="$GEO_DIR/.url_${key}.tmp"
+        rm -f "$tmp.d" "$tmp.c"
+        prev="No previous copy to fall back on"
+        { [ -f "$GEO_DIR/domains/userurl_${key}.txt" ] || [ -f "$GEO_DIR/geoip/userurl_${key}.cidr" ]; } && prev="Previous copy kept"
+        # "missing" (ensure_geo after an Apply): only URLs with no copy yet and not in their 6h
+        # back-off — log_url_backoff has just told the user they are paused.
+        if [ "$mode" = missing ]; then
+            [ "$prev" = "Previous copy kept" ] && continue
+            dl_recently_failed "url_${key}" && continue
+        fi
         if fetch_with_mirrors "$url" "$tmp" 60 && [ -s "$tmp" ]; then
-            rm -f "$GEO_DIR/domains/userurl_${key}.txt" "$GEO_DIR/geoip/userurl_${key}.cidr"
-            classify_user_list "$tmp" "$GEO_DIR/domains/userurl_${key}.txt" "$GEO_DIR/geoip/userurl_${key}.cidr"
-            rm -f "$(dl_fail_stamp "url_${key}")" 2>/dev/null
-            log_msg "Custom URL: $url ($key)"
+            if awk 'NR <= 30' "$tmp" | grep -qiE '<(!doctype|html|head|body)[ >]'; then
+                dl_mark_failed "url_${key}"
+                log_msg "Custom URL rejected: $url returned an HTML page, not a list — use the direct link to the raw file (for GitHub: raw.githubusercontent.com/…, not github.com/…/blob/…). $prev; retries paused for 6h ('Update now' retries at once)"
+            else
+                # shellcheck disable=SC2046
+                set -- $(classify_user_list "$tmp" "$tmp.d" "$tmp.c")
+                # Usable = IPv4 + real domains; bare whole-TLD words ($5) alone don't make a list
+                # (a plain-text "Page not found" body must not replace a good copy).
+                if [ $((${1:-0} + ${2:-0} - ${5:-0})) -gt 0 ]; then
+                    rm -f "$GEO_DIR/domains/userurl_${key}.txt" "$GEO_DIR/geoip/userurl_${key}.cidr"
+                    [ -f "$tmp.d" ] && mv "$tmp.d" "$GEO_DIR/domains/userurl_${key}.txt"
+                    [ -f "$tmp.c" ] && mv "$tmp.c" "$GEO_DIR/geoip/userurl_${key}.cidr"
+                    rm -f "$(dl_fail_stamp "url_${key}")" 2>/dev/null
+                    log_msg "Custom URL: $url ($key): $(user_list_summary "$@")"
+                else
+                    dl_mark_failed "url_${key}"
+                    log_msg "Custom URL rejected: $url has no usable entries: $(user_list_summary "$@") — expected one IPv4/CIDR or domain per line. $prev; retries paused for 6h ('Update now' retries at once)"
+                fi
+            fi
         else
             dl_mark_failed "url_${key}"
-            log_msg "Custom URL download failed: $url (won't re-try for 6h)"
+            log_msg "Custom URL download failed: $url ($(echo "$prev" | tr 'PN' 'pn'); retries paused for 6h — 'Update now' retries at once)"
         fi
-        rm -f "$tmp"
+        rm -f "$tmp" "$tmp.d" "$tmp.c"
     done
     prune_custom_urls
 }
 
+# Tell the user why an Apply did NOT (re)fetch a GeoCustom URL: a failed or rejected download is
+# negative-cached for 6h (dl_recently_failed), and until now that silence looked exactly like "the
+# URL is ignored". One line per URL that has no copy on disk and is waiting out its back-off.
+log_url_backoff(){
+    local u key f _then _left
+    for u in $(geo_union_urls); do
+        key=$(url_key "$u"); [ -n "$key" ] || continue
+        [ -f "$GEO_DIR/domains/userurl_${key}.txt" ] || [ -f "$GEO_DIR/geoip/userurl_${key}.cidr" ] && continue
+        dl_recently_failed "url_${key}" || continue
+        f=$(dl_fail_stamp "url_${key}"); _then=$(cat "$f" 2>/dev/null)
+        _left=$(( (21600 - ($(date +%s) - ${_then:-0})) / 60 ))
+        [ "$_left" -lt 0 ] && _left=0; [ "$_left" -gt 360 ] && _left=360   # clock steps (NTP) can skew it
+        log_msg "Custom URL $u: the last download failed or was rejected — retries paused for ~${_left} more min (then the next Apply retries; 'Update now' retries at once)"
+    done
+}
+
+# "120 IPv4, 3 domains[, N IPv6 skipped …][, M unrecognized skipped]" from classify_user_list's
+# counts ($1 IPv4, $2 domains, $3 IPv6, $4 unrecognized; $5 = how many of $2 are bare TLD rules).
+user_list_summary(){
+    local s="${1:-0} IPv4, ${2:-0} domains"
+    [ "${5:-0}" -gt 0 ] 2>/dev/null && s="$s (${5} of them whole-TLD rules like 'ru')"
+    [ "${3:-0}" -gt 0 ] 2>/dev/null && s="$s, ${3} IPv6 skipped (only IPv4 is routed)"
+    [ "${4:-0}" -gt 0 ] 2>/dev/null && s="$s, ${4} unrecognized entries skipped"
+    echo "$s"
+}
+
 download_all_geo(){
+    b64d_init
     mkdir -p "$GEO_DIR/geoip" "$GEO_DIR/domains" "$GEO_DIR/antifilter"
     log_msg "Downloading all geo databases..."
 
@@ -1530,34 +2319,126 @@ AWGEOF
     mount -o bind /tmp/menuTree.js /www/require/modules/menuTree.js
 }
 
+# stdin (IPv4/CIDR/range entries, one or more per line) -> `ipset restore` add-lines (permanent,
+# timeout 0) into set $1, for VALID IPv4 only: octets <=255, prefix 1-32 (hash:net can't hold a
+# /0), a-b ranges with start <= end, leading zeros normalized. This is not cosmetic — `ipset
+# restore` ABORTS at the first line it can't parse and silently discards that line's whole
+# uncommitted batch plus everything after it, so one IPv6 address (a family-inet set), a /33 or a
+# 300.x in a user list used to load zero or a fraction of it (reproduced on ipset 6.34-7.24: a
+# mixed v4/v6 list like Telegram's cidr.txt loaded 0). A clean canonical line (the 150K-line
+# antifilter list on every rebuild) is fully validated by ONE regex and printed as is — split()
+# per line was 4-8x slower on the bench; everything else is tokenized (inline `#` comments,
+# spaces/tabs/commas/semicolons/pipes) and each token validated, junk skipped.
+ipv4_restore_lines(){
+    LC_ALL=C awk -v s="$1" '
+        function ip4(t,   a) {
+            if (t !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) return ""
+            split(t, a, ".")
+            if (a[1] + 0 > 255 || a[2] + 0 > 255 || a[3] + 0 > 255 || a[4] + 0 > 255) return ""
+            return (a[1] + 0) "." (a[2] + 0) "." (a[3] + 0) "." (a[4] + 0)
+        }
+        function num(t,   a) { split(t, a, "."); return ((a[1] * 256 + a[2]) * 256 + a[3]) * 256 + a[4] }
+        function dq(n) { return int(n / 16777216) % 256 "." int(n / 65536) % 256 "." int(n / 256) % 256 "." n % 256 }
+        # An a-b range is emitted as its minimal CIDR cover (<= 62 lines, widest /1): the kernel
+        # rejects or mis-walks wide ranges in hash:net ("covers the whole address space", "Hash is
+        # full" for spans >= 2^31) and that one line aborted the whole restore.
+        function range(x, y,   lo, hi, bits, blk) {
+            lo = num(x); hi = num(y)
+            while (lo <= hi) {
+                bits = 0; blk = 1
+                while (bits < 31 && lo % (blk * 2) == 0 && lo + blk * 2 - 1 <= hi) { blk *= 2; bits++ }
+                print "add " s " " dq(lo) "/" (32 - bits) " timeout 0"
+                lo += blk
+            }
+        }
+        function emit(t,   a, p, x, y) {
+            if (t ~ /^[0-9.]+-[0-9.]+$/) {
+                split(t, a, "-"); x = ip4(a[1]); y = ip4(a[2])
+                if (x != "" && y != "" && num(x) <= num(y)) range(x, y)
+                return
+            }
+            p = split(t, a, "/"); if (p > 2) return
+            x = ip4(a[1]); if (x == "") return
+            if (p == 2) { if (a[2] !~ /^[0-9]+$/ || a[2] + 0 < 1 || a[2] + 0 > 32) return; x = x "/" (a[2] + 0) }
+            print "add " s " " x " timeout 0"
+        }
+        /^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\/([1-9]|[12][0-9]|3[0-2]))?$/ {
+            print "add " s " " $0 " timeout 0"; next
+        }
+        {
+            gsub(/\r/, ""); sub(/#.*/, "")
+            n = split($0, t, /[ \t,;|]+/)
+            for (i = 1; i <= n; i++)
+                if (t[i] ~ /^[0-9][0-9.\/-]*$/) emit(t[i])
+        }'
+}
+
 # Bulk-load CIDR file into ipset using restore (much faster than individual adds)
 ipset_load_file(){
     local file="$1"
     local setname="$2"
     [ ! -f "$file" ] && return
-    awk -v s="$setname" '
-        /^[0-9]/ && !/^#/ {
-            gsub(/[[:space:]\r]/, "")
-            if ($0 != "") print "add " s " " $0 " timeout 0"
-        }
-    ' "$file" | ipset restore -! 2>/dev/null
+    ipv4_restore_lines "$setname" < "$file" | ipset restore -! 2>/dev/null
 }
 
-# Split a user-supplied list (GeoCustom pasted file or downloaded URL) into a domains file and
-# a CIDR file, auto-detecting each line: IPv4/CIDR or IPv6 -> cidr_out; a bare domain -> dom_out;
-# blank lines, #comments and anything else are dropped. A bare IPv4 (no slash) goes to cidr_out,
-# so it never lands in dnsmasq as a useless pseudo-domain.
+# Split a user-supplied list (GeoCustom pasted file or downloaded URL) into a domains file and an
+# IPv4 file (CIDRs and a-b ranges), tolerating what real-world lists contain: CRLF, a UTF-8 BOM,
+# comments (`#` anywhere; `;`, `//`, `!` at line start), several entries per line (space/tab/
+# comma/semicolon/pipe separated), quotes and [ ] { } (JSON arrays), v2fly `domain:`/`full:`
+# prefixes, pasted URLs (reduced to their host: scheme, user@, :port, path dropped), `*.`/`+.`/
+# leading-dot wildcards, ip:port. Only VALID IPv4 reaches cidr_out (see ipv4_restore_lines for
+# why that matters); IPv6 is counted and skipped (the geo sets are family inet). A domain needs a
+# dot and a letter in its last label, labels <=63 and names <=253 chars (a longer one fails
+# `dnsmasq --test`, which drops ALL domain routing for that round). A bare single label is taken
+# as a whole-TLD rule ("ru", "xn--p1ai") ONLY when it is the line's sole entry: a word next to data
+# ("91.108.4.0/22,RU", "Hetzner Online GmbH", a "Page not found" body) must never become
+# `ipset=/ru/` — that routes an entire TLD. Such TLD rules are counted separately so a download
+# consisting only of them doesn't pass as a usable list. Output files are created only when
+# non-empty. Echoes "<IPv4> <domains> <IPv6> <unrecognized> <single-label domains>".
 classify_user_list(){
     local infile="$1" dom_out="$2" cidr_out="$3"
-    [ -f "$infile" ] || return 0
-    awk -v dout="$dom_out" -v cout="$cidr_out" '
-        { gsub(/[ \t\r]/, "") }
-        $0 == "" { next }
-        /^#/ { next }
-        /:/ { print > cout; next }
-        /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/ { print > cout; next }
-        /^\.?[a-zA-Z0-9._-]+$/ { sub(/^\./, ""); print > dout; next }
-    ' "$infile"
+    [ -f "$infile" ] || { echo "0 0 0 0 0"; return 0; }
+    LC_ALL=C awk -v dout="$dom_out" -v cout="$cidr_out" -v bom="$(printf '\357\273\277')" '
+        function v4ok(t,   a, p) {
+            p = split(t, a, /[.\/]/)
+            if (p < 4 || p > 5 || t !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/) return 0
+            if (a[1] + 0 > 255 || a[2] + 0 > 255 || a[3] + 0 > 255 || a[4] + 0 > 255) return 0
+            if (p == 5 && (a[5] + 0 < 1 || a[5] + 0 > 32)) return 0
+            return 1
+        }
+        function num(t,   a) { split(t, a, "."); return ((a[1] * 256 + a[2]) * 256 + a[3]) * 256 + a[4] }
+        NR == 1 && index($0, bom) == 1 { $0 = substr($0, length(bom) + 1) }
+        {
+            gsub(/\r/, ""); sub(/#.*/, ""); sub(/^[ \t]*(;|\/\/|!).*/, "")
+            n = split($0, tok, /[ \t,;|]+/); nt = 0
+            for (i = 1; i <= n; i++) if (tok[i] != "") nt++
+            for (i = 1; i <= n; i++) {
+                t = tolower(tok[i]); q = (t ~ /["'\''`]/ || index(t, "[") || index(t, "]") || index(t, "{") || index(t, "}"))
+                gsub(/["'\''`]/, "", t)
+                gsub(/\[/, "", t); gsub(/\]/, "", t); gsub(/\{/, "", t); gsub(/\}/, "", t)
+                if (t == "") continue
+                if (t ~ /^(domain|full):/) sub(/^(domain|full):/, "", t)
+                else if (t ~ /^(regexp|keyword|include|geosite|geoip|ext):/) { nbad++; continue }
+                else if (t ~ /^[a-z][a-z0-9+.-]*:\/\//) {
+                    sub(/^[a-z][a-z0-9+.-]*:\/\//, "", t); sub(/[\/?#].*$/, "", t); sub(/^.*@/, "", t)
+                }
+                if (t ~ /^[^:]+:[0-9]+$/) sub(/:[0-9]+$/, "", t)
+                if (t ~ /^[0-9.]+-[0-9.]+$/) {
+                    split(t, rg, "-")
+                    if (v4ok(rg[1]) && v4ok(rg[2]) && num(rg[1]) <= num(rg[2])) { print t > cout; nv4++ } else nbad++
+                    continue
+                }
+                if (t ~ /^[0-9.\/]+$/) { if (v4ok(t)) { print t > cout; nv4++ } else nbad++; continue }
+                if (t ~ /:/) { if (t ~ /^[0-9a-f:.\/]+$/ && t ~ /:.*:/) nv6++; else nbad++; continue }
+                sub(/^(\*|\+)?\./, "", t); sub(/\.$/, "", t)
+                if (length(t) > 253 || t ~ /[^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.][^.]/) { nbad++; continue }
+                lab = t; sub(/^.*\./, "", lab)
+                if (t ~ /^[a-z0-9_-]+(\.[a-z0-9_-]+)+$/ && lab ~ /[a-z]/) { print t > dout; ndom++ }
+                else if (nt == 1 && !q && (t ~ /^[a-z][a-z]+$/ || t ~ /^xn--[a-z0-9-]+$/)) { print t > dout; ndom++; ntld++ }
+                else nbad++
+            }
+        }
+        END { printf "%d %d %d %d %d\n", nv4, ndom, nv6, nbad, ntld }' "$infile"
 }
 
 # Regenerate policy <id>'s pasted-file lists for channel <kind> (inc=custom_files [include],
@@ -1572,17 +2453,41 @@ apply_custom_geo(){
     local blob
     blob=$(get_setting "$(geo_key "$id" "$key")")
     [ -z "$blob" ] && return 0
+    b64d_init
     mkdir -p "$GEO_DIR/domains" "$GEO_DIR/geoip"
-    local oldifs="$IFS" entry name b64 tmp base n seen=" "
-    IFS=';'
-    set -f
-    for entry in $blob; do
+    # A cut value (setting_is_cut: the firmware's own truncation fingerprints) lost the tail of its
+    # LAST file, usually mid-line (the page now refuses to save over 2900). That half-line must not
+    # load: a /24 cut to "/2" is a VALID CIDR routing a quarter of IPv4. If the cut fell inside the
+    # NEXT file's name, that whole file is gone — say so instead of skipping it silently.
+    local trunc=0 chan="" prev="" tailcut=0
+    setting_is_cut "$(geo_key "$id" "$key")" "$blob" && trunc=1
+    # Cut exactly after a ';' — the last file is intact and the NEXT one is gone entirely (IFS
+    # splitting drops the trailing empty field, so it must not be mistaken for a cut last file).
+    [ "$trunc" = 1 ] && case "$blob" in *';'|*'=') tailcut=1; trunc=0 ;; esac
+    [ "$kind" = exc ] && chan=", exclusions"
+    local oldifs="$IFS" entry name b64 tmp base n seen=" " idx=0 last=0 cnt
+    IFS=';'; set -f
+    # shellcheck disable=SC2086
+    set -- $blob
+    set +f; IFS="$oldifs"
+    for entry in "$@"; do idx=$((idx + 1)); [ -n "$entry" ] && last=$idx; done
+    idx=0
+    for entry in "$@"; do
+        idx=$((idx + 1))
         [ -z "$entry" ] && continue
-        case "$entry" in *,*) ;; *) continue ;; esac   # need a name,content pair
         name=${entry%%,*}
         b64=${entry#*,}
-        name=$(echo "$name" | sed 's/[^a-zA-Z0-9]/_/g')
-        [ -z "$name" ] && continue
+        case "$entry" in *,*) ;; *) name="" ;; esac   # need a name,content pair
+        # Sanitized AND capped: the name becomes part of file names (.uc_<pfx><name>.tmp, ...), and
+        # a very long one exceeded NAME_MAX, so the file silently failed to load.
+        name=$(echo "$name" | sed 's/[^a-zA-Z0-9]/_/g' | cut -c1-48)
+        if [ -z "$name" ]; then
+            if [ "$trunc" = 1 ] && [ "$idx" = "$last" ]; then
+                local _after="the start"; [ -n "$prev" ] && _after="file '$prev'"
+                log_msg "WARNING: GeoCustom files (policy $id$chan): the firmware settings store (~3000 chars per value, about 2 KB of list) cut off everything after $_after — a file after it was lost entirely. Re-add it smaller, or put a big list online and add it under URL sources"
+            fi
+            continue
+        fi
         # Uniquify on sanitized-name collision (e.g. "my.list" and "my-list" both -> "my_list"),
         # else the second file's classify output would truncate/overwrite the first's — data loss.
         base="$name"; n=1
@@ -1591,12 +2496,26 @@ apply_custom_geo(){
         done
         seen="$seen$name "
         tmp="$GEO_DIR/.uc_${pfx}${name}.tmp"
-        echo "$b64" | base64 -d 2>/dev/null > "$tmp"
-        [ -s "$tmp" ] && classify_user_list "$tmp" "$GEO_DIR/domains/${pfx}${name}.txt" "$GEO_DIR/geoip/${pfx}${name}.cidr"
+        printf '%s' "$b64" | b64d > "$tmp"
+        if [ "$trunc" = 1 ] && [ "$idx" = "$last" ]; then
+            # Only a PARTIAL last line goes (echo first: a complete newline-terminated line stays).
+            { cat "$tmp"; echo; } | sed '$d' > "$tmp.t" 2>/dev/null && mv "$tmp.t" "$tmp"
+            if [ -s "$tmp" ]; then
+                log_msg "WARNING: GeoCustom file '$name' (policy $id$chan) was cut off by the firmware settings store (~3000 chars per value, about 2 KB of list) — only its first part loads, the partial last line is dropped. Shrink it, or put a big list online and add it under URL sources"
+            else
+                log_msg "WARNING: GeoCustom file '$name' (policy $id$chan) was lost to the firmware settings store's cut (~3000 chars per value, about 2 KB of list) — nothing of it survived. Re-add it smaller, or put a big list online and add it under URL sources"
+            fi
+        fi
+        if [ -s "$tmp" ]; then
+            cnt=$(classify_user_list "$tmp" "$GEO_DIR/domains/${pfx}${name}.txt" "$GEO_DIR/geoip/${pfx}${name}.cidr")
+            # shellcheck disable=SC2086
+            log_msg "GeoCustom file '$name' (policy $id$chan): $(user_list_summary $cnt)"
+        fi
         rm -f "$tmp"
+        prev="$name"
     done
-    set +f
-    IFS="$oldifs"
+    [ "$tailcut" = 1 ] && log_msg "WARNING: GeoCustom files (policy $id$chan): the firmware settings store (~3000 chars per value, about 2 KB of list) cut off everything after file '$prev' — a file after it was lost entirely. Re-add it smaller, or put a big list online and add it under URL sources"
+    return 0
 }
 
 # Extract the UNION of every policy's GeoSite categories from the shared v2fly DB into shared
@@ -1694,7 +2613,7 @@ geo_any_pending(){
 geo_urls_missing(){
     local u key
     for u in $(geo_union_urls); do
-        key=$(echo "$u" | sha256sum | awk '{print $1}' | cut -c1-16)
+        key=$(url_key "$u"); [ -n "$key" ] || continue
         { [ ! -f "$GEO_DIR/domains/userurl_${key}.txt" ] && [ ! -f "$GEO_DIR/geoip/userurl_${key}.cidr" ]; } \
             && ! dl_recently_failed "url_${key}" && return 0
     done
@@ -1724,7 +2643,7 @@ geo_fetch_missing(){
         download_antifilter_list "$af_key" || log_msg "WARNING: Antifilter $af_key failed (won't re-try for 6h)"
         update_status
     done
-    geo_urls_missing && download_custom_urls
+    geo_urls_missing && download_custom_urls missing
 }
 
 # --- Unified firewall setup ---
@@ -1926,8 +2845,9 @@ EOF
 # watchdog reconciler can't drift from setup_firewall's decision.
 # A flag read that TIMED OUT (rc 124 from the bounded nvram call) counts as "active": the
 # callers act on "inactive" by installing our :53 DNAT, and doing that over a DNS owner we
-# merely failed to see is the exact conflict this probe exists to prevent. The next tick
-# re-reads; a skipped tick costs nothing.
+# merely failed to see is the exact conflict this probe exists to prevent. The watchdog's
+# removal branch must not take that answer as evidence: it reads fw_dns_redirect_name, which
+# names the unread case "unknown", and drops our DNAT only for a confirmed owner.
 fw_dns_redirect_active(){
     local _v _k
     pidof AdGuardHome >/dev/null 2>&1 && return 0
@@ -2030,9 +2950,15 @@ setup_dns_interception(){
 # Validated tunnel-DNS servers from awg_dns (comma/space separated): echoes up to 3 IPv4s.
 # IPv6 and hostnames are dropped — the @interface upstream binding + the awg0 policy rule
 # need literal v4 here (a hostname upstream would need resolving, a chicken-and-egg).
+# Read from the MATERIALIZED side-file (generate_config writes the dns field of the slot it
+# actually built awg0.conf from into $AWG_DIR/awg0.dns, same raw comma-joined format), NOT from
+# the effective slot: while a switch is saved but its restart was dropped, or a failover
+# override stopped matching, the effective slot is not what the daemon runs — and binding
+# dnsmasq to the OTHER profile's resolver can point the whole LAN at an address this tunnel
+# does not reach.
 tunnel_dns_ips(){
-    local raw ip out="" n=0
-    raw=$(pf_get dns | tr ',' ' ')
+    local raw="" ip out="" n=0
+    [ -f "$AWG_DIR/awg0.dns" ] && raw=$(tr ',' ' ' < "$AWG_DIR/awg0.dns" 2>/dev/null)
     for ip in $raw; do
         ip=$(echo "$ip" | tr -d ' \r')
         validate_ip "$ip" || continue
@@ -2088,18 +3014,36 @@ dns_ok(){
 # every flavor here. AAAA tokens fail the IPv4 shape test naturally; 0.0.0.0 and loopback answers
 # are dropped (AdGuard-family upstreams answer 0.0.0.0 for blocked names — routing those would
 # just add noise entries). No busybox-awk landmines: no {n,m} intervals, no gawk-isms.
+# $2 = optional nslookup option, deliberately unquoted so an empty one vanishes: the pre-resolve
+# passes "-querytype=A" once its probe proved this nslookup understands it (LEDE applet: -q +
+# skip-to-'='; Entware BIND: documented) — half the queries of the default A+AAAA. The classic
+# applet rejects any option, so the probe fails there and the call stays dual-stack. Never
+# -type=/-port=/-timeout=: LEDE's getopt reads them as -t/-p with junk arguments.
+# Prints the marker "!R" (and no address) on REFUSED/SERVFAIL or when the resolver never answered
+# (LEDE: "Connection refused" / "no servers could be reached"; the classic applet prints one
+# "can't resolve" for every failure, NXDOMAIN included, so there every failure qualifies) — a
+# dnsmasq restart blip or a dropped query, not "this name has no IPv4": the pre-resolve retries
+# those once at the end instead of counting them as done. (stderr joins the parsed stream for that; error lines never start with
+# Name:/Address, so the address parsing is unaffected.)
 resolve_domain_v4(){
-    nslookup "$1" 127.0.0.1 2>/dev/null | awk '
+    nslookup $2 "$1" 127.0.0.1 2>&1 | awk '
+        /[Cc]onnection refused|[Nn]o servers could be reached|[Tt]imed out|can.t resolve/ { bad = 1 }
+        /(^|[[:space:]:])(REFUSED|SERVFAIL)($|[[:space:]])/ { bad = 1 }
         /^Name:/ { seen = 1; next }
         seen && $1 ~ /^Address/ {
             for (i = 2; i <= NF; i++) {
                 if ($i !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) continue
                 split($i, o, ".")
                 if (o[1]+0 > 255 || o[2]+0 > 255 || o[3]+0 > 255 || o[4]+0 > 255) continue
-                if (o[1] == "127" || $i == "0.0.0.0") continue
-                print $i
+                # One address per Address line on every flavor: stop at it, so the trailing
+                # reverse name of the classic applet ("Address 1: IP PTR") is never read as a
+                # second IP when a PTR record happens to be a dotted quad. (No apostrophes or
+                # angle brackets in here: this program sits inside a single-quoted string.)
+                if (o[1] != "127" && $i != "0.0.0.0") { print $i; got = 1 }
+                break
             }
-        }'
+        }
+        END { if (bad && !got && !seen) print "!R" }'
 }
 
 setup_ipv6_block(){
@@ -2290,6 +3234,8 @@ ipset_commit_staged(){
     if ipset rename "$tmp" "$final" 2>/dev/null; then
         unregister_owned_set "$tmp"
         register_owned_set "$final"
+        # A brand-new live set holds statics only: the next pre-resolve must feed it from line 1.
+        geoset_gen_bump
         return 0
     fi
     return 1
@@ -2453,6 +3399,27 @@ cleanup_firewall(){
     log_msg "Firewall rules cleaned"
 }
 
+# Seconds since FILE ($1) was last modified — busybox `date -r` (always built), NOT `find -mmin`:
+# the firmware's busybox has neither -mmin nor -maxdepth (CONFIG_FEATURE_FIND_MMIN / _MAXDEPTH
+# are off in every Merlin config_base), so under the AWG_PATH_SANE=0 fallback PATH, or an
+# Entware without GNU findutils, every `find … -mmin` test read "not old" and the 15-min / 5-min
+# reclaims never fired. Prints nothing (rc 1) when the file is gone. A NEGATIVE age = an mtime
+# in the future (the clock stepped back): callers treat it as stale, never as fresh forever.
+file_age_s(){
+    local _m _n
+    _m=$(date -r "$1" +%s 2>/dev/null) || return 1
+    _n=$(date +%s 2>/dev/null) || return 1
+    case "$_m" in ''|*[!0-9]*) return 1 ;; esac
+    case "$_n" in ''|*[!0-9]*) return 1 ;; esac
+    echo $(( _n - _m ))
+}
+# True when FILE ($1) exists and is older than $2 seconds (or dated in the future).
+file_older_than(){
+    local _a
+    _a=$(file_age_s "$1") || return 1
+    [ "$_a" -gt "$2" ] || [ "$_a" -lt -60 ]
+}
+
 # --- Updater dnsmasq-reload coalescing ---
 # finalize_ipk_install's stop → prerm → postinst → stop chain kicks 3-4 detached reload
 # jobs while rc_service is busy with OUR OWN start_awgdoupdate service-event. None of
@@ -2467,7 +3434,7 @@ cleanup_firewall(){
 # stop landing in dnsmasq — the same class of harm as a stolen lock disabling self-heal).
 dnsreload_deferred(){
     [ -f "$DNSRELOAD_DEFER" ] || return 1
-    if [ -n "$(find "$DNSRELOAD_DEFER" -mmin +15 2>/dev/null)" ]; then
+    if file_older_than "$DNSRELOAD_DEFER" 900; then
         rm -f "$DNSRELOAD_DEFER"
         return 1
     fi
@@ -2477,6 +3444,101 @@ dnsreload_deferred(){
 dnsreload_defer_begin(){
     rm -f "$DNSRELOAD_PENDING"
     touch "$DNSRELOAD_DEFER"
+}
+
+# Remove the dnsmasq-reload lock ATOMICALLY: rename it to a tomb, then delete the tomb. Since
+# 1.5.27 queued waiters write `preempt`/`owed` INTO the lock dir every second, and a plain
+# `rm -rf` (unlink every entry, then rmdir) racing such a write fails its rmdir with ENOTEMPTY:
+# the dir survives with no pid file — a pidless lock every later reload waits 240 s behind and
+# then drops (reproduced in ~1 of 120 hand-offs under load). After the rename a late write finds
+# no dir (ENOENT). $1 = tag making the tomb name unique per remover.
+# $2 (optional, may be empty = "a pidless lock") = the holder pid the caller means to release.
+# The path is re-checked AFTER the rename: every remover decided from reads taken a moment
+# earlier, and in between the lock can change hands (the holder ended and a waiter took a fresh
+# lock; two waiters reclaimed the same dead pid). A lock that turns out to be someone else's is
+# put back instead of being deleted under its live owner.
+# The removed lock's flags are returned in DR_OWED / DR_UNL / DR_PH — read from the TOMB, after
+# the rename, so a waiter's give-up `owed` either landed before (seen here) or found no dir and
+# the waiter took the lock itself. Returns 0 = removed, 1 = nothing there / not the expected one.
+dnsreload_unlock(){
+    local _t="/tmp/.awg_dnsreload.x${1:-$$}" _p="" _x
+    DR_OWED=0; DR_UNL=0; DR_PH=""
+    rm -rf "$_t" 2>/dev/null
+    mv /tmp/.awg_dnsreload "$_t" 2>/dev/null || return 1
+    if [ $# -ge 2 ]; then
+        { read -r _p < "$_t/pid"; } 2>/dev/null
+        if [ "$_p" != "$2" ]; then
+            # Not the lock we meant: hand it back (never `mv` onto an existing path — that
+            # would nest it inside a newer lock).
+            [ -e /tmp/.awg_dnsreload ] || mv "$_t" /tmp/.awg_dnsreload 2>/dev/null
+            return 1
+        fi
+    fi
+    [ -f "$_t/owed" ] && DR_OWED=1
+    [ -f "$_t/unloaded" ] && DR_UNL=1
+    { read -r DR_PH _x < "$_t/beat"; } 2>/dev/null
+    case "$DR_PH" in *[!a-z]*) DR_PH="" ;; esac
+    rm -rf "$_t" 2>/dev/null
+    return 0
+}
+
+# Real pid of the CALLING shell, fork-free: a builtin's redirection is opened by the shell
+# itself, so /proc/self is this (sub)shell — unlike $$, which a `( ) &` job inherits from its
+# parent. Result in DR_SELF ('' if /proc is unreadable).
+dnsreload_self(){
+    local _x
+    DR_SELF=""; { read -r DR_SELF _x < /proc/self/stat; } 2>/dev/null
+    case "$DR_SELF" in ''|*[!0-9]*) DR_SELF="" ;; esac
+}
+
+# Remove a lock that is NOT the caller's own (a waiter reclaiming a dead holder; every reaper
+# branch) under a short mutex. Acquisition publishes a lock atomically and only onto a free
+# path, and a live holder releases only its own lock — so while the mutex is held, the lock a
+# remover has just re-read cannot change hands: verify-then-rename is safe, and no put-back
+# window exists. (1.5.27 round 3 renamed first and checked after, putting a foreign lock back:
+# with 3+ waiters reclaiming one dead holder in the same instant, the path sat free while a
+# live lock was in a tomb — two holders at once, or a lock deleted under its owner.)
+# $1 tomb tag, $2 expected pid ('' = pidless), $3 = dead: also require that pid to be dead.
+# Held for a few builtins and one rename; a remover killed inside it leaves it behind → broken
+# once it is over a minute old (or dated in the future), by renaming it away first so two
+# breakers cannot both delete. Returns 2 when the mutex stayed busy for 10 s (nothing done),
+# 1 when the lock was not the expected one any more (a lost race — someone else reclaimed or
+# took it), 0 when it removed it (flags in DR_OWED / DR_UNL / DR_PH).
+DNSRELOAD_MX=/tmp/.awg_dnsreload.m
+dnsreload_reclaim(){
+    local _p="" _i=0 _r=1
+    DR_OWED=0; DR_UNL=0; DR_PH=""
+    while ! mkdir "$DNSRELOAD_MX" 2>/dev/null; do
+        if file_older_than "$DNSRELOAD_MX" 60; then
+            dnsreload_self
+            if mv "$DNSRELOAD_MX" "$DNSRELOAD_MX.b${DR_SELF:-$$}" 2>/dev/null; then
+                rm -rf "$DNSRELOAD_MX.b${DR_SELF:-$$}" 2>/dev/null
+                continue
+            fi
+            # The break rename failed (never loop on it — a counted try, like a busy mutex).
+        fi
+        _i=$((_i + 1)); [ $_i -ge 10 ] && return 2
+        sleep 1
+    done
+    { read -r _p < /tmp/.awg_dnsreload/pid; } 2>/dev/null
+    if [ -d /tmp/.awg_dnsreload ] && [ "$_p" = "$2" ] \
+       && { [ "$3" != dead ] || [ -z "$2" ] || ! kill -0 "$2" 2>/dev/null; }; then
+        dnsreload_unlock "$1" "$2"; _r=$?
+    fi
+    rmdir "$DNSRELOAD_MX" 2>/dev/null
+    return $_r
+}
+
+# Would a reload job that ended at beat phase $1 (with the lock dir's flags already read into
+# $2 = owed 0/1 and $3 = unloaded 0/1) have left dnsmasq without the current conf? Past the
+# restart (dns wait, pre-resolve) the conf is loaded — unless the restart never took (unloaded)
+# or a waiter gave up behind the job (owed). A legacy (beat-less) or unknown phase counts as
+# not loaded. The pre-resolve itself resumes from its saved cursor at the next reload.
+dnsreload_needs_requeue(){
+    case "$1" in
+        preresolve|dnswait) [ "$2" = 1 ] || [ "$3" = 1 ] ;;
+        *) return 0 ;;
+    esac
 }
 
 # Close the defer window; if any reload was swallowed while it was open, fire exactly one
@@ -2508,31 +3570,181 @@ reload_dnsmasq(){
         # OWNERSHIP matters here: the old code, after 60s of waiting, BROKE OUT and ran
         # anyway — unserialized — and its EXIT trap then removed the OTHER job's lock, so
         # every later job also ran unserialized (two pre-resolve storms in the same second
-        # were seen in a field log). Now: reclaim only a DEAD holder's lock, concede (skip
-        # this reload) if a live one still holds it after the wait — the running job loads
-        # the current on-disk conf anyway, and the watchdog reconcile re-installs the :53
-        # DNAT within 5 min if this call was carrying the interception flag.
+        # were seen in a field log). Now: reclaim only a DEAD holder's lock; otherwise ask the
+        # holder to YIELD (1.5.27). The holder honors `preempt` only between pre-resolve
+        # batches — never inside settle/restart — so a queued reload normally takes over within
+        # a second or two of the holder's restart finishing, and the restart WE do then loads
+        # the current on-disk conf. Before 1.5.27 a waiter simply skipped after 240 s, although
+        # the holder, already past its restart and deep in a long pre-resolve, had loaded the
+        # OLD conf: a geo Apply / server start / analyzer toggle then never reached dnsmasq.
+        # A waiter that still gives up (holder stuck 240 s in settle/restart) leaves `owed`, and
+        # the holder re-runs the reload when it ends (_dr_done) — or the reaper re-queues it.
+        # The watchdog reconcile re-installs the :53 DNAT within 5 min if this call was
+        # carrying the interception flag.
+        # Writes into the lock dir use `true` (a REGULAR builtin), never `:` — a failed
+        # redirection on the special builtin `:` EXITS the shell, and this dir can vanish
+        # under us at any moment (holder exit, reaper).
         _w=0
-        while ! mkdir /tmp/.awg_dnsreload 2>/dev/null; do
+        # Publish the lock ATOMICALLY, with our pid already inside: build a private dir, then
+        # rename it onto the lock path. There is no pidless moment for a reclaimer to misjudge,
+        # and our pid can never land in someone else's dir. (The real pid of THIS subshell —
+        # `$$` would be the parent's, dead in seconds, and every waiter would "reclaim" our live
+        # lock; see the acquire_lock note.) busybox mv has no -T: when the path appeared
+        # meanwhile, mv moves our dir INTO that lock — the read-back then shows a foreign pid,
+        # we take our dir back out and queue.
+        dnsreload_self; _me=$DR_SELF
+        [ -n "$_me" ] || exit 0
+        _nl="/tmp/.awg_dnsreload.n$_me"
+        rm -rf "$_nl" 2>/dev/null
+        while :; do
+            # Keep a private dir holding OUR pid ready on every pass (a builtin read when it is
+            # already there). _pubok = we could build it: only then may we publish — a write that
+            # failed after the file was created (a full /tmp) would publish a pidless lock that
+            # even its creator queues behind — and only then may we ask a holder to yield below
+            # (it would throw its progress away for a job that can never take over).
+            _p=""; { read -r _p < "$_nl/pid"; } 2>/dev/null
+            if [ "$_p" != "$_me" ]; then
+                rm -rf "$_nl" 2>/dev/null
+                { mkdir "$_nl" && echo "$_me" > "$_nl/pid"; } 2>/dev/null
+                _p=""; { read -r _p < "$_nl/pid"; } 2>/dev/null
+            fi
+            if [ "$_p" = "$_me" ]; then _pubok=1; else _pubok=0; rm -rf "$_nl" 2>/dev/null; fi
+            if [ "$_pubok" = 1 ] && [ ! -e /tmp/.awg_dnsreload ]; then
+                mv "$_nl" /tmp/.awg_dnsreload 2>/dev/null
+                _p=""; { read -r _p < /tmp/.awg_dnsreload/pid; } 2>/dev/null
+                [ "$_p" = "$_me" ] && break
+                rm -rf "/tmp/.awg_dnsreload/.awg_dnsreload.n$_me" 2>/dev/null
+            fi
             _hp=$(cat /tmp/.awg_dnsreload/pid 2>/dev/null)
-            if [ -n "$_hp" ] && ! kill -0 "$_hp" 2>/dev/null; then
-                rm -rf /tmp/.awg_dnsreload 2>/dev/null
-                continue
+            # A dead holder's lock — or one carrying OUR pid that we did not publish (the dead
+            # holder's pid was reused by this very job) — is reclaimed under the mutex. Every
+            # attempt counts toward the give-up below; a mutex that stays busy costs 10 polls, so a
+            # stuck one degrades into the usual give-up + `owed` instead of an endless loop, while
+            # a race lost to another reclaimer costs one poll and a second.
+            _hgone=0
+            if [ -n "$_hp" ] && { [ "$_hp" = "$_me" ] || ! kill -0 "$_hp" 2>/dev/null; }; then
+                _hgone=1
+                if [ "$_hp" = "$_me" ]; then dnsreload_reclaim "w$_me" "$_hp"; else dnsreload_reclaim "w$_me" "$_hp" dead; fi
+                case $? in
+                    0) continue ;;
+                    2) _w=$((_w + 10)) ;;
+                    *) _w=$((_w + 1)); _hgone=0 ;;   # lost race: the lock changed hands
+                esac
+                sleep 1
+                [ $_w -lt 240 ] && continue
             fi
             # The defer window can open while we queue (update started under a running
             # job) — hand off to the updater's final reload instead of waiting it out.
-            if dnsreload_deferred; then touch "$DNSRELOAD_PENDING"; exit 0; fi
+            if dnsreload_deferred; then rm -rf "$_nl" 2>/dev/null; touch "$DNSRELOAD_PENDING"; exit 0; fi
+            # Ask the holder to yield only when we can take over: a job whose own publish keeps
+            # failing (a full /tmp) would make it throw away its progress for nobody.
+            [ "$_pubok" = 1 ] && true 2>/dev/null > /tmp/.awg_dnsreload/preempt
             _w=$((_w + 1))
             if [ $_w -ge 240 ]; then
-                log_msg "dnsmasq reload: another reload job (pid ${_hp:-?}) still running after 240s — skipping this one"
-                exit 0
+                # Give up only once `owed` is really in place: written into a dir the holder
+                # released a moment ago, it would be lost with no re-run at all. If it did not
+                # land, the lock is (being) freed — go round and take it instead (bounded, so an
+                # unwritable /tmp cannot spin us forever).
+                true 2>/dev/null > /tmp/.awg_dnsreload/owed
+                if [ -f /tmp/.awg_dnsreload/owed ] || [ $_w -ge 300 ]; then
+                    _hph=""; { read -r _hph _hpt < /tmp/.awg_dnsreload/beat; } 2>/dev/null
+                    case "$_hph" in *[!a-z]*) _hph="" ;; esac
+                    if [ ! -d /tmp/.awg_dnsreload ]; then
+                        log_msg "dnsmasq reload: could not take the reload lock for 240s (writing to /tmp keeps failing — full?) — this reload is dropped; the next Apply / reload runs it"
+                    elif [ "$_hgone" = 1 ]; then
+                        log_msg "dnsmasq reload: the reload lock's holder (pid $_hp) is gone and the lock could not be reclaimed for 240s — left \`owed\`; the watchdog clears it and re-runs this reload"
+                    elif [ -n "$_hp" ]; then
+                        log_msg "dnsmasq reload: another reload job (pid $_hp, phase ${_hph:-?}) still busy after 240s — it will re-run this reload when it finishes"
+                    else
+                        log_msg "dnsmasq reload: the reload lock has had no holder for 240s (a job died while taking it) — the watchdog clears it and re-runs this reload"
+                    fi
+                    rm -rf "$_nl" 2>/dev/null
+                    exit 0
+                fi
             fi
             sleep 1
         done
-        # Real pid of THIS reload subshell — `echo $$` here would record the parent (dead in
-        # seconds) and every waiter would "reclaim" our live lock; see the acquire_lock note.
-        sh -c 'echo $PPID' > /tmp/.awg_dnsreload/pid 2>/dev/null
-        trap 'rm -rf /tmp/.awg_dnsreload 2>/dev/null' EXIT INT TERM
+        # EXIT only releases the lock (atomically — see dnsreload_unlock); TERM must also END
+        # the job. A trap without `exit` (1.4.x-1.5.26: `trap '…' EXIT INT TERM`) ran the rm
+        # and then RESUMED the job, which went on unlocked — invisible to the reaper,
+        # unserialized against the next holder. (No INT trap: an async `( ) &` list starts
+        # with SIGINT ignored, and a signal ignored on entry cannot be trapped.)
+        trap 'dnsreload_unlock "$_me" "$_me"' EXIT
+        trap 'exit 143' TERM
+        # A lock won AFTER the updater opened its defer window (a waiter that queued before the
+        # window, handed the lock by a yielding holder): release it at once — the updater fires
+        # the one owed reload at its end. Without this check the new holder restarted dnsmasq in
+        # the middle of the update, the very storm the window exists to prevent.
+        if dnsreload_deferred; then touch "$DNSRELOAD_PENDING"; exit 0; fi
+        # Progress beat "<phase> <uptime-s>" (1.5.27). reap_stale_dnsreload judges this job by
+        # PROGRESS, not by age: 1.5.21 killed any holder older than 1200 s, and a long geo
+        # pre-resolve (tens of thousands of domains behind AdGuardHome) is legitimately older
+        # than that — it was reaped every ~25 min, blamed on nvram, re-queued, and started
+        # over from line 1, forever. Beat before every step that can block: each settle poll
+        # (the nvram read), each notify_rc, the dnsmasq tests/direct start, the DNS wait, each
+        # lookup batch and every 100 ipset adds. Written to a temp file and RENAMED into place:
+        # an in-place `echo > beat` truncates first, and the reaper's byte-at-a-time `read`
+        # landing in that window saw an empty or cut line ("preresolve 2" for 2380) and killed
+        # a healthy job. `echo`/`mv` are external applets on Merlin (no ASH_BUILTIN_ECHO) — two
+        # forks per beat, next to the forks each step makes anyway.
+        _dr_up(){
+            _ux=""; { read -r _ux _uy < /proc/uptime; } 2>/dev/null
+            _ux=${_ux%%.*}
+            case "$_ux" in ''|*[!0-9]*) _ux=0 ;; esac
+        }
+        _beat(){
+            _dr_up
+            echo "$1 $_ux" 2>/dev/null > /tmp/.awg_dnsreload/beat.t \
+                && mv -f /tmp/.awg_dnsreload/beat.t /tmp/.awg_dnsreload/beat 2>/dev/null
+        }
+        # Voluntary end of this job. A waiter that gave up while we were busy (`owed`) may carry
+        # a conf newer than the one our restart loaded: re-run the reload for it (its own md5
+        # check skips the restart if nothing changed). Release FIRST (rename to the tomb), THEN
+        # look for `owed` inside the tomb: a waiter writing it after the rename gets ENOENT and
+        # takes the lock itself, one writing before is seen here — no window where it is lost.
+        # The EXIT trap is dropped before that, so it cannot release the NEW job's lock.
+        _dr_done(){
+            trap - EXIT
+            if dnsreload_unlock "$_me" "$_me" && [ "$DR_OWED" = 1 ]; then
+                log_msg "dnsmasq reload: re-running a reload that queued behind this one and gave up"
+                reload_dnsmasq
+            fi
+            exit 0
+        }
+        _beat start
+        # Pre-1.5.27 pre-resolve scratch lived in /tmp/.awg_prerslv.<pid>.* and leaked on every
+        # SIGKILL (the trap never runs; the pre-clean only matched the same parent pid) — in the
+        # reap loop a new ~1 MB set per cycle, in RAM. Scratch now lives INSIDE the lock dir and
+        # dies with it; sweep the legacy leftovers (and any tomb a late write kept alive) once we
+        # hold the lock — no other reload job can be writing them now.
+        rm -f /tmp/.awg_prerslv.* 2>/dev/null
+        # Tombs: only under the reclaim mutex (a reclaimer holds it from its verification until
+        # it has read its tomb — sweeping that tomb from under it made the reaper resume a frozen
+        # holder that then ran without a lock), and never the tomb of a LIVE owner still reading
+        # its own flags. Not waiting for a busy mutex: the next holder sweeps.
+        if mkdir "$DNSRELOAD_MX" 2>/dev/null; then
+            for _d in /tmp/.awg_dnsreload.x*; do
+                [ -e "$_d" ] || continue
+                case "${_d##*.x}" in
+                    ''|*[!0-9]*) rm -rf "$_d" 2>/dev/null ;;
+                    *) kill -0 "${_d##*.x}" 2>/dev/null || rm -rf "$_d" 2>/dev/null ;;
+                esac
+            done
+            # A mutex breaker killed between its rename and its rm leaves .m.b<pid> behind.
+            for _d in "$DNSRELOAD_MX".b*; do
+                [ -e "$_d" ] || continue
+                case "${_d##*.b}" in
+                    ''|*[!0-9]*) rm -rf "$_d" 2>/dev/null ;;
+                    *) kill -0 "${_d##*.b}" 2>/dev/null || rm -rf "$_d" 2>/dev/null ;;
+                esac
+            done
+            rmdir "$DNSRELOAD_MX" 2>/dev/null
+        fi
+        # Private pre-publish dirs of acquirers that died before their rename.
+        for _d in /tmp/.awg_dnsreload.n*; do
+            [ -d "$_d" ] || continue
+            kill -0 "${_d##*.n}" 2>/dev/null || rm -rf "$_d" 2>/dev/null
+        done
         # Order-independent PID snapshot (sorted): dnsmasq runs as main + a --log-async child, so
         # pidof returns two PIDs — sort them so a mere change in listing order can't masquerade as
         # (or mask) a real restart in the comparison below.
@@ -2547,20 +3759,24 @@ reload_dnsmasq(){
         # idle — the one call that then executes beats thirty that rc throws away. The
         # budget is job-global, so a pathologically busy rc degrades to the old fire-blind
         # behavior instead of pinning this job (and the lock) forever.
-        _rcbudget=150
         # A TIMED-OUT read (rc 124) is not "idle": it is the one answer that would make us
         # fire blind, so it is treated as busy — sleep, spend budget, ask again. The budget
         # is WALL-CLOCK seconds (measured per iteration on /proc/uptime), not iterations: a
         # slow nvram spends up to 6 s per pass, and counting passes would let this loop run
-        # ~15 min — past the reaper's DNSRELOAD_STALE_S — while still "in budget".
+        # ~15 min while still "in budget".
+        _rcbudget=150
         _rc_settle(){
             local _rcs _t0 _t1 _d _r
             while [ $_rcbudget -gt 0 ]; do
+                _beat settle
                 read -r _t0 _r < /proc/uptime
+                # Update began while we waited: its final reload supersedes this one. Checked
+                # BEFORE the idle test too, so no restart attempt fires inside the window — but
+                # only while dnsmasq is UP: the heal/strip loops run with it down, and walking
+                # away from them would leave the LAN without DNS/DHCP for the whole update.
+                if dnsreload_deferred && pidof dnsmasq >/dev/null 2>&1; then touch "$DNSRELOAD_PENDING"; exit 0; fi
                 _rcs=$(nv get rc_service 2>/dev/null)
                 [ $? -ne 124 ] && [ -z "$_rcs" ] && return 0
-                # Update began while we waited: its final reload supersedes this one.
-                if dnsreload_deferred; then touch "$DNSRELOAD_PENDING"; exit 0; fi
                 sleep 1
                 read -r _t1 _r < /proc/uptime
                 _d=$(( ${_t1%%.*} - ${_t0%%.*} ))
@@ -2599,6 +3815,7 @@ reload_dnsmasq(){
                 # idle — don't fire another restart over a resolver that just reloaded
                 # (a needless bounce only widens the :53 outage window).
                 if _reload_took; then _took=1; break; fi
+                _beat restart
                 service restart_dnsmasq >/dev/null 2>&1
                 sleep 2
                 if _reload_took; then _took=1; break; fi
@@ -2609,6 +3826,9 @@ reload_dnsmasq(){
                 log_msg "dnsmasq reloaded (geo rules active)"
                 [ -n "$_sig" ] && echo "${newpid}|${_sig}" > "$DNSRELOAD_SIG"
             else
+                # The conf did NOT reach dnsmasq: tell the reaper, so a job that later stalls in
+                # the DNS wait / pre-resolve is re-queued instead of logged as "already loaded".
+                true 2>/dev/null > /tmp/.awg_dnsreload/unloaded
                 log_msg "WARNING: dnsmasq reload never took (rc kept dropping restart_dnsmasq); geo domains may need a manual restart"
             fi
         fi
@@ -2629,6 +3849,7 @@ reload_dnsmasq(){
             # snippet) actually PARSE? Our snippet was already validated in isolation, so a parse
             # FAILURE here is a combination conflict and our conf is the only lever we have; a parse
             # PASS means the death is runtime (race/OOM) and our valid conf must NOT be thrown away.
+            _beat test
             if which dnsmasq >/dev/null 2>&1; then
                 _dmtest=$(dnsmasq --test --conf-file=/etc/dnsmasq.conf 2>&1); _dmrc=$?
             else
@@ -2644,6 +3865,7 @@ reload_dnsmasq(){
                 _r=0
                 while [ $_r -lt 5 ]; do
                     _rc_settle   # a dropped attempt here = more dead-LAN time; make it count
+                    _beat heal
                     service restart_dnsmasq >/dev/null 2>&1
                     sleep 2
                     if pidof dnsmasq >/dev/null 2>&1; then _recovered=1; log_msg "dnsmasq recovered WITH geo rules intact"; break; fi
@@ -2667,6 +3889,7 @@ reload_dnsmasq(){
                 _j=0
                 while [ $_j -lt 15 ]; do
                     _rc_settle
+                    _beat strip
                     service restart_dnsmasq >/dev/null 2>&1
                     sleep 2
                     pidof dnsmasq >/dev/null 2>&1 && { log_msg "dnsmasq recovered (AWG dnsmasq rules removed)"; break; }
@@ -2679,6 +3902,7 @@ reload_dnsmasq(){
                 # the firmware runs it — rc's next real restart will kill+replace this instance
                 # cleanly, so we never end up fighting it.
                 if ! pidof dnsmasq >/dev/null 2>&1 && which dnsmasq >/dev/null 2>&1; then
+                    _beat direct
                     if dnsmasq --test >/dev/null 2>&1; then
                         log_msg "EMERGENCY: rc kept skipping restart_dnsmasq — starting dnsmasq directly to restore LAN DNS/DHCP"
                         dnsmasq --log-async >/dev/null 2>&1
@@ -2691,6 +3915,7 @@ reload_dnsmasq(){
                 fi
             fi
         fi
+        _beat dnswait
         wait_for_dns 10
         # Install the LAN :53 DNAT ONLY now that dnsmasq is confirmed answering. Doing it
         # before/while the restart_dnsmasq loop above bounces the resolver would DNAT every
@@ -2701,71 +3926,453 @@ reload_dnsmasq(){
         # Only when the conf actually carries domain rules: a filter-AAAA-only conf (CIDR-only
         # geo selection, no domains) has nothing to pre-resolve.
         if [ -f "$DNSMASQ_AWG_CONF" ] && grep -q '^ipset=' "$DNSMASQ_AWG_CONF" 2>/dev/null; then
-            # SELF-FEEDING pre-resolve (1.4.3). It used to only fire queries through dnsmasq and
-            # count on dnsmasq's ipset hook to populate the sets — but that hook runs ONLY on
-            # FORWARDED (upstream) answers, never on cache hits. Every firewall rebuild destroys
-            # + re-creates the sets with STATIC content only, and when the geo conf is unchanged
-            # the restart above is rightly skipped (md5 sig) — so with a warm dnsmasq cache the
-            # wiped domain IPs could NOT return until their TTLs expired: excluded domains leaked
-            # into the VPN (exclude mode) / geo domains fell out of it (include mode) for minutes
-            # to hours after every Apply. Field case TUF-AX3000_V2 @1.4.1: the cold-cache run fed
-            # +213 entries, the warm-cache rebuild 17 min later only +42 — the other ~170 bank
-            # domains routed via VPN. (The old "a restart usually fixes it" advice worked ONLY
-            # because a restart cools the cache — it misdiagnosed the cause as an unloaded conf.)
-            # Now each answer is parsed (resolve_domain_v4) and added to the line's own target
-            # set(s) BY US, cache hit or not; dnsmasq's hook still covers live client traffic
-            # afterwards. Adds are one-by-one WITHOUT -exist/`restore -!`: the exist flag RESETS
-            # the timeout of an already-present entry, which would demote the user's permanent
-            # (timeout 0) custom IPs to expiring 24h ones — a plain add's EEXIST is swallowed
-            # instead, exactly how dnsmasq's own hook behaves. Parallel jobs append to ONE shared
-            # O_APPEND file (each echo is a single short atomic write — no interleaving, no
-            # per-job file fan that a huge domain list would turn into a giant cat glob).
-            _pre_ips=$(geo_ipset_total)
-            _prl="/tmp/.awg_prerslv.$$"
-            # Pre-clean: .out below is APPENDED to, and $$ here is the PARENT's pid (the known
-            # subshell gotcha) — a killed-mid-run predecessor from the same parent must not leak
-            # its half-written pairs into this run.
-            rm -f "${_prl}".* 2>/dev/null
+            # SELF-FEEDING pre-resolve (1.4.3). dnsmasq's ipset hook runs ONLY on FORWARDED
+            # (upstream) answers, never on cache hits, so a set that lost its fed entries could
+            # not refill from a warm dnsmasq cache until the TTLs expired — excluded domains
+            # leaked into the VPN (exclude mode) / geo domains fell out of it (include mode) for
+            # minutes to hours (field case TUF-AX3000_V2 @1.4.1: ~170 bank domains via VPN after
+            # an Apply). So each answer is parsed (resolve_domain_v4) and added to the line's own
+            # target set(s) BY US, cache hit or not; dnsmasq's hook still covers live client
+            # traffic afterwards. Adds are one-by-one WITHOUT -exist/`restore -!`: the exist flag
+            # RESETS the timeout of an already-present entry, which would demote the user's
+            # permanent (timeout 0) custom IPs to expiring 24h ones — a plain add's EEXIST is
+            # swallowed instead, exactly how dnsmasq's own hook behaves.
+            # 1.5.27 — run only when needed, feed in chunks, resume, yield:
+            #  - Since 1.4.5 the hot Apply replays fed entries through the staged swap, so the
+            #    sets keep them until they are destroyed/created empty (GEOSET_GEN changes) or
+            #    age out (24 h set timeout). A run is needed only for a new domain->set list (its
+            #    md5), a new set generation, or a feed older than PRERSLV_FRESH_S; every other
+            #    reload (device-only Apply, server start/stop, analyzer, reaper) skips it. Before,
+            #    EVERY reload re-resolved the whole list from line 1.
+            #  - Answers are fed every 50 names and the cursor is saved in PRERSLV_STATE, so an
+            #    interrupted run resumes where it stopped (1.4.3-1.5.26 fed only at the very end —
+            #    a killed run fed nothing, and the next one started from line 1 again).
+            #  - A newer reload queued behind us (preempt) or the updater's defer window makes us
+            #    stop after the current batch; the next run resumes. Scratch lives in the lock dir
+            #    and dies with it (no /tmp leak on SIGKILL).
+            #  - When AdGuardHome runs it normally owns :53 — its default ratelimit is 20 qps per
+            #    /24 with loopback NOT exempt and the excess silently dropped (each drop costs
+            #    nslookup its full timeout, and the router's own lookups share that bucket), so
+            #    batches are paced to at most one per second. The target stays 127.0.0.1:53, the
+            #    resolver the router and the clients actually use: asking dnsmasq behind AGH
+            #    directly would feed answers from a different upstream (ISP / RKN-poisoned, other
+            #    CDN edges) than the clients get whenever AGH resolves upstream itself.
+            _beat preresolve
+            if dnsreload_deferred; then
+                log_msg "Geo domain pre-resolve: postponed — an addon update is in progress (it runs after the update)"
+                touch "$DNSRELOAD_PENDING"; exit 0
+            fi
+            if [ -f /tmp/.awg_dnsreload/preempt ]; then
+                log_msg "Geo domain pre-resolve: left to a newer dnsmasq reload queued behind this one"
+                _dr_done
+            fi
+            _prl="/tmp/.awg_dnsreload/prl.$_me"
             # "domain set1,set2" pairs straight from the conf we just built ($NF = the comma-set
             # target list; domains were charset-validated at emit time, so plain read splits
             # safely — and the list file, not a pipe, keeps the loop in THIS shell so the final
-            # `wait` really covers the last sub-10 batch (the piped version orphaned it).
-            awk -F/ '/^ipset=/{for(i=2;i<NF;i++)print $i " " $NF}' "$DNSMASQ_AWG_CONF" > "${_prl}.lst"
-            bg_count=0
-            while read -r domain dsets; do
-                [ -z "$domain" ] && continue
-                (
-                    for _rip in $(resolve_domain_v4 "$domain"); do
-                        for _rst in $(echo "$dsets" | tr ',' ' '); do
-                            [ -n "$_rst" ] && echo "$_rst $_rip"
-                        done
-                    done >> "${_prl}.out"
-                ) &
-                bg_count=$((bg_count + 1))
-                [ $bg_count -ge 10 ] && { wait; bg_count=0; }
-            done < "${_prl}.lst"
-            wait
-            sort -u "${_prl}.out" 2>/dev/null > "${_prl}.add"
-            _fed=0; _tried=0
-            while read -r _rst _rip; do
-                [ -n "$_rip" ] || continue
-                _tried=$((_tried + 1))
-                ipset add "$_rst" "$_rip" 2>/dev/null && _fed=$((_fed + 1))
-            done < "${_prl}.add"
-            rm -f "${_prl}".* 2>/dev/null
-            _post_ips=$(geo_ipset_total)
-            if [ "$_tried" -gt 0 ]; then
-                # _fed = entries the add actually created; the rest of _tried already existed
-                # (EEXIST) — e.g. a second run right after a successful one legitimately logs
-                # "0 new of N". Live count ("Firewall configured: N IPs" is a build-time tally,
-                # not proof of population — THIS line is the proof).
-                log_msg "Geo domain pre-resolve: self-fed $_fed new of $_tried resolved set entries (ipset ${_pre_ips} -> ${_post_ips}) — cache-proof, domain routing active without a dnsmasq restart"
-            elif dns_ok; then
-                log_msg "Geo domain pre-resolve: resolver answers real names but returned no usable IPv4 for any geo domain (upstream blocking/empty answers?) — domains will fill on later client queries"
+            # `wait` really covers the last batch). The same awk pass counts them.
+            _total=$(awk -F/ -v out="${_prl}.lst" '/^ipset=/{for(i=2;i<NF;i++){print $i " " $NF > out; n++}} END{print n+0}' "$DNSMASQ_AWG_CONF" 2>/dev/null)
+            case "$_total" in ''|*[!0-9]*) _total=0 ;; esac
+            { [ "$_total" -gt 0 ] && [ -s "${_prl}.lst" ]; } || _dr_done
+            # Skip / resume only on a fully validated state: any failed read (md5sum missing or
+            # crashing, garbage in the file) degrades to a full run, never to a wrong skip.
+            _lsum=$(md5sum < "${_prl}.lst" 2>/dev/null); _lsum=${_lsum%% *}
+            case "$_lsum" in *[!0-9a-f]*) _lsum="" ;; esac
+            [ ${#_lsum} -eq 32 ] || _lsum=""
+            _gen=""; { read -r _gen < "$GEOSET_GEN"; } 2>/dev/null
+            case "$_gen" in ''|*[!0-9A-Za-z.-]*) _gen=0 ;; esac
+            # State: <gen> <list-md5> <done> <total> <since> — since = start of the run that fed
+            # it (extra trailing fields are ignored). Digits only and no leading zero: ash reads
+            # "08" as bad octal and an arithmetic error kills the whole job (every later reload
+            # would die on the same line).
+            _sg=""; _sm=""; _sd=""; _st=""; _ss=""
+            { read -r _sg _sm _sd _st _ss _srest < "$PRERSLV_STATE"; } 2>/dev/null
+            case "$_sd" in ''|*[!0-9]*|0?*) _sd="" ;; esac
+            case "$_ss" in ''|*[!0-9]*|0?*) _ss="" ;; esac
+            _dr_up; _t0=$_ux
+            _mode=full; _from=1; _since=$_t0
+            if [ -n "$_lsum" ] && [ "$_t0" -gt 0 ] && [ "$_sg" = "$_gen" ] && [ "$_sm" = "$_lsum" ] \
+               && [ "$_st" = "$_total" ] && [ -n "$_sd" ] && [ -n "$_ss" ] && [ "$_ss" -le "$_t0" ] \
+               && [ $((_t0 - _ss)) -lt "$PRERSLV_FRESH_S" ]; then
+                if [ "$_sd" -eq "$_total" ]; then
+                    _mode=skip
+                elif [ "$_sd" -lt "$_total" ]; then
+                    # done=0 too: a run paused before its first productive chunk (a short list
+                    # with one never-answering name) keeps its retry list and strike this way.
+                    _mode=resume; _from=$((_sd + 1)); _since=$_ss
+                fi
+            fi
+            if [ "$_mode" = skip ]; then
+                log_msg "Geo domain pre-resolve: skipped — all $_total name(s) were fed $(( (_t0 - _ss) / 60 )) min ago and the geo sets have not been rebuilt since"
+                _dr_done
+            fi
+            # A full run starts from scratch: the old cursor (a kill inside our first chunk must
+            # not leave a resumable state of ANOTHER list behind), the refresh list and the retry
+            # list all go. A resume keeps adding to both lists.
+            # The strike survives a full run that happens only because the feed went stale (same
+            # generation, list and length) — otherwise a reload more than a day apart would drop it
+            # every time and a never-answering name would keep the run pausing forever.
+            if [ "$_mode" = full ]; then
+                rm -f "$PRERSLV_STATE" "$PRERSLV_EEX" "$PRERSLV_RETRY"
+                { [ -n "$_lsum" ] && [ "$_sg" = "$_gen" ] && [ "$_sm" = "$_lsum" ] && [ "$_st" = "$_total" ]; } \
+                    || rm -f "$PRERSLV_RETRY.strike"
+            fi
+            # A-only unless this nslookup REJECTS the option (see resolve_domain_v4), and
+            # AdGuardHome-aware pacing, at most one batch START per second: A-only = 1 query per
+            # name, so 8 names/s. The only applet that rejects it is the classic one, and it
+            # costs far more than A+AAAA — it also reverse-resolves (PTR) EVERY answer address for
+            # its "Address N: <ip> <host>" lines: measured 2-18, avg ~6.7 queries per name. So one
+            # name per second there (~7 q/s), leaving the rest of AGH's default 20 qps bucket to
+            # the router itself (dns_ok, NTP, downloads share it — loopback is not exempt).
+            # Decided by REJECTION (the classic applet prints its usage and sends nothing), never
+            # by whether one lookup happened to answer: a single dropped probe used to demote a
+            # whole run to dual-stack. Stock Merlin 3004.388 / 3006.102 build the LEDE applet
+            # (CONFIG_NSLOOKUP_LEDE): A-only there; the classic one survives on older firmwares.
+            _nsq="-querytype=A"
+            case "$(nslookup -querytype=A localhost 127.0.0.1 2>&1)" in *[Uu]sage:*) _nsq="" ;; esac
+            _usl=0; which usleep >/dev/null 2>&1 && _usl=1
+            _jobs=10; _pace=0
+            if [ -n "$_nsq" ]; then _mdesc="A-only"; else _mdesc="A+AAAA+PTR"; fi
+            if agh_present; then
+                _pace=1
+                if [ -n "$_nsq" ]; then _jobs=8; else _jobs=1; fi
+                _mdesc="$_mdesc; AdGuardHome running — paced to $_jobs name(s)/s"
+            fi
+            _pre_ips=$(geo_ipset_total)
+            if [ "$_mode" = resume ]; then
+                awk -v s="$_from" 'NR >= s' "${_prl}.lst" > "${_prl}.work" 2>/dev/null
+                _work="${_prl}.work"
+                log_msg "Geo domain pre-resolve: resuming at $_from/$_total via 127.0.0.1 ($_mdesc)"
             else
+                _work="${_prl}.lst"
+                log_msg "Geo domain pre-resolve: $_total name(s) via 127.0.0.1 ($_mdesc)"
+            fi
+            if [ "$_total" -gt 20000 ]; then
+                if [ "$_pace" = 1 ]; then _eta="at least $(( (_total - _from + 1) / _jobs / 60 )) min at this pace"; else _eta="tens of minutes"; fi
+                log_msg "Geo domain pre-resolve: large list — this takes $_eta; it runs in the background, progress is logged every 5000 names and saved every 50, so an interruption resumes instead of restarting"
+            fi
+            [ -s "$_work" ] || _dr_done
+            # Save the cursor — never once the set generation moved under us (the sets were
+            # destroyed or rebuilt meanwhile: a state written now would describe sets that no
+            # longer exist). _saved = what the next job resumes after, for the logs.
+            # Only the completion block (`_state N complete`) may record the whole list: an
+            # in-loop save that reached done == total (a dry last batch) would let the next reload
+            # SKIP although the retry pass and the refresh never ran. When the generation moved,
+            # nothing is saved and the next job starts from line 1 (_saved = 0, for the logs).
+            _saved=$_ln
+            _state(){
+                _cg=""; { read -r _cg < "$GEOSET_GEN"; } 2>/dev/null
+                case "$_cg" in ''|*[!0-9A-Za-z.-]*) _cg=0 ;; esac
+                if [ "$_cg" != "$_gen" ] || [ -z "$_lsum" ]; then _saved=0; return 0; fi
+                _sc=$1
+                [ "$2" = complete ] || [ "$_sc" -lt "$_total" ] || _sc=$((_total - 1))
+                _saved=$_sc
+                echo "$_gen $_lsum $_sc $_total $_since" 2>/dev/null > "$PRERSLV_STATE"
+            }
+            # Cursor discipline: the saved cursor LAGS one chunk — it is the START of the last
+            # chunk that produced addresses (_prodfrom), never its end. The resolver can die
+            # half-way through a chunk, and a kill / yield / update pause landing before the next
+            # chunk would otherwise record that chunk's dead tail as fed. Costs at most one chunk
+            # (50 names) re-resolved per interruption.
+            _fed=0; _tried=0; _dry=0; _ln=$((_from - 1)); _lastflush=$_ln; _prodfrom=$_ln; _saved=$_ln
+            _nextlog=$(( (_ln / 5000 + 1) * 5000 ))
+            _NL='
+'
+            # Add what the finished lookups produced (called only after `wait`, so .out holds
+            # complete names only). An add that fails — nearly always EEXIST, an entry an earlier
+            # feed or dnsmasq's hook already put there — is queued in PRERSLV_EEX for
+            # _prl_refresh: a plain add never refreshes an existing entry's timeout, so without
+            # it those entries would expire on the EARLIER feed's schedule while the state claims
+            # a fresh feed. Appended in slices of 200 (printf is an external applet on Merlin: one
+            # argv holding a whole run's pairs could exceed the kernel's per-argument limit).
+            _prl_feed(){
+                _np=0; _ebuf=""; _en=0
+                if [ -s "${_prl}.out" ]; then
+                    sort -u "${_prl}.out" > "${_prl}.add" 2>/dev/null
+                    true 2>/dev/null > "${_prl}.out"
+                    if [ -f "${_prl}.add" ]; then
+                        while read -r _rst _rip; do
+                            [ -n "$_rip" ] || continue
+                            _np=$((_np + 1)); _tried=$((_tried + 1))
+                            if ipset add "$_rst" "$_rip" 2>/dev/null; then
+                                _fed=$((_fed + 1))
+                            else
+                                _ebuf="$_ebuf$_rst $_rip$_NL"; _en=$((_en + 1))
+                                if [ "$_en" -ge 200 ]; then
+                                    printf '%s' "$_ebuf" >> "$PRERSLV_EEX" 2>/dev/null
+                                    _ebuf=""; _en=0
+                                fi
+                            fi
+                            [ $((_np % 100)) -eq 0 ] && _beat preresolve
+                        done < "${_prl}.add"
+                    fi
+                fi
+                [ -n "$_ebuf" ] && printf '%s' "$_ebuf" >> "$PRERSLV_EEX" 2>/dev/null
+            }
+            _prl_flush(){
+                _chs=$_lastflush
+                _prl_feed
+                _lastflush=$_ln
+                if [ "$_np" -gt 0 ]; then
+                    _dry=0; _prodfrom=$_chs
+                else
+                    _dry=$((_dry + 1))
+                fi
+                _state "$_prodfrom"
+            }
+            # Refresh the entries whose add hit EEXIST — without demoting a static one. Per target
+            # set: one `ipset save` stream says which of them are there and which are permanent
+            # (timeout 0 — a custom IP, an antifilter /32 equal to a resolved IP: never touched,
+            # the 1.4.3 no-`-exist` rule); the rest go through that set's own `restore -!`, which
+            # resets an existing entry's timeout to the set default — PRESENT ones first (under
+            # -exist they cannot fail), then those that expired meanwhile (re-added). restore
+            # stops at its first real error ("Hash is full", a vanished set), so one restore per
+            # set and present-before-absent keep one bad line from voiding the rest. A save that
+            # fails refreshes nothing for that set (fail-safe: never guess what is permanent).
+            # The list outlives the job (a yield / kill resumes later) and is consumed only when
+            # EVERY save/restore succeeded, and only while the set generation is still ours.
+            # Keep all pairs on any failure: retrying a successful set is safe, losing a failed
+            # set would let its old timeouts expire under a falsely completed 24-hour cursor.
+            _prl_refresh(){
+                local _cg _rs _rsets _refresh_failed=0
+                [ -s "$PRERSLV_EEX" ] || return 0
+                _cg=""; { read -r _cg < "$GEOSET_GEN"; } 2>/dev/null
+                case "$_cg" in ''|*[!0-9A-Za-z.-]*) _cg=0 ;; esac
+                [ "$_cg" = "$_gen" ] || return 1
+                _rsets=$(awk 'NF == 2 { sets[$1] = 1 } END { for (s in sets) print s }' "$PRERSLV_EEX" 2>/dev/null) || return 1
+                [ -n "$_rsets" ] || return 1
+                for _rs in $_rsets; do
+                    _beat preresolve
+                    # Stage only the refresh commands, not the full set dump. The pipeline ends
+                    # at awk so a failed save cannot be masked by a successful empty restore.
+                    if ! { ipset save "$_rs" 2> "${_prl}.refresh.err" && echo "#SAVE-OK"; } | awk -v s="$_rs" '
+                        NR == FNR { if (NF == 2 && $1 == s) want[$2] = 1; next }
+                        $1 == "#SAVE-OK" { ok = 1; next }
+                        $1 == "create" && $2 == s { hdr = 1; next }
+                        $1 == "add" && $2 == s && ($3 in want) {
+                            if ($0 ~ / timeout 0( |$)/) perm[$3] = 1; else pres[$3] = 1
+                        }
+                        END {
+                            if (!ok || !hdr) exit 1
+                            for (k in pres) print "add " s " " k
+                            for (k in want) if (!(k in perm) && !(k in pres)) print "add " s " " k
+                            print "#REFRESH-OK"
+                        }
+                    ' "$PRERSLV_EEX" - 2>/dev/null > "${_prl}.refresh"; then
+                        _refresh_failed=1
+                        log_msg "Geo domain pre-resolve: could not read ipset $_rs for refresh: $(awk 'NR == 1 { print substr($0, 1, 400); exit }' "${_prl}.refresh.err" 2>/dev/null)"
+                        continue
+                    fi
+                    # Busybox awk may exit 0 after ENOSPC: require its final marker too.
+                    if ! grep -qxF '#REFRESH-OK' "${_prl}.refresh" 2>/dev/null \
+                       || ! ipset restore -! < "${_prl}.refresh" 2> "${_prl}.refresh.err"; then
+                        _refresh_failed=1
+                        log_msg "Geo domain pre-resolve: could not finish ipset $_rs refresh (scratch write / restore): $(awk 'NR == 1 { print substr($0, 1, 400); exit }' "${_prl}.refresh.err" 2>/dev/null)"
+                    fi
+                done
+                [ "$_refresh_failed" = 0 ] || return 1
+                rm -f "$PRERSLV_EEX"
+            }
+            # Pacing clock, fork-free: whole seconds + centiseconds of /proc/uptime, kept apart so
+            # nothing is multiplied up (32-bit ash arithmetic on Merlin) and the fraction loses a
+            # leading zero ("08" would be bad octal). Sub-second truth matters: comparing whole
+            # seconds let two batches start 0.1 s apart whenever one crossed a second boundary.
+            _dr_cs(){
+                _css=""; _csf=""; { read -r _css _uy < /proc/uptime; } 2>/dev/null
+                case "$_css" in *.*) _csf=${_css#*.}; _css=${_css%%.*} ;; *) _csf=0 ;; esac
+                _csf=${_csf%"${_csf#??}"}; _csf=${_csf#0}
+                case "$_css$_csf" in ''|*[!0-9]*) _css=0; _csf=0 ;; esac
+                _csf=${_csf:-0}
+            }
+            _prl_stamp(){ _dr_cs; _bss=$_css; _bsf=$_csf; }
+            # Pace: at least 1.01 s from the moment the previous batch was fully spawned (stamped
+            # just before its `wait`) to the next batch — the extra centisecond absorbs the
+            # truncation of /proc/uptime. The rest of the second is slept with busybox usleep
+            # (built on Merlin); `sleep 1` otherwise.
+            _prl_pace(){
+                [ "$_pace" = 1 ] || return 0
+                _dr_cs; _el=$(( (_css - _bss) * 100 + _csf - _bsf ))
+                [ "$_el" -lt 101 ] || return 0
+                if [ "$_usl" = 1 ] && [ "$_el" -ge 0 ]; then usleep $(( (101 - _el) * 10000 )); else sleep 1; fi
+            }
+            # Stop conditions shared by the main loop and the retry pass. The update window FIRST:
+            # yielding to a waiter there would hand the lock to a job that restarts dnsmasq in the
+            # middle of the update.
+            _prl_stops(){
+                if dnsreload_deferred; then
+                    if [ "$_lastflush" -lt "$_ln" ]; then _prl_flush; else _state "$_prodfrom"; fi
+                    log_msg "Geo domain pre-resolve: paused at $_ln/$_total for an addon update (resumes from $((_saved + 1)) after it)"
+                    touch "$DNSRELOAD_PENDING"
+                    exit 0
+                fi
+                if [ -f /tmp/.awg_dnsreload/preempt ]; then
+                    if [ "$_lastflush" -lt "$_ln" ]; then _prl_flush; else _state "$_prodfrom"; fi
+                    log_msg "Geo domain pre-resolve: yielding at $_ln/$_total to a newer dnsmasq reload (it resumes from $((_saved + 1)))"
+                    _dr_done
+                fi
+            }
+            # Between batches: beat, feed every 50 names (BEFORE pacing, so its time counts toward
+            # the interval), pace, and the stop conditions.
+            _prl_batch(){
+                _beat preresolve
+                [ $((_ln - _lastflush)) -ge 50 ] && _prl_flush
+                _prl_pace
+                # Two empty chunks in a row: either those ~100 names really have no IPv4, or the
+                # resolver died under us (WAN/upstream down) — then every further lookup would
+                # just burn its timeout. Pause, keeping the cursor at the last productive chunk.
+                if [ "$_dry" -ge 2 ]; then
+                    if ! dns_ok; then
+                        _state "$_prodfrom"
+                        log_msg "Geo domain pre-resolve: the router's resolver stopped answering at $_ln/$_total — paused; it resumes from $((_saved + 1)) at the next dnsmasq reload"
+                        _dr_done
+                    fi
+                    # The resolver is fine — those names just have no IPv4: they count as done.
+                    _dry=0; _prodfrom=$_ln; _state "$_ln"
+                fi
+                _prl_stops
+                if [ "$_ln" -ge "$_nextlog" ]; then
+                    log_msg "Geo domain pre-resolve: $_ln/$_total names done, $_fed new set entries so far"
+                    _nextlog=$((_nextlog + 5000))
+                fi
+            }
+            # One name: its "set ip" pairs go to .out; a lookup the resolver REFUSED or never
+            # answered (resolve_domain_v4 prints the "!R" marker — a dnsmasq restart blip, a
+            # dropped query) goes to $1 as "<domain> <sets>" for one retry when the run completes,
+            # instead of silently counting as "no IPv4" for a day.
+            _prl_one(){
+                _ips=$(resolve_domain_v4 "$domain" "$_nsq")
+                case "$_ips" in
+                    '') return 0 ;;
+                    '!R') echo "$domain $dsets" >> "$1"; return 0 ;;
+                esac
+                # Split the comma-set list without a fork per IP (the old $(echo | tr) did).
+                _oifs=$IFS; IFS=,; set -f; set -- $dsets; IFS=$_oifs
+                for _rip in $_ips; do
+                    for _rst in "$@"; do
+                        [ -n "$_rst" ] && echo "$_rst $_rip"
+                    done
+                done >> "${_prl}.out"
+            }
+            _bg=0; _bss=0; _bsf=0
+            while read -r domain dsets; do
+                _ln=$((_ln + 1))
+                [ -z "$domain" ] && continue
+                ( _prl_one "$PRERSLV_RETRY" ) &
+                _bg=$((_bg + 1))
+                [ "$_bg" -ge "$_jobs" ] || continue
+                _prl_stamp
+                wait; _bg=0
+                _prl_batch
+            done < "$_work"
+            [ "$_bg" -gt 0 ] && _prl_stamp
+            wait
+            _prl_flush
+            # One retry of the refused / unanswered lookups (kept in PRERSLV_RETRY across yields),
+            # same pacing and the same stop conditions — a queued reload or the updater's window is
+            # honoured here too. Names that fail again go to .retry2.
+            # A resumed job re-resolves its first chunk, so the same name can be queued twice: dedupe.
+            # _rgot counts pairs the retries produced — evidence that the upstream answers names
+            # that are NOT in any cache (see the counted-as-done rule below).
+            _rgot=0; _rn=0
+            if [ -s "$PRERSLV_RETRY" ]; then
+                # Never truncate the list in place: a failed write (full /tmp) would empty it.
+                sort -u "$PRERSLV_RETRY" > "${_prl}.rs" 2>/dev/null && [ -s "${_prl}.rs" ] \
+                    && mv -f "${_prl}.rs" "$PRERSLV_RETRY" 2>/dev/null
+                _rn=$(wc -l < "$PRERSLV_RETRY" 2>/dev/null); _rn=$(( ${_rn:-0} + 0 ))
+                rm -f "${_prl}.retry2"
+                _prl_pace
+                _bg=0; _rdry=0
+                while read -r domain dsets; do
+                    [ -n "$domain" ] || continue
+                    ( _prl_one "${_prl}.retry2" ) &
+                    _bg=$((_bg + 1))
+                    [ "$_bg" -ge "$_jobs" ] || continue
+                    _prl_stamp
+                    wait; _bg=0
+                    _beat preresolve
+                    _prl_feed
+                    _rgot=$((_rgot + _np))
+                    # The resolver can die during the retries too: after ~100 names without a
+                    # single answer, ask dns_ok instead of burning every remaining timeout.
+                    if [ "$_np" -gt 0 ]; then _rdry=0; else _rdry=$((_rdry + _jobs)); fi
+                    if [ "$_rdry" -ge 100 ]; then
+                        if ! dns_ok; then
+                            _state "$_prodfrom"
+                            log_msg "Geo domain pre-resolve: the router's resolver stopped answering during the retries — paused; it resumes from $((_saved + 1)) at the next dnsmasq reload"
+                            _dr_done
+                        fi
+                        _rdry=0
+                    fi
+                    _prl_pace
+                    _prl_stops
+                done < "$PRERSLV_RETRY"
+                wait
+                _prl_feed
+                _rgot=$((_rgot + _np))
+            fi
+            # The resolver can also die in the last chunk(s), after the in-loop check ran for the
+            # last time — then the run must pause like mid-list instead of recording the whole
+            # list as fed (it would be skipped for a day). The saved cursor already lags at the
+            # last productive chunk; confirm the resolver once and only then mark the list
+            # complete.
+            if [ "$_tried" -gt 0 ] || [ -s "$PRERSLV_RETRY" ]; then
+                if ! dns_ok; then
+                    _state "$_prodfrom"
+                    log_msg "Geo domain pre-resolve: the router's resolver stopped answering near the end ($_ln/$_total) — paused; it resumes from $((_saved + 1)) at the next dnsmasq reload"
+                    _dr_done
+                fi
+            fi
+            # Names that got no answer twice: usually names without a working answer (a dead
+            # authoritative server, an upstream slower than nslookup's timeout) — counted as done,
+            # or every later reload would re-resolve the tail forever. But dns_ok's names are the
+            # ones the LAN keeps hot in the caches: during an UPSTREAM outage they still answer
+            # while every uncached name times out. So count them as done only with evidence that
+            # uncached names do resolve (some retry answered), or on the second completion in a
+            # row that ends the same way; otherwise pause once and try again at the next reload.
+            if [ -s "$PRERSLV_RETRY" ]; then
+                _rk=$(wc -l < "${_prl}.retry2" 2>/dev/null); _rk=$(( ${_rk:-0} + 0 ))
+                if [ "$_rk" -gt 0 ] && [ "$_rgot" -eq 0 ] && [ ! -f "$PRERSLV_RETRY.strike" ]; then
+                    true 2>/dev/null > "$PRERSLV_RETRY.strike"
+                    mv -f "${_prl}.retry2" "$PRERSLV_RETRY" 2>/dev/null
+                    _state "$_prodfrom"
+                    log_msg "Geo domain pre-resolve: $_rk name(s) got no answer twice and no retried name answered (an upstream outage?) — paused; they are retried at the next dnsmasq reload"
+                    # What this run DID get must not wait for that reload: re-arm its EEXIST
+                    # entries now (the resumed chunk builds a fresh list).
+                    _prl_refresh
+                    _dr_done
+                fi
+                if [ "$_rk" -gt 0 ]; then
+                    log_msg "Geo domain pre-resolve: $_rk of $_rn name(s) got no answer twice (e.g. $(awk 'NR <= 3 { printf "%s%s", (NR > 1 ? " " : ""), $1 }' "${_prl}.retry2" 2>/dev/null)) — counted as done; they fill when clients resolve them"
+                fi
+                rm -f "$PRERSLV_RETRY" "$PRERSLV_RETRY.strike"
+            fi
+            if ! _prl_refresh; then
+                _state "$_prodfrom"
+                log_msg "Geo domain pre-resolve: ipset refresh failed — paused; pending entries are kept for the next dnsmasq reload"
+                _dr_done
+            fi
+            _post_ips=$(geo_ipset_total)
+            _dr_up; _dur=$((_ux - _t0))
+            if [ "$_tried" -gt 0 ]; then
+                _state "$_total" complete
+                # _fed = entries the add actually created; the rest of _tried already existed
+                # (EEXIST — now refreshed) — e.g. a second run right after a successful one
+                # legitimately logs "0 new of N". Live count ("Firewall configured: N IPs" is a
+                # build-time tally, not proof of population — THIS line is the proof).
+                log_msg "Geo domain pre-resolve: self-fed $_fed new of $_tried resolved set entries for $((_total - _from + 1)) name(s)$([ "$_rn" -gt 0 ] && echo " + $_rn retried") in ${_dur}s (ipset ${_pre_ips} -> ${_post_ips}) — cache-proof, domain routing active without a dnsmasq restart"
+            elif dns_ok; then
+                _state "$_total" complete
+                if [ "$_from" -gt 1 ]; then
+                    log_msg "Geo domain pre-resolve: completed — the re-resolved rest of the list ($((_total - _from + 1)) name(s)) had no usable IPv4"
+                else
+                    log_msg "Geo domain pre-resolve: resolver answers real names but returned no usable IPv4 for any geo domain (upstream blocking/empty answers?) — domains will fill on later client queries"
+                fi
+            else
+                _state "$_prodfrom"
                 log_msg "Geo domain pre-resolve: router DNS not resolving real names yet (WAN/upstream/DoT not ready); domains will fill on later client queries"
             fi
         fi
+        _dr_done
     ) </dev/null >/dev/null 2>&1 &
 }
 
@@ -2915,6 +4522,7 @@ cleanup_xray_priority(){
 }
 
 setup_firewall(){
+    b64d_init   # once here, so every $(geo_union_urls)/$(policy_url_keys) below inherits the probe
     # HOT-APPLY (1.4.5): no cleanup_firewall here anymore. The old teardown-then-rebuild left
     # the LAN unmarked + the sets empty for the whole rebuild (~17-21 s on a loaded armv7 —
     # every Apply looked like a VPN reconnect AND leaked geo devices to the WAN past the
@@ -2973,7 +4581,14 @@ setup_firewall(){
     # routing survives the rebuild with no gap at all. Shared-base semantics preserved: a
     # pre-existing set we don't own is loaded IN PLACE for id 1 (documented shared behavior —
     # we must never destroy/swap another tool's set) and skipped for id>=2 (foreign collision).
-    local gid gset tset _ldt _staged _desired_sets=""
+    local gid gset tset _ldt _staged _desired_sets="" _prs_before _ssig
+    # The staged swap below keeps what an earlier pre-resolve fed (replay), so it keeps
+    # GEOSET_GEN and the pre-resolve cursor stays valid — but only for feeds that happened
+    # BEFORE the replay snapshot. Let a running pre-resolve reach its batch boundary and yield
+    # first, remember the cursor, and let geo_swap_window_close judge the window afterwards.
+    geo_preresolve_quiesce
+    _prs_before="$(cat "$GEOSET_GEN" 2>/dev/null)|$(cat "$PRERSLV_STATE" 2>/dev/null)"
+    _ssig=$(geo_static_sig)
     for gid in $(geo_ids); do
         gset=$(geo_ipset "$gid")
         local _cerr _crc
@@ -3021,8 +4636,7 @@ setup_firewall(){
         done
         # Custom IPs (field) -> permanent entries, batched through ONE `ipset restore` (the old
         # per-IP `ipset add` loop forked a process per entry — 100+ execs on big fields).
-        get_setting "$(geo_key "$gid" custom_ips)" | tr ',' '\n' | awk -v s="$_ldt" '
-            { gsub(/[ \r]/, ""); if ($0 != "") print "add " s " " $0 " timeout 0" }' \
+        get_setting "$(geo_key "$gid" custom_ips)" | tr ',' '\n' | ipv4_restore_lines "$_ldt" \
             | ipset restore -! 2>/dev/null
         # GeoCustom pasted files (per-policy content): regenerate, then load this policy's CIDRs.
         apply_custom_geo "$gid"
@@ -3066,8 +4680,7 @@ setup_firewall(){
                 fi
             fi
             if [ -n "$_exldt" ]; then
-                get_setting "$(geo_key "$gid" exc_ips)" | tr ',' '\n' | awk -v s="$_exldt" '
-                    { gsub(/[ \r]/, ""); if ($0 != "") print "add " s " " $0 " timeout 0" }' \
+                get_setting "$(geo_key "$gid" exc_ips)" | tr ',' '\n' | ipv4_restore_lines "$_exldt" \
                     | ipset restore -! 2>/dev/null
                 for _f in "$GEO_DIR"/geoip/excustom_p${gid}_*.cidr; do
                     [ -f "$_f" ] && ipset_load_file "$_f" "$_exldt"
@@ -3092,6 +4705,7 @@ setup_firewall(){
         [ -n "$_ent" ] && [ "$_ent" -ge "$maxelem" ] 2>/dev/null && \
             log_msg "WARNING: ipset $gset full ($_ent/$maxelem) for geo policy $gid — raise RAM or trim its lists"
     done
+    geo_swap_window_close "$_prs_before" "$_ssig"
 
     # --- Build dnsmasq config for domain-based routing ---
     local domain_count=0
@@ -3121,13 +4735,13 @@ setup_firewall(){
     # as `ipset=/dom/setA,setB,...` — a comma-set line fans the resolved IP to EVERY listed set.
     local dgid dgset f _cat _uk _dfiles _efiles _chan _cset _cfiles
     local _ds_tmp="$GEO_DIR/.dnsmasq_ds.$$"
-    : > "$_ds_tmp"
+    true 2>/dev/null > "$_ds_tmp"   # not `:` — a failed redirect on that special builtin exits the shell
     for dgid in $(geo_ids); do
         dgset=$(geo_ipset "$dgid")
         # INC domain files for this policy (route via its main set).
         _dfiles=""
         for _cat in $(get_setting "$(geo_key "$dgid" v2fly)" | tr ',' ' '); do
-            _cat=$(echo "$_cat" | sed 's/[^A-Za-z0-9_.-]//g'); [ -z "$_cat" ] && continue
+            _cat=$(echo "$_cat" | sed 's/[^A-Za-z0-9_.!-]//g'); [ -z "$_cat" ] && continue   # same charset as geo_union_geosite
             _dfiles="$_dfiles $GEO_DIR/domains/v2fly_${_cat}.txt"
         done
         _dfiles="$_dfiles $GEO_DIR/domains/custom_p${dgid}.txt"
@@ -3651,6 +5265,7 @@ geo_in_use(){
 # Runs in the background so Apply/Force Apply/update return promptly; the log shows
 # progress and setup_firewall is re-applied afterwards.
 ensure_geo(){
+    b64d_init   # inherited by the $( ) subshells and the background download below
     # Sync the shared pool to the UNION of all policies' selections (drop de-selected files),
     # and GC sets/files of deleted policies.
     prune_geoip
@@ -3658,6 +5273,7 @@ ensure_geo(){
     prune_custom_urls
     prune_orphan_policies
     geo_in_use || return 0
+    log_url_backoff
     # Collect ONLY what's missing across the union — adding one GeoIP service to one tab
     # shouldn't re-fetch the others or the big shared v2fly DB.
     local need=0 need_yml=0
@@ -3984,10 +5600,14 @@ generate_config(){
 
     # The ACTIVE config profile — resolved ONCE here; every field below reads this slot.
     # Slot 1 maps to the legacy unsuffixed keys (see pf_key), so pre-profile installs
-    # materialize exactly what they always did.
+    # materialize exactly what they always did. AWG_CFG_SLOT / AWG_CFG_FP (plain globals, set
+    # only on success) tell do_start WHICH profile this conf really is — the running-profile
+    # record (RUNNING_PF) and the health check's failover circle key off it, never off a
+    # re-resolution that a switch/override change in between could move.
     local pf
+    AWG_CFG_SLOT=""; AWG_CFG_FP=""
     pf=$(profile_effective)
-    log_msg "Config profile: $pf ($(profile_name "$pf"))"
+    log_msg "Config profile: $(profile_desc "$pf")"
 
     # Neutral field names (see migrate_field_names): iface_p1 = interface private key,
     # peer_p1 = peer public key, peer_p2 = peer preshared key.
@@ -4019,7 +5639,10 @@ generate_config(){
     done
     if [ -n "$initdata" ]; then
         local decoded
-        decoded=$(echo "$initdata" | base64 -d 2>/dev/null)
+        # b64d, not a bare `base64 -d`: stock Merlin has no base64 applet, and there the I-params
+        # silently never reached awg0.conf at all (tunnel up, DPI camouflage absent).
+        b64d_init
+        decoded=$(echo "$initdata" | b64d)
         i1=$(echo "$decoded" | awk '/^I1 /{sub(/^[^=]+=[ ]?/,"");print;exit}')
         i2=$(echo "$decoded" | awk '/^I2 /{sub(/^[^=]+=[ ]?/,"");print;exit}')
         i3=$(echo "$decoded" | awk '/^I3 /{sub(/^[^=]+=[ ]?/,"");print;exit}')
@@ -4192,6 +5815,8 @@ generate_config(){
     local dns=$(pf_slot_get "$pf" dns)
     if [ -n "$dns" ]; then echo "$dns" > "$AWG_DIR/awg0.dns"; else rm -f "$AWG_DIR/awg0.dns"; fi
 
+    AWG_CFG_SLOT=$pf
+    AWG_CFG_FP=$(pf_fp_of "$iface_p1" "$peer_p1")
     log_msg "Config saved"
     return 0
 }
@@ -4286,9 +5911,11 @@ do_diag(){
     echo "entware coreutils    : $([ "$AWG_PATH_SANE" = 0 ] && echo 'firmware busybox in use — /opt grep/sed/awk failed the addon self-test. The addon works FULLY this way; often just a lib-path/env quirk in the addon minimal env, NOT necessarily a bad USB. If /opt/bin/grep --version works over SSH, ignore it; suspect the Entware install/USB only if it also crashes in SSH. See the /opt/bin/grep probe below.' || echo 'OK')"
     echo "inherited LD_LIBRARY_PATH (httpd) : ${AWG_ORIG_LD_LIBRARY_PATH:-(empty — good)}"
     echo "PATH                 : $PATH"
-    for _t in grep sed awk sort md5sum curl; do
+    for _t in grep sed awk sort md5sum sha256sum base64 openssl curl; do
         echo "  which $_t : $(which "$_t" 2>/dev/null || echo '(not found)')"
     done
+    b64d_init
+    echo "  base64 decoder  : $AWG_B64D   (base64 applet absent on stock Merlin -> openssl/awk fallback; GeoCustom URLs/files + I1-I5 depend on it)"
     echo "  grep functional : $([ "$(echo probe 2>/dev/null | grep -c probe 2>/dev/null)" = "1" ] && echo yes || echo 'NO (segfault/broken!)')"
     echo "  sed functional  : $([ "$(echo probe 2>/dev/null | sed -n 's/probe/ok/p' 2>/dev/null)" = "ok" ] && echo yes || echo 'NO (broken!)')"
     echo "  awk functional  : $([ "$(echo probe 2>/dev/null | awk '{print "ok"}' 2>/dev/null)" = "ok" ] && echo yes || echo 'NO (broken!)')"
@@ -4311,10 +5938,38 @@ do_diag(){
     [ -f $DAEMON_LOG ] && sed 's/^/  /' $DAEMON_LOG || echo "  (none)"
     echo "  last daemon exit (this launch): $(cat $DAEMON_RC 2>/dev/null || echo '(none — daemon still running or never exited)')"
     echo "  Go runtime tune (computed now): $(go_tune_desc)"
-    grep -qiF 'out of memory' $DAEMON_LOG 2>/dev/null && \
+    is_running && [ -r "$DAEMON_TUNE" ] && \
+        echo "  Go runtime tune (applied at launch, GOMEMLIMIT|pool cap): $(cat "$DAEMON_TUNE" 2>/dev/null)"
+    if grep -qiE 'out of memory|^fatal error: .*memory' $DAEMON_LOG 2>/dev/null; then
         echo "  >>> last daemon exit was a Go runtime OUT-OF-MEMORY: heap hit the ceiling under load (box low on RAM for this throughput) <<<"
+    elif grep -qE '^(panic: |fatal error: |unexpected fault address)' $DAEMON_LOG 2>/dev/null; then
+        echo "  >>> last daemon exit was a Go CRASH (panic / fault), NOT an OOM: a daemon or runtime bug, or bad RAM / USB I/O errors — please report it with this diag <<<"
+    fi
+    if [ -s "$DAEMON_CRASH" ]; then
+        echo "--- last daemon CRASH trace ($DAEMON_CRASH — survives relaunches, not a reboot) ---"
+        head -n 40 "$DAEMON_CRASH" 2>/dev/null | sed 's/^/  /'
+    fi
     echo "--- runtime / network / TUN ---"
     echo "memory (free):"; free 2>/dev/null | sed 's/^/  /'
+    # Free RAM is the WRONG lens under vm.overcommit_memory=2 — the budget that decides
+    # whether the Go runtime can grow its heap is CommitLimit - Committed_AS. Print both,
+    # plus swap (the user-side lever that raises CommitLimit), so a squeezed box is
+    # diagnosable from the diag alone instead of needing an SSH session.
+    _oc=$(awk '{print $1; exit}' /proc/sys/vm/overcommit_memory 2>/dev/null)
+    _cl=$(awk '/^CommitLimit:/{printf "%d", $2/1024; exit}' /proc/meminfo 2>/dev/null)
+    _ca=$(awk '/^Committed_AS:/{printf "%d", $2/1024; exit}' /proc/meminfo 2>/dev/null)
+    echo "vm.overcommit_memory : ${_oc:-?}$([ "${_oc:-}" = 2 ] && echo ' (STRICT accounting: the heap budget is CommitLimit - Committed_AS, NOT free RAM)')"
+    echo "commit budget        : CommitLimit=${_cl:-?}MiB Committed_AS=${_ca:-?}MiB swap=$(swap_total_mib)MiB"
+    # Top memory users, eight lines, so a field diag answers "what is eating it" without a
+    # second round-trip. The full breakdown (modules, Trend Micro switches) is `mem`.
+    # Fed through `cat`, NOT as awk file operands: awk (busybox and gawk alike) aborts on the
+    # first operand it cannot open, and a process exiting between the glob and the read
+    # would silently truncate the list; cat skips the vanished file and goes on.
+    echo "top memory users by RSS (RSS KB / VmData KB — on pre-4.5 kernels VmData also counts reserved Go heap address space; Committed_AS above is the commit authority):"
+    cat /proc/[0-9]*/status 2>/dev/null \
+        | awk '/^Name:/{n=$2; r=0} /^VmRSS:/{r=$2} /^VmData:/{printf "  %8d %8d  %s\n", r, $2, n}' | sort -rn | head -8
+    _msq=$(mem_squeeze_state)
+    [ -n "$_msq" ] && echo "  >>> MEMORY ENVELOPE AT ITS FLOOR ($_msq = state|GOMEMLIMIT MiB|pool cap|swap MiB) — strict overcommit leaves so little commit headroom that the daemon runs (or would start) with GOMEMLIMIT at the ${AWG_GOMEMLIMIT_COMMIT_FLOOR}MiB floor and the pool at its 512-buffer liveness floor; sustained load can OOM-abort it and the watchdog restarts it (reads as 'the VPN drops now and then'). Box-side levers: a swap file (raises CommitLimit 1:1) and/or fewer user-space memory consumers <<<"
     echo "amneziawg-go running : $(pidof amneziawg-go 2>/dev/null || echo no)"
     echo "dnsmasq running      : $(pidof dnsmasq 2>/dev/null || echo no)"
     echo "--- persistent incident log (survives reboot; last LAN-critical events) ---"
@@ -4322,14 +5977,34 @@ do_diag(){
     echo "--- connection history (last 5: start_epoch|end_epoch|dur_s|reason) ---"
     if [ -s "$CONN_HISTORY" ]; then sed 's/^/  /' "$CONN_HISTORY"; else echo "  (none recorded yet)"; fi
     [ -f "$CONN_CURRENT" ] && echo "  open session (start_epoch start_uptime_s): $(cat "$CONN_CURRENT" 2>/dev/null)"
-    echo "--- config profiles (endpoint shown, keys never) ---"
-    profile_cli_list 2>/dev/null | sed 's/^/  /'
-    [ -f "$PF_OVERRIDE" ] && echo "  failover override    : slot $(cat "$PF_OVERRIDE" 2>/dev/null) ($PF_OVERRIDE)"
+    echo "--- config profiles (endpoint shown, keys never; slot = stable storage number, #k = the number the page shows) ---"
+    profile_cli_list diag 2>/dev/null | sed 's/^/  /'
+    # Every input of the slot resolution, raw, next to what it resolved to — a "wrong profile
+    # came up" report is answerable from these lines alone. fp = <md5(privkey) prefix>@<peer
+    # pubkey> (profile_resolve): not secret-bearing.
+    _dpu=$(get_setting awg_profile_active)
+    _dus=$(profile_user)
+    profile_resolve; _deff=$AWG_PF_EFF
+    echo "  user's choice        : awg_profile_active=${_dpu:-(unset)} -> slot $_dus = $(profile_desc "$_dus")"
+    echo "  failover override    : $([ -f "$PF_OVERRIDE" ] && echo "\"$(cat "$PF_OVERRIDE" 2>/dev/null)\" ($PF_OVERRIDE)" || echo none)"
+    echo "  effective profile    : slot $_deff = $(profile_desc "$_deff")$([ "$_deff" != "$_dus" ] && echo ' — failover override in effect')"
+    echo "  effective fp         : $(pf_fp "$_deff")"
+    echo "  running profile      : $([ -f "$RUNNING_PF" ] && echo "slot+fp = $(cat "$RUNNING_PF" 2>/dev/null)" || echo '(no record — tunnel stopped, or started by a pre-1.5.26 version)')"
     [ -f "$FAILOVER_STATE" ] && echo "  failover circle      : start+hops = $(tr '\n' ' ' < "$FAILOVER_STATE" 2>/dev/null)(incident in progress)"
+    # Start/stop generation (a stale health check compares its own against this before acting),
+    # the STARTING_FLAG owner and an in-flight switch request.
+    echo "  start/stop gen       : $(cat "/tmp/.${IFACE}_gen" 2>/dev/null || echo none)"
+    echo "  starting flag        : $([ -f "$STARTING_FLAG" ] && echo "set, owner $(cat "$STARTING_FLAG" 2>/dev/null)" || echo clear)"
+    echo "  switch request       : $([ -f "$SWITCH_REQ" ] && echo "slot+epoch = $(cat "$SWITCH_REQ" 2>/dev/null)" || echo none)"
+    # The pages' save token (the LAST key of every settings POST since 1.5.26): absent after a
+    # page save = the firmware wrote the store only partially (full JFFS) or discarded it.
+    _dtok=$(get_setting awg_save_tok)
+    echo "  awg_save_tok         : $([ -n "$_dtok" ] && echo "present ($_dtok)" || echo absent)"
     echo "--- self-heal / background state ---"
     echo "awg crons (cru l):"
     _crons=$(awg_cru l 2>/dev/null)
-    if [ $? -eq 124 ]; then echo "  (cru l timed out — cron table unreadable, not necessarily empty)"
+    if [ $? -eq 124 ]; then
+        echo "  (cru l timed out — cron table unreadable, not necessarily empty)"
     else
         _crons=$(echo "$_crons" | grep -i awg)
         if [ -n "$_crons" ]; then echo "$_crons" | sed 's/^/  /'; else echo "  (NONE — watchdog/status cron not scheduled!)"; fi
@@ -4346,9 +6021,9 @@ do_diag(){
         echo "stale status runs    : none"
     fi
     if which flock >/dev/null 2>&1; then
-        echo "lock forced reclaim : available for owners with a verified start-time record"
+        echo "lock forced reclaim  : available for owners with a verified start-time record"
     else
-        echo "lock forced reclaim : disabled (flock unavailable; live holders are preserved)"
+        echo "lock forced reclaim  : disabled (flock unavailable; live holders are preserved)"
     fi
     echo "locks (a DEAD holder = operation crashed mid-flight):"
     for _L in "$LOCKDIR" "$GEOLOCK" /tmp/.awg_dnsreload; do
@@ -4358,30 +6033,65 @@ do_diag(){
                 # Holder age makes a wedged job visible at a glance (the 2026-08-24 field diag
                 # showed only "alive" — the 6-minute hang had to be inferred from timestamps).
                 _la2=$(proc_age_s "$_lp2")
-                _wd2=""
-                case "$_L" in
-                    "$LOCKDIR")
-                        _la2=$(lock_age_s "$_lp2")
-                        _th2=""
-                        if [ -n "$_la2" ] && which flock >/dev/null 2>&1; then
-                            _th2="$LOCK_STALE_S"; _by2="the next watchdog tick / acquire_lock"
-                        fi ;;
-                    /tmp/.awg_dnsreload) _th2="$DNSRELOAD_STALE_S"; _by2="the next watchdog tick" ;;
-                    *)                   _th2="" ;;   # GEOLOCK has no reaper
-                esac
-                [ -n "$_th2" ] && [ -n "$_la2" ] && [ "$_la2" -gt "$_th2" ] && _wd2=" — WEDGED (>${_th2}s; reclaimed by $_by2)"
-                echo "  $_L : held by pid $_lp2 (alive${_la2:+, ${_la2}s old})$_wd2"
+                # The reload job's progress beat (1.5.27): phase + how long since it last moved.
+                # A long-running job in "preresolve" that keeps moving is healthy; one that has
+                # not moved for DNSRELOAD_STALL_S is what the watchdog reaps.
+                _lb2=""
+                if [ "$_L" = "$LOCKDIR" ]; then
+                    _lh2=$(lock_age_s "$_lp2")
+                    if [ -n "$_lh2" ]; then
+                        _lb2=", lock held ${_lh2}s"
+                        [ "$_lh2" -gt "$LOCK_STALE_S" ] && which flock >/dev/null 2>&1 &&
+                            _lb2="$_lb2 — WEDGED (>${LOCK_STALE_S}s; reclaimed by the next watchdog tick / acquire_lock)"
+                    fi
+                fi
+                if [ "$_L" = /tmp/.awg_dnsreload ]; then
+                    _bph=""; _bts=""; { read -r _bph _bts < "$_L/beat"; } 2>/dev/null
+                    case "$_bph" in *[!a-z]*) _bph="?" ;; esac
+                    case "$_bts" in ''|*[!0-9]*) ;; *)
+                        _lb2=", phase $_bph, last progress $(( $(cut -d. -f1 /proc/uptime) - _bts ))s ago" ;;
+                    esac
+                    [ -f "$_L/preempt" ] && _lb2="$_lb2, a newer reload is waiting"
+                    [ -f "$_L/owed" ] && _lb2="$_lb2, OWES a reload"
+                    [ -f "$_L/unloaded" ] && _lb2="$_lb2, its restart never took"
+                fi
+                echo "  $_L : held by pid $_lp2 (alive${_la2:+, ${_la2}s old}$_lb2)"
             elif [ -n "$_lp2" ]; then echo "  $_L : held by pid $_lp2 (DEAD — stale lock!)"
             else echo "  $_L : held (no pid recorded)"; fi
         else
             echo "  $_L : free"
         fi
     done
+    # Geo pre-resolve cursor (1.5.27): how much of the domain list has been fed into the sets
+    # under the CURRENT set generation. A stale generation means the sets were rebuilt since
+    # and the next reload feeds from line 1; done < total means the next reload resumes.
+    if [ -f "$PRERSLV_STATE" ]; then
+        _psg=""; _psm=""; _psd=""; _pst=""; _pss=""
+        { read -r _psg _psm _psd _pst _pss _psrest < "$PRERSLV_STATE"; } 2>/dev/null
+        _pgen=""; { read -r _pgen < "$GEOSET_GEN"; } 2>/dev/null
+        case "$_pss" in ''|*[!0-9]*) _pss="" ;; esac
+        case "$_psd" in ''|*[!0-9]*) _psd="?" ;; esac
+        case "$_pst" in ''|*[!0-9]*) _pst="?" ;; esac
+        echo "geo pre-resolve state: ${_psd:-?}/${_pst:-?} names fed$([ -n "$_pss" ] && echo ", run started $(( ($(cut -d. -f1 /proc/uptime) - _pss) / 60 )) min ago"), set generation $([ "$_psg" = "${_pgen:-0}" ] && echo current || echo 'STALE (sets rebuilt since — next reload feeds from line 1)')"
+    else
+        _bph=""; { read -r _bph _bts < /tmp/.awg_dnsreload/beat; } 2>/dev/null
+        if [ "$_bph" = preresolve ]; then
+            echo "geo pre-resolve state: none yet (a run is in progress — the cursor is first saved after 50 names)"
+        else
+            echo "geo pre-resolve state: none (no feed recorded since the sets were last built)"
+        fi
+    fi
+    # Pending work carried across jobs: names to retry (strike = the last completion found no
+    # retried name answering and paused once), and EEXIST entries to re-arm at completion.
+    _prn=$(wc -l < "$PRERSLV_RETRY" 2>/dev/null); _pen=$(wc -l < "$PRERSLV_EEX" 2>/dev/null)
+    [ -n "$_prn$_pen" ] && echo "geo pre-resolve pending: retry list $(( ${_prn:-0} + 0 )) name(s)$([ -f "$PRERSLV_RETRY.strike" ] && echo ' (strike: paused once already — the next completion counts them as done)'), refresh list $(( ${_pen:-0} + 0 )) entr(y/ies)"
+    _pleg=$(ls /tmp/.awg_prerslv.* 2>/dev/null | wc -l)
+    [ "$_pleg" -gt 0 ] 2>/dev/null && echo "legacy pre-resolve scratch: $_pleg file(s) in /tmp/.awg_prerslv.* (leaked by a pre-1.5.27 job; swept by the next reload)"
+    [ -f "${LOCKDIR}.stopped" ] && echo "deliberate Stop      : watchdog recovery disabled until Start/reboot"
     # Updater flags: a FRESH one during an update is normal; one older than ~15 min means the
     # updater died mid-flight (both self-reclaim on TTL, but show them so the window is visible).
-    [ -f "${LOCKDIR}.stopped" ] && echo "deliberate Stop      : watchdog recovery disabled until Start/reboot"
     for _F in /tmp/.awg_no_autostart "$DNSRELOAD_DEFER" "$DNSRELOAD_PENDING"; do
-        [ -f "$_F" ] && echo "updater flag: $_F ($([ -n "$(find "$_F" -mmin +15 2>/dev/null)" ] && echo 'STALE >15min — updater died?' || echo 'fresh'))"
+        [ -f "$_F" ] && echo "updater flag: $_F ($(file_older_than "$_F" 900 && echo 'STALE >15min — updater died?' || echo 'fresh'))"
     done
     # Boot/Entware-init forensics (1.5.8, field: RT-BE92U @ 3006.102.8): when the firmware's
     # native Entware starter and the amtm/post-mount hook collide, NEITHER runs the
@@ -4466,7 +6176,26 @@ do_diag(){
         # matches none of the generic /priv/ /psk/ /preshar/ /secret/ globs — note /psk/ does NOT
         # match "hpk". Neutral field names come from migrate_field_names: iface_p1 = interface
         # private key, peer_p2 = peer preshared key.
-        grep '^awg_' "$SETTINGS" 2>/dev/null | awk '{k=$1; if(k ~ /^awg_(pf[0-9]+_)?iface_p1/||k ~ /^awg_(pf[0-9]+_)?peer_p2/||k ~ /^awg_(pf[0-9]+_)?hpk/||k ~ /priv/||k ~ /psk/||k ~ /preshar/||k ~ /secret/){print k" <redacted>"}else{print}}' | head -120 | sed 's/^/  /'
+        # Records are split exactly like get_setting (the firmware glues the NEXT key onto an
+        # over-long line — a glued private key used to print in clear under the previous key's
+        # name), and long blobs (file/initdata base64) are shortened to their length: noise in a
+        # pasted diag.
+        LC_ALL=C awk '
+            function emit(r,   k, v) {
+                k = r; sub(/ .*/, "", k)
+                if (k !~ /^awg_/) return
+                if (++shown > 120) { more++; return }   # capped HERE, so the glued note below always prints
+                if (k ~ /^awg_(pf[0-9]+_)?iface_p1/ || k ~ /^awg_(pf[0-9]+_)?peer_p2/ || k ~ /^awg_(pf[0-9]+_)?hpk/ || k ~ /priv/ || k ~ /psk/ || k ~ /preshar/ || k ~ /secret/) { print k " <redacted>"; return }
+                v = (index(r, " ") ? substr(r, index(r, " ") + 1) : "")
+                if (length(v) > 160) v = substr(v, 1, 48) "...(" length(v) " chars)"
+                print k " " v
+            }
+            { r = $0
+              if (length(r) > 3039) glued = glued " " NR
+              while (length(r) > 3039) { emit(substr(r, 1, 3039)); r = substr(r, 3040) }
+              emit(r) }
+            END { if (more) print "... (" more " more awg_ keys not shown)"
+                  if (glued != "") print "!! custom_settings line(s)" glued ": a record overflowed the firmware 3039-byte cap and the next key got glued onto it" }' "$SETTINGS" 2>/dev/null | sed 's/^/  /'
     else echo "  (no $SETTINGS)"; fi
     echo "--- awg show (live UAPI state, secrets redacted) ---"
     # Through redact_secrets: an AmneziaWG 3.0 daemon makes `awg show` print the header protection
@@ -4560,6 +6289,106 @@ arm_lan_deadman(){
     ) </dev/null >/dev/null 2>&1 &
 }
 
+# `mem` — who is eating what, split by the TWO budgets that actually decide whether the
+# daemon survives (1.5.23). They are NOT the same budget, and conflating them sends people
+# after the wrong knob — which is the whole reason this subcommand exists:
+#
+#   * PHYSICAL RAM (MemFree/MemAvailable, RSS, slab, kernel modules). This is what makes the
+#     box feel full and what makes small helpers die oddly (a field diag showed busybox grep
+#     taking SIGSEGV mid-apply, which silently zeroed that run's domain list).
+#   * COMMIT BUDGET (CommitLimit - Committed_AS). Under vm.overcommit_memory=2 this — not
+#     free RAM — is what compute_go_memlimit clamps GOMEMLIMIT against, so it is what pins a
+#     box to the 64MiB floor. CommitLimit = overcommit_ratio% x MemTotal + SwapTotal, so
+#     SWAP raises it 1:1, while freeing memory helps only as far as it lowers Committed_AS.
+#     Kernel-module memory (the tdts/IDPfw Trend Micro engine behind AiProtection, Traffic
+#     Analyzer and Adaptive QoS) costs physical RAM but is NOT charged to Committed_AS —
+#     the features' USER-SPACE services are. So unloading the engine alone frees RAM
+#     without lifting the ceiling; stopping the services behind it does lift it.
+#
+# Per-process numbers come from one awk pass over /proc/<pid>/status (VmData appears AFTER
+# VmRSS there, so a single forward scan has both by the time it prints), fed through `cat`
+# so a process that exits mid-scan can't abort awk. There is no per-process Committed_AS in
+# /proc, and VmData is not one: on pre-4.5 kernels (BCM675x 4.1) it also counts reserved
+# PROT_NONE address space — the Go daemon's heap reservation, hundreds of MB — so the report
+# reconciles the two totals out loud rather than implying they should match. Kernel threads
+# have neither line and drop out on their own. This is a MANUAL command, so the fork
+# discipline that governs the every-minute paths (see reap_stale_status) does not apply here.
+do_mem_report(){
+    local _oc _ratio _cl _ca _hr _msq _need
+    echo "================= AmneziaWG memory report ================="
+    echo "addon version    : $AWG_VERSION"
+    echo "date             : $(date)"
+    echo "model / firmware : $(nv get productid 2>/dev/null) / $(nv get buildno 2>/dev/null).$(nv get extendno 2>/dev/null)"
+    echo "--- budgets ---"
+    awk '/^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SwapTotal|SwapFree|Slab|SReclaimable|SUnreclaim|CommitLimit|Committed_AS):/{printf "  %-16s %8.1f MB\n",$1,$2/1024}' /proc/meminfo 2>/dev/null
+    _oc=$(awk '{print $1; exit}' /proc/sys/vm/overcommit_memory 2>/dev/null)
+    _ratio=$(awk '{print $1; exit}' /proc/sys/vm/overcommit_ratio 2>/dev/null)
+    echo "  overcommit_memory ${_oc:-?} (ratio ${_ratio:-?})$([ "${_oc:-}" = 2 ] && echo ' — STRICT: the daemon ceiling follows CommitLimit - Committed_AS, NOT free RAM')"
+    _cl=$(awk '/^CommitLimit:/{printf "%d", $2/1024; exit}' /proc/meminfo 2>/dev/null)
+    _ca=$(awk '/^Committed_AS:/{printf "%d", $2/1024; exit}' /proc/meminfo 2>/dev/null)
+    # Both counters validated SEPARATELY — "$_cl$_ca" as one word would pass with one empty.
+    _hr=''
+    case "$_cl" in ''|*[!0-9]*) : ;; *) case "$_ca" in ''|*[!0-9]*) : ;; *)
+        _hr=$(( _cl - _ca )); echo "  commit headroom  $(printf '%8d' $_hr) MB  (CommitLimit - Committed_AS: the pool the daemon ceiling is cut from)" ;; esac ;; esac
+    echo "--- what the addon does with that ---"
+    echo "  $(go_tune_desc)   [computed now]"
+    is_running && [ -r "$DAEMON_TUNE" ] && \
+        echo "  running daemon was launched with (GOMEMLIMIT|pool cap): $(cat "$DAEMON_TUNE" 2>/dev/null)"
+    _msq=$(mem_squeeze_state)
+    if [ -n "$_msq" ]; then
+        echo "  >>> ENVELOPE AT ITS FLOOR ($_msq = state|GOMEMLIMIT MiB|pool cap|swap MiB) <<<"
+        # The clamp is (CommitLimit - Committed_AS) x COMMIT_PCT%, so the ceiling leaves the
+        # floor once the headroom exceeds FLOOR x 100 / COMMIT_PCT — print that target and
+        # both ways to reach it (swap adds to CommitLimit 1:1; the rest must come off
+        # Committed_AS), instead of a rule of thumb that only fits one box size.
+        _need=$(( AWG_GOMEMLIMIT_COMMIT_FLOOR * 100 / AWG_GOMEMLIMIT_COMMIT_PCT ))
+        if [ -n "$_hr" ] && [ "$_hr" -lt "$_need" ]; then
+            echo "      the ceiling leaves its floor once the commit headroom exceeds ~${_need}MB (now ${_hr}MB): raise CommitLimit by ~$(( _need - _hr ))MB or more (SwapTotal adds 1:1 — amtm's usual swap file is 1GB), or cut Committed_AS by as much (to under ~$(( _cl - _need ))MB). A running tunnel picks up the new ceiling on its next restart."
+        fi
+    fi
+    echo "--- processes: top 20 by RSS (Data = VmData, see the caveat below) ---"
+    printf '  %8s %8s  %s\n' "RSS KB" "Data KB" "process"
+    cat /proc/[0-9]*/status 2>/dev/null \
+        | awk '/^Name:/{n=$2; r=0} /^VmRSS:/{r=$2} /^VmData:/{printf "%8d %8d  %s\n", r, $2, n}' \
+        | sort -rn | head -20 | sed 's/^/  /'
+    # VmData is not a process's commit contribution. On pre-4.5 kernels it also counts
+    # reserved (PROT_NONE) address space, and the Go runtime reserves a large heap-arena
+    # range it never commits, so amneziawg-go can show hundreds of MB of Data against
+    # single-digit MB of RSS. Print the reconciliation instead of hiding it — Committed_AS
+    # is the authority, and a wide gap is normal on a box running a Go daemon, NOT a leak.
+    # (Field report, 1.5.23: sum(VmData)=689MB vs Committed_AS=253MB, all of the gap one
+    # amneziawg-go.)
+    cat /proc/[0-9]*/status 2>/dev/null | awk -v ca="$_ca" '/^VmRSS:/{s+=$2} /^VmData:/{d+=$2; n++} END{
+            printf "  TOTAL: RSS %.1f MB, Data %.1f MB across %d processes\n", s/1024, d/1024, n
+            if (ca+0 > 0 && d/1024 > ca*1.3)
+                printf "  NB: Data totals %.1f MB against Committed_AS %d MB — the gap is address space\n      reserved but never committed (older kernels count the Go heap reservation in VmData). Committed_AS rules.\n", d/1024, ca
+        }'
+    # Unreclaimable slab is kernel memory no process owns and no process list can explain —
+    # on Broadcom boxes the wl driver's packet pools alone run to a third of RAM. Call it out
+    # so it isn't hunted for in the process table above.
+    awk '/^SUnreclaim:/{ if ($2/1024 > 80) printf "  NB: %.1f MB of unreclaimable kernel slab — owned by no process (Broadcom wl/flow-cache pools,\n      conntrack, the Trend Micro engine). Breakdown: sort -k3 -rn /proc/slabinfo | head\n", $2/1024 }' /proc/meminfo 2>/dev/null
+    echo "--- kernel modules: top 12 by size (cost RAM, invisible to Committed_AS) ---"
+    awk '{printf "  %8.0f KB  %s\n", $2/1024, $1}' /proc/modules 2>/dev/null | sort -rn | head -12
+    awk '{s+=$2} END{printf "  TOTAL modules: %.1f MB\n", s/1048576}' /proc/modules 2>/dev/null
+    echo "--- Trend Micro engine (tdts/IDPfw): which switch keeps it resident ---"
+    # The AiProtection toggles are only one of its consumers — Traffic Analyzer, App
+    # analysis, Web History and Adaptive QoS (qos_type=1) load the same engine, so a user
+    # who "turned AiProtection off" in the GUI can still be paying for it. ONE nvram show
+    # (never a per-key `nvram get` loop — see the 1.5.10 hang note).
+    if awk '{print $1}' /proc/modules 2>/dev/null | grep -qE '^(tdts|IDPfw)$'; then
+        echo "  engine LOADED"
+    else
+        echo "  engine not loaded"
+    fi
+    nv show 2>/dev/null \
+        | awk -F= '/^(wrs_enable|wrs_app_enable|wrs_cc_enable|wrs_vp_enable|bwdpi_db_enable|bwdpi_wh_enable|apps_analysis|qos_enable|qos_type|TM_EULA)=/{print "  "$0}' \
+        | sort
+    echo "==========================================================="
+    echo "Tip: run this twice — once idle, once while heavy traffic (video) flows through the"
+    echo "tunnel. amneziawg-go's Data column grows by the buffer pool; the delta is what the"
+    echo "tunnel actually needs under your load."
+}
+
 # GOGC for the daemon: lower than Go's default 100, so the heap is collected after +50%
 # growth rather than +100% — a smaller sawtooth leaves more absolute headroom before a
 # burst can outrun the collector on a RAM-starved box. Paired with GOMEMLIMIT below.
@@ -4615,6 +6444,15 @@ AWG_GOTUNE_BELOW_MIB=768
 # commit headroom (floor 64MiB), so the ceiling fits the budget that actually exists
 # instead of quoting 448MiB the box cannot commit.
 AWG_GOMEMLIMIT_COMMIT_PCT=50  # % of (CommitLimit - Committed_AS) usable per daemon
+# Lowest GOMEMLIMIT the strict-overcommit clamp may emit (MiB). Named rather than inlined
+# because mem_squeeze_state compares against it: a ceiling that LANDED on this floor means
+# the clamp ran out of budget, not that it picked a ceiling that fits.
+# NB unlike compute_pool_cap's 512-buffer floor this is NOT a liveness minimum: it came in
+# with 1.3.15 as a bare "floor 64MiB" when the pool was 1024 x 64KB = 64MB, and was not
+# re-derived when 1.5.22 halved the pool floor to 32MB. Headroom <= 64MiB puts the soft
+# limit at or above the whole budget. Re-deriving it needs a measurement on a Cortex-A7
+# box (GC CPU vs survival), so it stays until then.
+AWG_GOMEMLIMIT_COMMIT_FLOOR=64
 
 # TRUE when the box has enough RAM to run the daemon with stock Go GC
 # (MemTotal readable AND >= AWG_GOTUNE_BELOW_MIB, and NOT under strict overcommit
@@ -4674,14 +6512,18 @@ compute_go_memlimit(){
     # Strict-overcommit clamp (see AWG_GOMEMLIMIT_COMMIT_PCT): under vm.overcommit=2 the
     # RAM-based ceiling can vastly exceed what the box can actually commit — refit it to
     # the live commit headroom, floor 64MiB (unreadable counters => RAM ceiling stands).
+    # Readable counters with ZERO or negative headroom (Committed_AS >= CommitLimit, the
+    # most starved state there is) land on the floor too — 1.3.15-1.5.22 skipped the clamp
+    # there and handed the daemon its LOOSEST ceiling (178-448MiB) at the worst moment.
     if [ "$(awk '{print $1; exit}' /proc/sys/vm/overcommit_memory 2>/dev/null)" = "2" ]; then
         _cl_kb=$(awk '/^CommitLimit:/{print $2; exit}' /proc/meminfo 2>/dev/null)
         _ca_kb=$(awk '/^Committed_AS:/{print $2; exit}' /proc/meminfo 2>/dev/null)
         case "$_cl_kb" in ''|*[!0-9]*) _cl_kb='' ;; esac
         case "$_ca_kb" in ''|*[!0-9]*) _cl_kb='' ;; esac
-        if [ -n "$_cl_kb" ] && [ "$_cl_kb" -gt "$_ca_kb" ]; then
-            _hr_mib=$(( (_cl_kb - _ca_kb) * AWG_GOMEMLIMIT_COMMIT_PCT / 100 / 1024 ))
-            [ "$_hr_mib" -lt 64 ] && _hr_mib=64
+        if [ -n "$_cl_kb" ]; then
+            _hr_mib=0
+            [ "$_cl_kb" -gt "$_ca_kb" ] && _hr_mib=$(( (_cl_kb - _ca_kb) * AWG_GOMEMLIMIT_COMMIT_PCT / 100 / 1024 ))
+            [ "$_hr_mib" -lt "$AWG_GOMEMLIMIT_COMMIT_FLOOR" ] && _hr_mib=$AWG_GOMEMLIMIT_COMMIT_FLOOR
             [ "$_hr_mib" -lt "$_lim_mib" ] && _lim_mib=$_hr_mib
         fi
     fi
@@ -4716,6 +6558,83 @@ compute_pool_cap(){
     [ "$_pcl" -lt 512 ]  && _pcl=512
     [ "$_pcl" -gt 1024 ] && _pcl=1024
     printf '%d' "$_pcl"
+}
+
+# SwapTotal in MiB, 0 when the box is swapless — which is the fleet default: routers ship
+# without swap, and the only practical place for a swap file is the USB stick /opt already
+# lives on (amtm creates one). Unreadable meminfo => 0.
+swap_total_mib(){
+    local _sw
+    _sw=$(awk '/^SwapTotal:/{printf "%d", $2/1024; exit}' /proc/meminfo 2>/dev/null)
+    case "$_sw" in ''|*[!0-9]*) _sw=0 ;; esac
+    printf '%d' "$_sw"
+}
+
+# "The memory envelope ran out of room" probe (1.5.23). Prints
+# "<state>|<GOMEMLIMIT MiB>|<pool cap>|<SwapTotal MiB>", or NOTHING when the box is fine.
+#
+# WHY THIS EXISTS: compute_go_memlimit's strict-overcommit clamp has a FLOOR
+# (AWG_GOMEMLIMIT_COMMIT_FLOOR = 64MiB) and compute_pool_cap has one too (512 buffers — a
+# LIVENESS minimum, see its header: three rolling consumers pre-hold a 128-buffer batch
+# each). On a box where the clamp LANDS on its floor the two floors collide: up to 512 x
+# 64KB = 32MB of message buffers inside a 64MiB soft ceiling. A sustained inbound burst
+# then walks straight through the SOFT limit (GOMEMLIMIT never refuses an allocation) until
+# a heap-arena mmap exceeds the commit budget -> `runtime: out of memory` rc=2, the
+# watchdog restarts the daemon, and the user sees "the VPN drops every few minutes".
+# (A Go "unexpected fault address"/panic is NOT this — see record_daemon_oom.)
+#
+# 1.5.22 scales the pool cap down for exactly this shape and can go no lower; the heap
+# floor is not a liveness minimum (see AWG_GOMEMLIMIT_COMMIT_FLOOR) but is not re-derived
+# yet either. The levers that work today are box-side — swap raises CommitLimit 1:1,
+# stopping user-space memory consumers lowers Committed_AS — so this surfaces as a status
+# flag/banner instead of yet another silent retune.
+#
+# Field case (RT-AX58U 512MB, 388.12_2, diag 2026-09-20): GOMEMLIMIT=64MiB + pool cap 512,
+# no swap, 392 of 512MB already in use with the tunnel DOWN (AiProtection/tdts resident) —
+# ~30 OOM aborts and 9 health-check rollbacks in a single day. The user saw only "the VPN
+# drops now and then", and only while YouTube played through a geo policy (the one thing
+# routed into the tunnel, and the one workload that sustains a line-rate inbound burst).
+# After a 1GB swap file: GOMEMLIMIT ~180-190MiB, pool ~730-760 (exact figures depend on
+# MemTotal).
+#
+# WHICH CEILING: $1, when given, is the GOMEMLIMIT to judge (record_daemon_oom passes what
+# the dead daemon was launched with; do_start passes what it is about to launch with —
+# explicitly empty = roomy/untuned = fine). With no argument and this instance's tunnel UP
+# it judges what the running daemon was ACTUALLY launched with ($DAEMON_TUNE) — a recompute
+# would count the daemon's own commit (>= 24MB of pre-held buffers, only ratcheting up)
+# against it and claim "pinned to 64MiB" for a daemon launched at 70-96MiB — and only while
+# the live budget is STILL at the floor (swap added since => the commit wall has moved
+# away; the next restart picks up the higher ceiling, no banner needed). Tunnel down: a
+# prediction for the next start.
+#
+# State tokens: "floor" = at the floor with NO swap (adding swap is the actionable fix);
+# "tight" = at the floor WITH swap present (enlarge it, or cut other memory consumers).
+mem_squeeze_state(){
+    local _lim _mib _sw _pool="" _live
+    # Only strict accounting has a commit floor to be pinned against (overcommit=2 is also
+    # never box_is_roomy, so that check is implied).
+    [ "$(awk '{print $1; exit}' /proc/sys/vm/overcommit_memory 2>/dev/null)" = "2" ] || return 0
+    if [ $# -gt 0 ]; then
+        _lim=$1
+    elif iface_exists "$IFACE" && [ -r "$DAEMON_TUNE" ]; then
+        IFS='|' read -r _lim _pool < "$DAEMON_TUNE"
+        _live=$(compute_go_memlimit)
+        _live=${_live%MiB}
+        case "$_live" in ''|*[!0-9]*) : ;; *) [ "$_live" -gt "$AWG_GOMEMLIMIT_COMMIT_FLOOR" ] && return 0 ;; esac
+    else
+        _lim=$(compute_go_memlimit)
+    fi
+    case "$_lim" in *MiB) : ;; *) return 0 ;; esac
+    _mib=${_lim%MiB}
+    case "$_mib" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$_mib" -le "$AWG_GOMEMLIMIT_COMMIT_FLOOR" ] || return 0
+    case "$_pool" in ''|*[!0-9]*) _pool=$(compute_pool_cap "$_lim") ;; esac
+    _sw=$(swap_total_mib)
+    if [ "$_sw" -gt 0 ]; then
+        printf 'tight|%s|%s|%s' "$_mib" "${_pool:-1024}" "$_sw"
+    else
+        printf 'floor|%s|%s|0' "$_mib" "${_pool:-1024}"
+    fi
 }
 
 # One-line description of the Go-runtime tuning decision for logs/diag. Every site that
@@ -4758,6 +6677,9 @@ launch_daemon(){
     # floor the compiled 1024x64KB pool alone can fill). Empty on roomy boxes => env
     # untouched, compiled 1024.
     _gpool=$(compute_pool_cap "$_glim")
+    # Record what THIS launch applies (empty|empty on roomy boxes): status/diag judge the
+    # running daemon by it instead of recomputing against a budget the daemon now eats into.
+    printf '%s|%s\n' "$_glim" "$_gpool" > $DAEMON_TUNE 2>/dev/null
     # WG_PROCESS_FOREGROUND=1: without it amneziawg-go DAEMONIZES — the process we launch is
     # only a short-lived parent that forks the real daemon and exits 0 once the device is up.
     # The wrapper then recorded THAT exit ("[daemon exited rc=0]" on every successful start —
@@ -4786,24 +6708,74 @@ launch_daemon(){
 }
 
 # Called from the launch wrapper after the daemon exits: if it aborted with a Go-runtime
-# out-of-memory (heavy-load heap blowout), drop a persistent breadcrumb so the cause is
-# still visible in the diag after the watchdog restarts it and after a reboot (RAM logs
-# don't survive). Gated on the exact `out of memory` string, which ONLY the Go runtime's
-# fatal-OOM prints — an intentional kill (SIGTERM/SIGKILL on stop/restart) never matches,
-# so this can't false-fire on a normal teardown.
+# out-of-memory (heavy-load heap blowout), crashed (panic / fault, 1.5.23) or was taken by
+# the kernel oom-killer, drop a persistent breadcrumb so the cause is still visible in the
+# diag after the watchdog restarts it and after a reboot (RAM logs don't survive). Gated on
+# strings only the Go runtime's own fatal paths print — an intentional kill (SIGTERM/SIGKILL
+# on stop/restart) never matches, so this can't false-fire on a normal teardown.
+# $1 = rc, $2 = GOMEMLIMIT and $3 = pool cap this daemon was launched with.
 record_daemon_oom(){
-    if grep -qiF 'out of memory' $DAEMON_LOG 2>/dev/null; then
-        # The Go runtime's OWN fatal-OOM (heap-commit refused). rc is typically 2.
-        awg_incident "amneziawg-go OOM-crashed (rc=${1:-?}) — Go heap hit its ceiling under load (GOMEMLIMIT=${2:-unset}, pool cap ${3:-1024}); box is low on RAM for this throughput"
-    elif [ "${1:-}" = 137 ] && dmesg 2>/dev/null | grep -iE 'killed process|out of memory' | grep -qi 'amneziawg-go'; then
+    local _kind _sq _adv="" _why _sig _frame _dn="${AWG_GO##*/}"
+    # Classify FIRST, so a clean exit (the common case) costs two greps and nothing more.
+    if grep -qiE 'out of memory|^fatal error: .*memory' $DAEMON_LOG 2>/dev/null; then
+        # The Go runtime's OWN fatal-OOM (heap-commit refused). rc is typically 2. The
+        # anchored half catches its other memory throws ("runtime: cannot allocate memory",
+        # "failed to reserve page summary memory") while an ordinary ENOMEM error LINE
+        # ("…sendmsg: cannot allocate memory") can't turn a later clean stop into an OOM.
+        _kind=oom
+    elif grep -qE '^(panic: |fatal error: |unexpected fault address)' $DAEMON_LOG 2>/dev/null; then
+        # Any other Go crash: panic (nil deref, index out of range, …) or runtime fault.
+        # NOT memory pressure: strict overcommit refuses at mmap time (-> the OOM branch
+        # above) and physical exhaustion at first touch goes to the kernel OOM-killer
+        # (SIGKILL, rc=137, the branch below). "unexpected fault address" is a wild or
+        # corrupted pointer — a daemon/runtime bug, bad RAM, or (SIGBUS) an I/O error
+        # reading pages back from the USB. Recorded as nothing until 1.5.23.
+        _kind=crash
+    elif [ "${1:-}" = 137 ] && dmesg 2>/dev/null | grep -iE 'killed process|out of memory' | grep -qi "$_dn"; then
         # rc=137 = 128+SIGKILL. That's ALSO how do_stop/do_start's `kill -9` fallback exits
         # the daemon, so rc alone must NOT be trusted — only record when the kernel log shows
-        # the OOM-KILLER named amneziawg-go (a box-wide-pressure kill, a DIFFERENT OOM than the
+        # the OOM-KILLER named the daemon (a box-wide-pressure kill, a DIFFERENT OOM than the
         # Go-runtime one above and invisible in the daemon's own log). Without that corroboration
         # a plain forced teardown would false-flag an incident. This catches the failure mode
         # GOMEMLIMIT can shift residual crashes toward (per-daemon cap holds, box still starves).
-        awg_incident "amneziawg-go killed by the KERNEL oom-killer (rc=137) under box-wide memory pressure — not a Go-runtime OOM; free RAM / reduce co-resident load (GOMEMLIMIT=${2:-unset}, pool cap ${3:-1024})"
+        _kind=oomkill
+    else
+        return 0
     fi
+    # Envelope verdict (1.5.23) for the ceiling THIS daemon ran with ($2, from the launch),
+    # not a re-probe of the box after its commit was released.
+    _sq=$(mem_squeeze_state "${2:-}")
+    case "${_sq%%|*}" in
+        floor) _adv=" — it ran at the strict-overcommit floor with NO swap: a swap file on the USB (amtm) raises CommitLimit 1:1 and lifts the ceiling on the next start" ;;
+        tight) _adv=" — it ran at the strict-overcommit floor even with ${_sq##*|}MiB swap: enlarge the swap file or stop other user-space memory consumers" ;;
+    esac
+    case "$_kind" in
+        oom)
+            awg_incident "$_dn OOM-crashed (rc=${1:-?}) — Go heap hit its ceiling under load (GOMEMLIMIT=${2:-unset}, pool cap ${3:-1024}); box is low on memory for this throughput${_adv}" ;;
+        oomkill)
+            awg_incident "$_dn killed by the KERNEL oom-killer (rc=137) under box-wide memory pressure — not a Go-runtime OOM; free RAM / reduce co-resident load (GOMEMLIMIT=${2:-unset}, pool cap ${3:-1024})${_adv}" ;;
+        crash)
+            # Keep the evidence: the next launch truncates DAEMON_LOG, and the watchdog
+            # relaunches within minutes. The trace goes to $DAEMON_CRASH (RAM, until reboot;
+            # diag prints it) and its two decisive lines into the incident itself (/jffs):
+            # the [signal …] line (SIGSEGV vs SIGBUS, code, addr, pc) and the first
+            # non-runtime frame of the crashing goroutine.
+            { echo "# $_dn crash, rc=${1:-?}, $(date '+%Y-%m-%d %H:%M:%S'), GOMEMLIMIT=${2:-unset} pool=${3:-1024}"
+              awk '/^(panic: |fatal error: |unexpected fault address)/{f=1} f' $DAEMON_LOG 2>/dev/null | head -n 150
+            } > $DAEMON_CRASH 2>/dev/null
+            _why=$(awk '/^(panic: |fatal error: |unexpected fault address)/{print; exit}' $DAEMON_LOG 2>/dev/null | cut -c1-120)
+            _sig=$(awk '/^\[signal /{print; exit}' $DAEMON_LOG 2>/dev/null | cut -c1-120)
+            _frame=$(awk '
+                /^goroutine [0-9]+ /   { g = 1; fn = ""; next }
+                g && /^$/              { exit }
+                g && /^[^ \t]/         { fn = $0; next }
+                g && fn != ""          { x = fn; sub(/\([^()]*\)$/, "", x); sub(/^.*\//, "", x)
+                                         if (x !~ /^runtime\./ && x != "panic") {
+                                             f = $1; sub(/^.*\//, "", f); print x " " f; exit }
+                                         fn = "" }' $DAEMON_LOG 2>/dev/null | cut -c1-120)
+            [ -n "$_sq" ] && _adv=" (box is also at its memory floor — that explains OOM aborts, not a crash like this)" || _adv=""
+            awg_incident "$_dn CRASHED (rc=${1:-?}): ${_why:-Go crash}${_sig:+ $_sig}${_frame:+ at $_frame} — NOT an OOM: a daemon/runtime bug, bad RAM or USB I/O errors; trace in $DAEMON_CRASH until reboot — please report it with the diag (GOMEMLIMIT=${2:-unset}, pool cap ${3:-1024})${_adv}" ;;
+    esac
 }
 
 # Daemon log minus the harmless wireguard-go "kernel has first class support" banner box, so
@@ -4968,10 +6940,75 @@ do_boot_guard(){
     /opt/etc/init.d/S99amneziawg start
 }
 
+# --- Start/stop generations + STARTING_FLAG ownership ---
+# Every do_stop and every COMMITTED do_start writes a fresh generation id to /tmp/.<iface>_gen
+# under the operation lock. Whoever acts on "the tunnel I just stopped/started" LATER, outside
+# the lock, carries the id it saw and hands it back as the expected generation — do_restart's
+# start half, the watchdog's start half, the health check's rollback / failover / DNS fail-open
+# — and do_stop/do_start re-check it UNDER the lock, standing down (rc 2, touching nothing)
+# when a newer stop/start happened in between. Closes: a 60-s health check of an OLD start
+# rolling back or failing over the tunnel a newer switch had just brought up; a restart whose
+# stop half raced a user Stop resurrecting the tunnel. Ids come from the kernel's uuid source
+# (a fork-free `read`; every kernel in the fleet incl. 2.6.36 has it). Instance-scoped by IFACE:
+# the server role (awgs0) never reads or writes the client's file.
+awg_new_id(){
+    AWG_NEW_ID=""
+    { read -r AWG_NEW_ID < /proc/sys/kernel/random/uuid; } 2>/dev/null
+    if [ -z "$AWG_NEW_ID" ]; then
+        local _c=""
+        { read -r _c < /tmp/.awg_id_ctr; } 2>/dev/null
+        case "$_c" in ''|*[!0-9]*) _c=0 ;; esac
+        _c=$((_c + 1))
+        echo "$_c" > /tmp/.awg_id_ctr 2>/dev/null
+        AWG_NEW_ID="$(date +%s)-$_c"
+    fi
+}
+# Write a fresh generation (the caller holds the lock) and leave it in AWG_GEN_NEW — EMPTY when
+# the write did not stick (full /tmp). Callers then hand on no expected generation, i.e. the old
+# unconditional behaviour, instead of a token nothing will ever match (which would, e.g., make
+# the health check of a dead tunnel stand down instead of rolling it back).
+awg_gen_bump(){
+    local _gf="/tmp/.${IFACE}_gen" _rb=""
+    awg_new_id
+    AWG_GEN_NEW="$AWG_NEW_ID"
+    echo "$AWG_GEN_NEW" > "$_gf" 2>/dev/null
+    { read -r _rb < "$_gf"; } 2>/dev/null
+    [ "$_rb" = "$AWG_GEN_NEW" ] || AWG_GEN_NEW=""
+}
+# True when $1 is empty (no expectation) or still the current generation. Fork-free: the
+# health check runs it every 2 s.
+gen_current_is(){
+    local _g=""
+    [ -n "$1" ] || return 0
+    { read -r _g < "/tmp/.${IFACE}_gen"; } 2>/dev/null
+    [ "$_g" = "$1" ]
+}
+# STARTING_FLAG holds its OWNER's id (AWG_FLAG_ID: one per do_restart / standalone do_start; the
+# do_start a do_restart runs reuses the restart's). A starter removes the flag only while it is
+# still ITS OWN: the old unconditional rm let a second actor that bailed out (lock timeout,
+# superseded restart) wipe the flag of the start actually in progress, and the page flashed a
+# fully-stopped «Запустить» in the middle of it. do_stop still removes it unconditionally — under
+# the lock, a stop ends every start. Readers only test existence.
+flag_clear_mine(){
+    local _f=""
+    { read -r _f < "$STARTING_FLAG"; } 2>/dev/null
+    [ -n "$_f" ] && [ "$_f" = "$AWG_FLAG_ID" ] && rm -f "$STARTING_FLAG"
+    return 0
+}
+
 do_start(){
+    # $1 = expected generation (see awg_gen_bump): do_restart and the watchdog pass the one their
+    #      do_stop wrote, so a stop/start in between wins (rc 2, nothing started). Empty = the
+    #      unconditional start every other caller wants.
+    # $2 = STARTING_FLAG owner id to reuse (do_restart passes its own); empty = take a fresh one.
+    # rc: 0 started (or nothing to do), 1 failed, 2 superseded.
+    local _exp_gen="$1" _run_sig="" _pu=""
+    if [ -n "$2" ]; then AWG_FLAG_ID="$2"; else awg_new_id; AWG_FLAG_ID="$AWG_NEW_ID"; fi
     # Skip if update in progress (opkg triggers S99amneziawg start)
     [ -f /tmp/.awg_no_autostart ] && { log_msg "Start blocked: update in progress"; return 0; }
 
+    # A deliberate Stop that left the interface up (killed mid-way) must still be clearable by
+    # the user's Start — fall through to the lock, which drops the flag before re-checking.
     if is_running && [ ! -f "${LOCKDIR}.stopped" ]; then
         log_msg "Already running"
         update_status
@@ -4999,10 +7036,14 @@ do_start(){
         return 1
     fi
 
-    # Mark start-in-progress so the UI shows "Connecting" even across a page
-    # refresh; the trap clears it and writes the final status on any exit path.
-    touch "$STARTING_FLAG"
-    trap 'rm -f "$STARTING_FLAG"; update_status' EXIT INT TERM
+    # Mark start-in-progress so the UI shows "Connecting" even across a page refresh; the trap
+    # clears it (while it is still ours — see flag_clear_mine) and writes the final status on any
+    # exit path. A STANDALONE start does not take over a flag another starter already holds: it
+    # would then be the one to remove it — possibly on its own lock timeout, in the middle of the
+    # other start. It claims the flag at its commit point below instead, under the lock, if it
+    # really starts. (The flag of a do_restart is already this start's own.)
+    if [ -n "$2" ] || [ ! -f "$STARTING_FLAG" ]; then echo "$AWG_FLAG_ID" > "$STARTING_FLAG"; fi
+    trap 'flag_clear_mine; update_status' EXIT INT TERM
     update_status
 
     # Wait for network to be ready (br0 up with IP), important on boot
@@ -5027,11 +7068,23 @@ do_start(){
     [ "$_start_delay" -gt 0 ] && { log_msg "Pre-start delay: ${_start_delay}s"; sleep "$_start_delay"; }
     [ "$(get_setting awg_wait_for_agh)" = "1" ] && agh_present && wait_for_agh 60
 
-    acquire_lock || { log_msg "Cannot acquire lock, aborting start"; update_status; return 1; }
+    acquire_lock || { log_msg "Cannot acquire lock, aborting start"; flag_clear_mine; update_status; return 1; }
+
+    # Deliberate-stop flag, re-read under the lock: a watchdog that passed its own check just
+    # before the user's Stop must not bring the tunnel back. Any other start clears it.
     if [ "${AWG_WATCHDOG:-0}" = 1 ] && [ -f "${LOCKDIR}.stopped" ]; then
-        release_lock; return 0
+        release_lock; flag_clear_mine; update_status
+        return 0
     fi
     rm -f "${LOCKDIR}.stopped"
+
+    # The stop/start this restart was paired with is no longer the latest (a user Stop, another
+    # restart or the watchdog got the lock in between): starting now would undo THEIR outcome.
+    if ! gen_current_is "$_exp_gen"; then
+        log_msg "Restart superseded by a newer stop/start — not starting"
+        release_lock; flag_clear_mine; update_status
+        return 2
+    fi
 
     # Re-check under the lock: the is_running test at the top ran BEFORE the (up to 30s) lock
     # wait, so a second queued start (double service event, watchdog racing a user click) used
@@ -5044,8 +7097,24 @@ do_start(){
         return 0
     fi
 
+    # COMMIT POINT: this start owns the "Connecting" flag and a fresh generation — the one its
+    # health check carries, so any later stop/start supersedes that check.
+    echo "$AWG_FLAG_ID" > "$STARTING_FLAG"
+    awg_gen_bump; AWG_GEN_STARTED=$AWG_GEN_NEW
+
     generate_config || { update_status; release_lock; return 1; }
     [ ! -f "$CONF" ] && { log_msg "ERROR: No config"; update_status; release_lock; return 1; }
+    # Fingerprint of the conf THIS launch runs, taken here — under the lock, before setconf — so
+    # it is exactly the file the daemon gets (written to RUNNING_CONF_SIG at the success point).
+    _run_sig=$(md5sum "$CONF" 2>/dev/null | awk '{print $1}')
+    # A saved pointer at an EMPTY slot resolved to the lowest configured one (profile_user) —
+    # say so once per start; the store is not rewritten.
+    _pu=$(get_setting awg_profile_active)
+    case "$_pu" in
+        [1-9]) if [ "$_pu" -le "$AWG_PF_MAX" ] && ! profile_configured "$_pu"; then
+                   log_msg "WARNING: saved profile (slot $_pu) is empty — started $(profile_desc "$AWG_CFG_SLOT")"
+               fi ;;
+    esac
     # Both userspace binaries must EXIST and be NON-EMPTY before we launch anything.
     # An interrupted opkg update on a low-RAM box (power-cycle mid-write, then an e2fsck
     # truncation on the next boot) or a failing USB drive can leave amneziawg-go / awg as
@@ -5105,6 +7174,17 @@ do_start(){
     log_msg "Platform $(uname -m): amneziawg-go=$(elf_arch "$AWG_GO") awg=$(elf_arch "$AWG_BIN")"
     log_msg "ipset binary: ${AWG_IPSET_BIN:-NONE (no working ipset found — geo will be disabled)}${AWG_IPSET_LIB:+ (LD_LIBRARY_PATH=$AWG_IPSET_LIB)}"
     log_msg "Go runtime: $(go_tune_desc)"
+    # The envelope can be at its floor BEFORE a single packet flows (1.5.23) — say so at
+    # start, not only in the incident log after the first crash-loop. Advice, never a
+    # refusal: the tunnel still starts. Judged on the ceiling launch_daemon is about to
+    # apply (explicit arg), never on a previous launch's $DAEMON_TUNE.
+    local _msq _msf
+    _msq=$(mem_squeeze_state "$(compute_go_memlimit)")
+    _msf=${_msq#*|}   # "<GOMEMLIMIT MiB>|<pool cap>|<swap MiB>"
+    case "${_msq%%|*}" in
+        floor) log_msg "  WARNING: memory envelope at its floor (GOMEMLIMIT=${_msf%%|*}MiB, pool cap $(echo "$_msf" | cut -d'|' -f2), strict vm.overcommit, NO swap) — sustained load (video through the tunnel) can OOM-abort the daemon and the watchdog will restart it. Fix: a swap file on the USB (amtm) — it raises CommitLimit 1:1, which is what sets this ceiling." ;;
+        tight) log_msg "  WARNING: memory envelope at its floor (GOMEMLIMIT=${_msf%%|*}MiB, pool cap $(echo "$_msf" | cut -d'|' -f2), strict vm.overcommit) even with ${_msf##*|}MiB swap — enlarge the swap file or stop other user-space memory consumers if the tunnel drops under load." ;;
+    esac
     launch_daemon
     if ! wait_for_iface "$IFACE" 10; then
         # Name the failure mode from the captured exit status: a SILENT death (banner only, no
@@ -5227,8 +7307,9 @@ do_start(){
         done
         [ "$_v4_ok" = 1 ] || log_msg "WARN: no IPv4 address on $IFACE — NAT and policy routing need one; check the Address field"
     fi
-    # MTU: configurable via awg_mtu / the active profile's mtu field (default 1280)
-    local mtu=$(pf_get mtu)
+    # MTU: configurable via awg_mtu / the active profile's mtu field (default 1280) — of the
+    # profile generate_config MATERIALIZED, not a fresh resolution (see AWG_CFG_SLOT).
+    local mtu=$(pf_slot_get "$AWG_CFG_SLOT" mtu)
     { [ -n "$mtu" ] && validate_uint "$mtu" && [ "$mtu" -ge 576 ] && [ "$mtu" -le 1500 ]; } || mtu=1280
     ip link set "$IFACE" mtu "$mtu"
     ip link set "$IFACE" up
@@ -5280,13 +7361,17 @@ do_start(){
     arm_lan_deadman "$(pidof amneziawg-go 2>/dev/null | awk '{print $1}')"
     setup_firewall
 
-    # Fingerprint of the config the DAEMON is actually running (this launch's $CONF). The
-    # status builder compares it against the current generated conf: a later Apply that edits
-    # tunnel params (keys/endpoint/obfuscation) regenerates the file but deliberately does NOT
-    # restart the daemon — the mismatch drives the page's "изменения применятся после
-    # Перезапустить" badge instead of leaving the user to guess (field case: a user swapped
-    # the whole provider config, pressed Apply and kept riding the OLD tunnel unaware).
-    md5sum "$CONF" 2>/dev/null | awk '{print $1}' > "$RUNNING_CONF_SIG"
+    # Fingerprint of the config the DAEMON is actually running (this launch's $CONF, hashed
+    # right after generate_config above). The status builder compares it against the current
+    # generated conf: a later Apply that edits tunnel params (keys/endpoint/obfuscation)
+    # regenerates the file but deliberately does NOT restart the daemon — the mismatch drives the
+    # page's "изменения применятся после Перезапустить" badge instead of leaving the user to guess
+    # (field case: a user swapped the whole provider config, pressed Apply and kept riding the OLD
+    # tunnel unaware). RUNNING_PF records WHICH profile that conf is ("<slot> <fp>"): a switch
+    # whose restart was dropped/aborted leaves the conf untouched, so only the slot/fp comparison
+    # can still tell the user the saved profile is not the one running.
+    echo "$_run_sig" > "$RUNNING_CONF_SIG"
+    printf '%s %s\n' "$AWG_CFG_SLOT" "$AWG_CFG_FP" > "$RUNNING_PF"
 
     conn_record_start
     log_msg "Started, verifying tunnel connectivity (probing: $(watchdog_hosts))..."
@@ -5296,12 +7381,20 @@ do_start(){
     # Health check (detached): verify the tunnel passes traffic and roll back if not.
     # Backgrounded so the service-event handler returns promptly — otherwise
     # rc_service stays busy for up to ~60s and silently drops other events.
+    # It carries THIS start's generation (hc_gen) and the slot it materialized (hc_slot): every
+    # act below is re-checked against the generation — cheaply at the top of each round (a newer
+    # stop/start makes this check moot: exit silently) and again UNDER THE LOCK inside
+    # do_stop/do_restart (rc 2 = superseded in the gap) — so a stale check can never roll back,
+    # fail over or DNS-fail-open a tunnel it did not start.
     (
+        hc_gen="$AWG_GEN_STARTED"
+        hc_slot="$AWG_CFG_SLOT"
         hc_ok=false
         hc_try=0
         hc_dns_fails=0
         hc_reason="not passing traffic (probed: $(watchdog_hosts))"
         while [ $hc_try -lt 30 ]; do
+            gen_current_is "$hc_gen" || exit 0
             # Reachability, cheapest first: ICMP every round; a TCP/HTTPS connect through the
             # tunnel at ~10s and ~30s in (endpoints that pass TCP but DROP ICMP — Cloudflare
             # WARP); and from ~6s in, a FRESH HANDSHAKE counts as proof of life — the pings we
@@ -5335,6 +7428,9 @@ do_start(){
                 # DNS-only failures do that and keep the tunnel.
                 hc_dns_fails=$((hc_dns_fails + 1))
                 if [ $hc_dns_fails -ge 6 ]; then
+                    # Re-check right before acting: the probes above take seconds, and dropping
+                    # the :53 interception a NEWER start just installed is not ours to do.
+                    gen_current_is "$hc_gen" || exit 0
                     log_msg "WARNING: tunnel passes traffic but router DNS won't resolve — removing :53 interception (fail-open), tunnel stays up; check the router's upstream DNS/dnsmasq"
                     disable_tunnel_dns   # a dead tunnel-DNS must not pin dnsmasq to it (no-op if feature off)
                     cleanup_dns_interception
@@ -5347,6 +7443,7 @@ do_start(){
             sleep 2
         done
         if [ "$hc_ok" = true ]; then
+            gen_current_is "$hc_gen" || exit 0
             if [ "$hc_pass" = "handshake" ]; then
                 log_msg "Tunnel verified: handshake completing — but the probe hosts ($(watchdog_hosts)) answer neither ICMP nor TCP; point awg_watchdog_hosts at ping-able hosts (e.g. 8.8.8.8) for faster checks"
             else
@@ -5355,34 +7452,48 @@ do_start(){
             # A verified tunnel ends any failover incident: clear the circle so a LATER
             # failure starts a fresh circle from this (now proven) profile. The override
             # stays — the auto-switched profile keeps running until a reboot/manual switch.
+            # "Auto-switch complete" only when what THIS start ran is not the user's own choice
+            # (a hop that came back around to the primary is no auto-switch).
             if [ -f "$FAILOVER_STATE" ]; then
                 rm -f "$FAILOVER_STATE"
-                [ -f "$PF_OVERRIDE" ] && log_msg "FAILOVER: profile $(profile_effective) ($(profile_name "$(profile_effective)")) verified working — auto-switch complete (a reboot or manual switch returns to the primary profile)"
+                [ -n "$hc_slot" ] && [ "$hc_slot" != "$(profile_user)" ] \
+                    && log_msg "FAILOVER: profile $(profile_desc "$hc_slot") verified working — auto-switch complete (a reboot or manual switch returns to the primary profile)"
             fi
             update_status
         else
+            # A newer stop/start owns the tunnel: its own health check decides — not a word here.
+            gen_current_is "$hc_gen" || exit 0
             log_msg "ERROR: Tunnel $hc_reason after 60s"
             # Snapshot the live UAPI state BEFORE the rollback kills the daemon — the single most
             # useful signal for "up but no traffic". A present "latest handshake" + non-zero
             # received bytes means the tunnel IS established and the fault is downstream (routing /
             # MTU / a co-resident tool stealing egress); no handshake means the handshake UDP never
             # got a reply (endpoint unreachable, obfuscation mismatch, or egress hijacked). The diag
-            # runs after rollback so `awg show` there is empty — capture it here while it's alive.
-            log_msg "  awg show: $("$AWG_BIN" show "$IFACE" 2>&1 | grep -iE 'latest handshake|transfer|endpoint' | tr '\n' '|' | sed 's/|$//')"
+            # runs after rollback so `awg show` there is empty — capture it here while it's alive
+            # (ONCE: the incident below is written only after the stop, from this same text).
+            hc_show=$("$AWG_BIN" show "$IFACE" 2>&1)
+            log_msg "  awg show: $(printf '%s\n' "$hc_show" | grep -iE 'latest handshake|transfer|endpoint' | tr '\n' '|' | sed 's/|$//')"
             xray_redirect_active && log_msg "  HINT: XRAYUI transparent-proxy (TPROXY 'redirect all') is active — it captures the router's egress incl. our handshake; turn off XRAYUI's redirect-all mode or run one VPN at a time"
             # Profile failover (opt-in): try the next configured profile instead of rolling
             # back — do_restart re-runs the FULL start (config, routes, firewall) on the new
             # slot and spawns a fresh health check that decides whether to hop again. When
             # failover is off / out of candidates, the classic rollback below keeps the exact
-            # pre-1.4.0 behavior (stop, watchdog keeps retrying with backoff).
-            if failover_next_profile "$hc_reason"; then
-                do_restart failover 2>/dev/null
-            else
-                awg_incident "health-check rollback: $hc_reason (awg show: $("$AWG_BIN" show "$IFACE" 2>&1 | grep -iE 'latest handshake|transfer' | tr '\n' '|' | sed 's/|$//'))"
-                do_stop "" rollback 2>/dev/null
-                log_msg "VPN stopped automatically. Check server config and endpoint reachability."
-                update_status
-            fi
+            # pre-1.4.0 behavior (stop, watchdog keeps retrying with backoff). The hop (or the
+            # give-up) is COMMITTED by do_stop under the lock, gated on hc_gen — see there.
+            hc_next=$(failover_next_profile "$hc_slot")
+            case "$hc_next" in
+                ''|giveup)
+                    do_stop "" rollback "$hc_gen" "$hc_next" "$hc_reason" 2>/dev/null
+                    case $? in
+                        0)  awg_incident "health-check rollback: $hc_reason (awg show: $(printf '%s\n' "$hc_show" | grep -iE 'latest handshake|transfer' | tr '\n' '|' | sed 's/|$//'))"
+                            log_msg "VPN stopped automatically. Check server config and endpoint reachability."
+                            update_status ;;
+                        1)  log_msg "Health-check rollback skipped: another operation holds the lock" ;;
+                        # 2 = superseded under the lock: silent, the newer operation owns it.
+                    esac ;;
+                *)
+                    do_restart failover "$hc_gen" "$hc_next $(pf_fp "$hc_next")" "$hc_reason" 2>/dev/null ;;
+            esac
         fi
     ) </dev/null >/dev/null 2>&1 &
 }
@@ -5392,11 +7503,56 @@ do_start(){
 do_stop(){
     local user_stop="$1"   # "user" = deliberate user stop/uninstall; removes the watchdog cron
     local stop_reason="$2" # connection-history token; empty → derived from $1 (user/auto)
+    # $3 = expected generation (the health check's rollback / failover pass the one their start
+    #      wrote): a newer stop/start in between → rc 2 with NOTHING touched. Empty = unconditional.
+    # $4 = failover commit, done here under the lock (so only the check of the CURRENT start can
+    #      do it): "<slot> <fp>" = hop to that profile, "giveup" = the circle is complete.
+    # $5 = the health-check failure reason, for the failover journal/incident lines.
+    # rc: 0 stopped, 1 could not take the lock (nothing done), 2 superseded (nothing done).
+    # Leaves the fresh generation in AWG_GEN_STOPPED (do_restart / the watchdog hand it to
+    # do_start) and, when do_restart set AWG_FLAG_BRIDGE, re-writes the restart's STARTING_FLAG
+    # before its final status write — no fully-stopped status between the two halves.
+    local _fs="" _fh="" _fcur="" _fx="" _fnext
     acquire_lock || { log_msg "Cannot acquire lock, aborting stop"; return 1; }
+    if ! gen_current_is "$3"; then
+        release_lock
+        return 2
+    fi
+    # The flag, not the cron removal below, is what keeps a user-stopped tunnel down: a
+    # `cru d` that times out leaves the watchdog scheduled, and the flag makes it stand down.
+    # Written first and checked, so a stop that cannot record the user's intent changes nothing.
     if [ "$user_stop" = user ]; then
         touch "${LOCKDIR}.stopped" || { release_lock; return 1; }
     fi
+    awg_gen_bump; AWG_GEN_STOPPED=$AWG_GEN_NEW
     rm -f "$STARTING_FLAG"
+    # A manual switch ends any failover incident: the user's pick beats the override + circle,
+    # and a later failure starts a fresh circle from it. Under the lock — the page/CLI switch
+    # used to drop them BEFORE the restart, where a health check still running for the old
+    # start could write them back.
+    [ "$stop_reason" = "switch" ] && rm -f "$PF_OVERRIDE" "$FAILOVER_STATE"
+    if [ -n "$4" ]; then
+        # The failing start's own profile (its RUNNING_PF record — the generation matched, so the
+        # record is that start's) is the default circle start for a first hop.
+        [ -f "$RUNNING_PF" ] && { read -r _fcur _fx < "$RUNNING_PF"; } 2>/dev/null
+        case "$_fcur" in [1-9]) ;; *) _fcur=$(profile_effective) ;; esac
+        [ -f "$FAILOVER_STATE" ] && { read -r _fs _fh < "$FAILOVER_STATE"; } 2>/dev/null
+        case "$_fs" in ''|*[!0-9]*) _fs=$_fcur; _fh=0 ;; esac
+        case "$_fh" in ''|*[!0-9]*) _fh=0 ;; esac
+        if [ "$4" = "giveup" ]; then
+            # Both state files go, so the watchdog's backoff retries start from the user's
+            # primary profile and may walk a fresh circle.
+            log_msg "FAILOVER: profile circle complete ($_fh switches, none passed the health check) — giving up; the watchdog keeps retrying the primary profile with backoff"
+            awg_incident "failover gave up: all candidate profiles failed the health check (${5:-health check failed})"
+            rm -f "$FAILOVER_STATE" "$PF_OVERRIDE"
+        else
+            _fnext=${4%% *}
+            echo "$4" > "$PF_OVERRIDE"
+            printf '%s %s\n' "$_fs" "$((_fh + 1))" > "$FAILOVER_STATE"
+            log_msg "FAILOVER: switching to config profile $(profile_desc "$_fnext") — hop $((_fh + 1))"
+            awg_incident "health-check failover: profile $(profile_iref "$_fcur") -> $(profile_iref "$_fnext") (${5:-health check failed})"
+        fi
+    fi
     do_analyze_stop quiet   # never leave a capture (or its dnsmasq query logging) running past a stop
     # Mark stop-in-progress so the UI shows "Stopping..." even across a page refresh
     touch "$STOPPING_FLAG"
@@ -5460,28 +7616,52 @@ do_stop(){
     ip link set "$IFACE" down 2>/dev/null
     ip link del "$IFACE" 2>/dev/null
     rm -f /var/run/amneziawg/"$IFACE".sock
-    rm -f "$RUNNING_CONF_SIG"   # no daemon -> no "running config" to compare against
+    # No daemon -> no "running config" (conf md5 + which profile) to compare against.
+    rm -f "$RUNNING_CONF_SIG" "$RUNNING_PF"
 
     reload_dnsmasq
 
     log_msg "Stopped"
+    # do_restart's bridge: its start half follows — show "Connecting" from here on, not a
+    # stopped tunnel with no flags (see do_restart).
+    [ -n "$AWG_FLAG_BRIDGE" ] && echo "$AWG_FLAG_BRIDGE" > "$STARTING_FLAG"
     rm -f "$STOPPING_FLAG"
     update_status
     release_lock
+    return 0
 }
 
 # Stop then start as ONE operation, keeping the "Connecting" marker set across the stop->start
 # gap so the status never flashes a fully-stopped state mid-restart. Without it, the brief
 # running=false / no-flags window between do_stop and do_start made every status reader (page
 # steady poll, header widget, watchdog) see "stopped" and surface a clickable «Запустить» that
-# raced the restart's own start. do_start re-touches the flag; its EXIT trap clears it at the end.
+# raced the restart's own start. The flag carries this restart's own id (see flag_clear_mine):
+# do_stop writes it before its last status write, do_start reuses it, and it is removed here —
+# only if still ours — whatever do_start returned (its early returns come BEFORE its trap).
+#   $1 = connection-history stop token (switch/failover); default "restart"
+#   $2 = expected generation, $3 = failover commit, $4 = reason — passed to do_stop (see there)
+# rc: 3 = the stop half could not take the lock (nothing restarted; do_stop logged it, and the
+#     flag is left alone — it belongs to whoever holds the lock), 2 = superseded, else do_start's.
 do_restart(){
-    # $1: optional connection-history stop token (switch/failover); default "restart".
-    do_stop "" "${1:-restart}"
-    touch "$STARTING_FLAG"
+    local _rc
+    awg_new_id; AWG_FLAG_ID="$AWG_NEW_ID"
+    AWG_FLAG_BRIDGE="$AWG_FLAG_ID"
+    do_stop "" "${1:-restart}" "$2" "$3" "$4"; _rc=$?
+    AWG_FLAG_BRIDGE=""
+    case $_rc in
+        0) ;;
+        2) return 2 ;;
+        *) log_msg "ERROR: could not stop: another operation holds the lock — nothing restarted"
+           update_status
+           return 3 ;;
+    esac
+    echo "$AWG_FLAG_ID" > "$STARTING_FLAG"
     update_status
     wait_for_pid_exit amneziawg-go 10
-    do_start
+    do_start "$AWG_GEN_STOPPED" "$AWG_FLAG_ID"; _rc=$?
+    flag_clear_mine
+    update_status
+    return $_rc
 }
 
 # --- Stale `status` reaper ---------------------------------------------------------------
@@ -5586,56 +7766,141 @@ proc_age_s(){
     echo $(( up - $1 / 100 ))
 }
 
-# --- Stale dnsmasq-reload-job reaper (1.5.21) --------------------------------------------
-# Second incarnation of the wedged-`nvram get` disease (see reap_stale_status above): until
-# 1.5.23 the DETACHED reload_dnsmasq job polled a BARE `nvram get rc_service` once a second
-# inside _rc_settle, and ONE lost envrams reply parked the whole job in the kernel forever —
-# while it HELD /tmp/.awg_dnsreload. Every later reload then waited its 240 s and self-skipped
-# ("another reload job still running"), so dnsmasq never picked up refreshed DOMAIN geo rules
-# again until a reboot. Field-caught 2026-08-24 (TUF-AX3000_V2 @1.5.20 diag): holder alive 6+
-# minutes, rc idle the whole time, not one further journal/syslog line from the job — parked
-# before its `service` call, i.e. inside the nvram read. Since 1.5.23 that read is bounded
-# (`nv`, 5 s) and a timeout counts as "busy"; the reaper stays as the net under the steps that
-# are STILL unbounded — each `service restart_dnsmasq` (notify_rc blocks ~15 s on a busy rc)
-# and `dnsmasq --test`. Unlike a status run, this job's lifetime is LEGITIMATELY minutes (up
-# to 240 s in the lock queue, a 150 s rc-settle budget, and up to 30 notify_rc attempts), so
-# the threshold sits far above all of that combined. Age is measured on the holder PROCESS
-# (proc_age_s), not on a lock file — so locks taken by a pre-1.5.21 addon are covered the
-# moment this version lands.
+# --- Stale dnsmasq-reload-job reaper (1.5.21, progress-based since 1.5.27) ----------------
+# Second incarnation of the wedged-`nvram get` disease (see reap_stale_status above): the
+# DETACHED reload_dnsmasq job polls a bare `nvram get rc_service` once a second inside
+# _rc_settle, and ONE lost reply parks the whole job in the kernel forever — while it HOLDS
+# /tmp/.awg_dnsreload. Every later reload then queued behind it and skipped, so dnsmasq never
+# picked up refreshed DOMAIN geo rules again until a reboot. Field-caught 2026-08-24
+# (TUF-AX3000_V2 @1.5.20 diag): holder alive 6+ minutes, rc idle the whole time, not one further
+# journal/syslog line from the job.
+# 1.5.21 judged the holder by AGE (> 1200 s), budgeting the lock queue + settle + restarts and
+# forgetting that the same job then runs the geo pre-resolve, whose length scales with the
+# domain count and resolver latency. A big list behind AdGuardHome is legitimately older than
+# that: it was reaped mid-lookup, the log blamed nvram (hard-coded), the requeued job skipped the
+# restart (md5) and started the pre-resolve over from line 1 — reaped again ~1490 s later, every
+# ~25 min, forever, with the resolver under constant load (field report 2026-09-28, GT-AX6000
+# + AGH @1.5.25). Now the job writes a progress beat (reload_dnsmasq's _beat: phase + uptime)
+# before every step that can block, and a holder is reaped only when that beat is older than
+# DNSRELOAD_STALL_S — however long it has been running. The longest legitimate gap between
+# beats is one notify_rc block (~15 s), one lookup batch (a few timeouts) or 100 ipset adds.
+# Holders without a beat were started by a pre-1.5.27 script (an upgrade under a running job)
+# and keep the old age rule.
+DNSRELOAD_STALL_S=180
 DNSRELOAD_STALE_S=1200
 
 reap_stale_dnsreload(){
-    local hp age victims kids more d p sline v pass
+    local hp age victims kids more d p sline v pass ph ts up ux stall comms why rph _bf _ba
     [ -d /tmp/.awg_dnsreload ] || return 0
     hp=$(cat /tmp/.awg_dnsreload/pid 2>/dev/null)
+    ph=""; ts=""
+    { read -r ph ts < /tmp/.awg_dnsreload/beat; } 2>/dev/null
+    case "$ph" in *[!a-z]*) ph="" ;; esac
+    case "$ts" in ''|*[!0-9]*) ts="" ;; esac
     if [ -z "$hp" ]; then
         # mkdir won but the pid write never landed (writer killed in that instant). The
         # queue's dead-holder reclaim keys on the pid FILE, so a pidless dir blocks every
         # reload forever. Same age discipline as the watchdog's LOCKDIR reclaim: touch it
         # only once the dir is demonstrably old — mid-acquire is a moment, not minutes.
-        [ -n "$(find /tmp/.awg_dnsreload -maxdepth 0 -mmin +5 2>/dev/null)" ] || return 0
-        rm -rf /tmp/.awg_dnsreload 2>/dev/null
-        log_msg "WATCHDOG: removed an orphaned pidless dnsmasq-reload lock (it was blocking every reload)"
+        # Re-queue: whatever it was carrying never ran (the md5 check makes a no-op cheap).
+        file_older_than /tmp/.awg_dnsreload 300 || return 0
+        dnsreload_reclaim "r0" "" || return 0
+        log_msg "WATCHDOG: removed an orphaned pidless dnsmasq-reload lock (it was blocking every reload) — re-queuing the reload"
+        reload_dnsmasq
         return 0
     fi
     case "$hp" in *[!0-9]*) return 0 ;; esac
     if ! kill -0 "$hp" 2>/dev/null; then
-        # Dead holder. The reload queue reclaims these itself, but only when the NEXT reload
-        # actually queues up behind it — clear it now so that one starts instantly instead.
-        rm -rf /tmp/.awg_dnsreload 2>/dev/null
+        # Dead holder (killed without its EXIT trap — OOM killer, kill -9). The reload queue
+        # reclaims these itself, but only when the NEXT reload actually queues up behind it —
+        # clear it now so that one starts instantly instead, and re-run the reload if the job
+        # died before dnsmasq had the conf (dnsreload_needs_requeue — a job without a beat died
+        # before it did anything, or is a pre-1.5.27 one: re-run it; the md5 check keeps a
+        # needless run cheap).
+        dnsreload_reclaim "r$hp" "$hp" dead || return 0
+        rph=${DR_PH:-$ph}
+        if [ -z "$ts" ] || dnsreload_needs_requeue "$rph" "$DR_OWED" "$DR_UNL"; then
+            log_msg "WATCHDOG: a dnsmasq-reload job died in phase ${rph:-start} (pid $hp) — re-queuing the reload"
+            reload_dnsmasq
+        else
+            log_msg "WATCHDOG: a dnsmasq-reload job died in phase ${rph:-?} (pid $hp) — lock removed; not re-queued (dnsmasq already has the current rules; the pre-resolve resumes at the next reload)"
+        fi
         return 0
+    fi
+    # Progress first — read with the `read` builtin, no fork while the job is healthy.
+    stall=""
+    if [ -n "$ts" ]; then
+        up=""; { read -r up ux < /proc/uptime; } 2>/dev/null
+        up=${up%%.*}
+        case "$up" in ''|*[!0-9]*) return 0 ;; esac
+        stall=$((up - ts))
+        [ "$stall" -gt "$DNSRELOAD_STALL_S" ] || return 0
+    elif [ -e /tmp/.awg_dnsreload/beat ] || [ -e /tmp/.awg_dnsreload/beat.t ]; then
+        # A beat exists but did not parse: it is being written this instant (or was damaged).
+        # Only a job WITHOUT any beat is a pre-1.5.27 holder — never apply the age rule to a
+        # 1.5.27 job on the strength of one unlucky read; the next tick decides. (Bounded: a
+        # beat that stays unparsable longer than a stall is treated as a stall below.)
+        for _bf in /tmp/.awg_dnsreload/beat /tmp/.awg_dnsreload/beat.t; do
+            _ba=$(file_age_s "$_bf") || continue
+            [ "$_ba" -ge -60 ] && [ "$_ba" -le "$DNSRELOAD_STALL_S" ] && return 0
+        done
+        stall="?"
     fi
     age=$(proc_age_s "$hp")
     [ -n "$age" ] || return 0
-    [ "$age" -gt "$DNSRELOAD_STALE_S" ] || return 0
+    if [ -n "$ts" ]; then
+        # A process YOUNGER than the job's last beat cannot have written it: the holder died
+        # without its EXIT trap and its pid was reused by something unrelated. 1.5.21's age
+        # gate protected such a young process implicitly; the stall rule must do it explicitly
+        # — never SIGSTOP/SIGKILL a stranger's process tree (httpd, dnsmasq, the daemon…).
+        if [ "$age" -lt "$stall" ]; then
+            dnsreload_reclaim "r$hp" "$hp" || return 0
+            rph=${DR_PH:-$ph}
+            if dnsreload_needs_requeue "$rph" "$DR_OWED" "$DR_UNL"; then
+                log_msg "WATCHDOG: removed a dead dnsmasq-reload job's lock (its pid $hp now belongs to another process; last beat ${stall}s ago in phase ${rph:-?}) — re-queuing the reload"
+                reload_dnsmasq
+            else
+                log_msg "WATCHDOG: removed a dead dnsmasq-reload job's lock (its pid $hp now belongs to another process; last beat ${stall}s ago in phase ${rph:-?}) — not re-queued (dnsmasq already has the current rules; the pre-resolve resumes at the next reload)"
+            fi
+            return 0
+        fi
+    elif [ "$stall" = "?" ]; then
+        # Same stranger test for a beat that stayed unreadable past the stall limit: a process
+        # younger than that limit cannot have written it — the holder died and its pid was reused.
+        if [ "$age" -le "$DNSRELOAD_STALL_S" ]; then
+            dnsreload_reclaim "r$hp" "$hp" || return 0
+            log_msg "WATCHDOG: removed a dead dnsmasq-reload job's lock (unreadable progress beat; its pid $hp now belongs to another process) — re-queuing the reload"
+            reload_dnsmasq
+            return 0
+        fi
+    else
+        [ "$age" -gt "$DNSRELOAD_STALE_S" ] || return 0
+        # The job may have ENDED between our reads — its release renames the whole lock dir
+        # away, and "no beat" then only means "no dir". Re-confirm the same holder still owns a
+        # beat-less lock before acting on the legacy rule.
+        { [ -d /tmp/.awg_dnsreload ] && [ "$(cat /tmp/.awg_dnsreload/pid 2>/dev/null)" = "$hp" ] \
+          && [ ! -e /tmp/.awg_dnsreload/beat ] && [ ! -e /tmp/.awg_dnsreload/beat.t ]; } || return 0
+    fi
+    # Freeze the holder, then make sure the lock is still ITS lock (it may have finished and
+    # released it between our reads and the STOP) — else let it go.
+    kill -STOP "$hp" 2>/dev/null
+    if [ "$(cat /tmp/.awg_dnsreload/pid 2>/dev/null)" != "$hp" ]; then
+        kill -CONT "$hp" 2>/dev/null
+        return 0
+    fi
     # Collect the holder's descendants TRANSITIVELY: the wedged `nvram get` runs inside a
-    # $(…) command-substitution subshell, i.e. it is usually a GRANDchild of the holder — a
-    # single-level PPid pass would kill the middle shell and orphan the nvram process, still
-    # wedged, onto init. Deepest generation lands FIRST in $kids, and children die BEFORE
-    # the holder (the reap_stale_status lesson: freeing the shell alone lets it resume and
-    # act on a world that moved on minutes ago).
-    victims=" $hp"; kids=""; pass=0
-    while [ $pass -lt 4 ]; do
+    # $(…) command-substitution subshell, i.e. it is usually a GRANDchild of the holder, and a
+    # pre-resolve lookup sits three levels down (batch subshell → $(…) → nslookup). A
+    # single-level PPid pass would kill the middle shell and orphan the wedged process onto
+    # init. Each generation is SIGSTOPped as it is found (the holder already is): a stopped
+    # task cannot fork, so nothing new appears between this scan and the kill. Deepest
+    # generation lands FIRST in $kids, and children die BEFORE the holder (the
+    # reap_stale_status lesson: freeing the shell alone lets it resume and act on a world that
+    # moved on minutes ago). The victims' comm names say WHAT was stuck — the log reports that
+    # instead of assuming nvram (1.5.21-1.5.26 blamed nvram for every reap, and sent a field
+    # user hunting a firmware bug that was really this reaper killing a live pre-resolve).
+    victims=" $hp"; kids=""; comms=""; pass=0
+    while [ $pass -lt 6 ]; do
         more=""
         for d in /proc/[0-9]*; do
             p=${d#/proc/}
@@ -5646,22 +7911,59 @@ reap_stale_dnsreload(){
             set -f; set -- $sline; set +f
             [ $# -ge 4 ] || continue    # pid (comm) state ppid — our victims' comms are never spaced
             for v in $victims; do
-                [ "$4" = "$v" ] && { more="$more $p"; break; }
+                [ "$4" = "$v" ] && { more="$more $p"; comms="$comms $2"; break; }
             done
         done
         [ -n "$more" ] || break
+        kill -STOP $more 2>/dev/null
         kids="$more$kids"
         victims="$victims$more"
         pass=$((pass + 1))
     done
+    # Release the lock while the whole tree is FROZEN, before any kill: a waiter polling now
+    # still sees a live holder (a stopped process passes kill -0), so it cannot reclaim and
+    # have its fresh lock renamed away by us; once the rename lands, its own mkdir wins. The
+    # flags come from the tomb (dnsreload_reclaim), after the rename — a waiter's give-up
+    # `owed` is either seen here or finds no dir, and that waiter then takes the lock itself.
+    if ! dnsreload_reclaim "r$hp" "$hp"; then
+        # The lock is no longer this holder's — it released it itself in the instant before the
+        # freeze (its forked `mv` is not stopped by our SIGSTOP). Let the whole tree run on: the
+        # job finishes its own release and handles `owed` itself.
+        kill -CONT $kids "$hp" 2>/dev/null
+        return 0
+    fi
+    rph=${DR_PH:-$ph}
     [ -n "$kids" ] && kill -9 $kids 2>/dev/null
     kill -9 "$hp" 2>/dev/null
-    rm -rf /tmp/.awg_dnsreload 2>/dev/null
-    log_msg "WATCHDOG: reaped a wedged dnsmasq-reload job (pid $hp, ${age}s old — a firmware 'nvram get' with no timeout had parked it; reloads were being skipped) — re-queuing the reload"
-    # The killed job's reload never happened; run a fresh one so refreshed domain rules reach
-    # dnsmasq now rather than at the next Apply. It detaches itself and self-skips via the
-    # conf md5 signature when there is genuinely nothing to load.
-    reload_dnsmasq
+    case "$comms" in
+        *'(nvram)'*)            why="a firmware 'nvram get' never answered (the firmware's nvram IPC has no timeout)" ;;
+        *'(service)'*|*'(rc)'*) why="'service restart_dnsmasq' (notify_rc) never returned" ;;
+        *'(nslookup)'*)
+            if [ "$rph" = preresolve ]; then why="a geo pre-resolve DNS lookup never returned"
+            else why="the router's own resolver (127.0.0.1) never answered a lookup"; fi ;;
+        *'(dnsmasq)'*)          why="a 'dnsmasq --test' / direct start never returned" ;;
+        *)                      why="no identifiable blocked step" ;;
+    esac
+    # Re-queue only when dnsmasq may not hold the current conf (dnsreload_needs_requeue): the
+    # job died before or in its restart, the restart never took, or a waiter gave up behind it.
+    # Past a successful restart — the DNS wait or the pre-resolve — dnsmasq already loaded the
+    # conf and the pre-resolve resumes from its saved cursor at the next reload; an automatic
+    # requeue there is exactly what turned the 1.5.21 reaper into a loop.
+    if [ "$stall" = "?" ]; then
+        log_msg "WATCHDOG: reaped a dnsmasq-reload job whose progress beat stayed unreadable for over ${DNSRELOAD_STALL_S}s (pid $hp, ${age}s old) — $why; re-queuing the reload"
+        reload_dnsmasq
+    elif [ -z "$ts" ]; then
+        log_msg "WATCHDOG: reaped a dnsmasq-reload job started by a pre-1.5.27 script (pid $hp, ${age}s old, over the ${DNSRELOAD_STALE_S}s limit for jobs without a progress beat) — $why; re-queuing the reload"
+        reload_dnsmasq
+    elif dnsreload_needs_requeue "$rph" "$DR_OWED" "$DR_UNL"; then
+        log_msg "WATCHDOG: reaped a stalled dnsmasq-reload job (pid $hp, phase ${rph:-?}, no progress for ${stall}s, ${age}s old) — $why; re-queuing the reload"
+        # The killed job's reload never (fully) happened; run a fresh one so refreshed domain
+        # rules reach dnsmasq now rather than at the next Apply. It detaches itself and
+        # self-skips via the conf md5 signature when there is genuinely nothing to load.
+        reload_dnsmasq
+    else
+        log_msg "WATCHDOG: reaped a stalled dnsmasq-reload job (pid $hp, phase $rph, no progress for ${stall}s, ${age}s old) — $why; not re-queued (dnsmasq already has the current rules; the pre-resolve resumes at the next reload)"
+    fi
 }
 
 # --- Status JSON for web UI ---
@@ -5722,7 +8024,10 @@ EOF
         fi
     fi
 
-    log_text=$(grep "amneziawg" /tmp/syslog.log 2>/dev/null | tail -20 | sed 's/"/\\"/g' | tr '\n' '|' | sed 's/|/\\n/g')
+    # JSON-escape: backslash FIRST, then quotes; tabs -> spaces and other control bytes dropped. A
+    # lone backslash (a pasted Windows path in a log line) or a raw tab made awg_status.htm invalid
+    # JSON and the page showed the router as offline until that line scrolled out of the tail.
+    log_text=$(grep "amneziawg" /tmp/syslog.log 2>/dev/null | tail -20 | tr '\t' ' ' | tr -d '\000-\010\013-\037' | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' '|' | sed 's/|/\\n/g')
 
     # "Daemon up but the tunnel isn't established" flag for the UI. True only while running and NO
     # peer has EVER completed a handshake (peer_hs_max==0 → endpoint unreachable / obfuscation
@@ -5750,16 +8055,41 @@ EOF
     local awg31_cap=false
     awg31_supported && awg31_cap=true
 
+    # The profile the tunnel materializes NOW (a VALID failover override honored), resolved ONCE
+    # per tick — conf_pending below and the profile block further down share it (and its
+    # fingerprint, when the override check already computed one).
+    local pf_active _eff_fp="" _rpf_slot="" _rpf_fp=""
+    profile_resolve; pf_active=$AWG_PF_EFF
+
     local conf_pending=false _rc_sig _cf_sig _pk_live _pk_conf
-    if [ "$running" = "true" ] && [ -f "$CONF" ]; then
-        _cf_sig=$(md5sum "$CONF" 2>/dev/null | awk '{print $1}')
-        _rc_sig=$(cat "$RUNNING_CONF_SIG" 2>/dev/null)
-        if [ -n "$_rc_sig" ]; then
-            [ "$_rc_sig" != "$_cf_sig" ] && conf_pending=true
-        elif [ -n "$dump" ]; then
-            _pk_live=$(printf '%s\n' "$dump" | awk -F'	' 'NR==1{print $1}')
-            _pk_conf=$(awk -F' *= *' '/^PublicKey/{print $2; exit}' "$CONF" 2>/dev/null)
-            [ -n "$_pk_live" ] && [ -n "$_pk_conf" ] && [ "$_pk_live" != "$_pk_conf" ] && conf_pending=true
+    if [ "$running" = "true" ]; then
+        if [ -f "$CONF" ]; then
+            _cf_sig=$(md5sum "$CONF" 2>/dev/null | awk '{print $1}')
+            _rc_sig=$(cat "$RUNNING_CONF_SIG" 2>/dev/null)
+            if [ -n "$_rc_sig" ]; then
+                [ "$_rc_sig" != "$_cf_sig" ] && conf_pending=true
+            elif [ -n "$dump" ]; then
+                _pk_live=$(printf '%s\n' "$dump" | awk -F'	' 'NR==1{print $1}')
+                _pk_conf=$(awk -F' *= *' '/^PublicKey/{print $2; exit}' "$CONF" 2>/dev/null)
+                [ -n "$_pk_live" ] && [ -n "$_pk_conf" ] && [ "$_pk_live" != "$_pk_conf" ] && conf_pending=true
+            fi
+        fi
+        # ...OR the profile now in effect is not the one running. A switch whose restart never
+        # happened (the firmware dropped the event, the lock was held, the stop failed) leaves
+        # the conf untouched — the md5 alone says "nothing pending" while the page's pointer
+        # names another profile. RUNNING_PF (do_start) records the slot + fingerprint the daemon
+        # was built from; an edited identity of the SAME slot counts too. A tunnel started before
+        # 1.5.26 has no record, which skips this test.
+        if [ "$conf_pending" = false ] && [ -f "$RUNNING_PF" ]; then
+            { read -r _rpf_slot _rpf_fp < "$RUNNING_PF"; } 2>/dev/null
+            if [ -n "$_rpf_slot" ]; then
+                if [ "$_rpf_slot" != "$pf_active" ]; then
+                    conf_pending=true
+                else
+                    _eff_fp=${AWG_PF_EFF_FP:-$(pf_fp "$pf_active")}
+                    [ "$_rpf_fp" != "$_eff_fp" ] && conf_pending=true
+                fi
+            fi
         fi
     fi
 
@@ -5920,27 +8250,60 @@ EOF
     local ctf_block=false
     ctf_active && ctf_block=true
 
-    # Config profiles for the UI: the slot the tunnel materializes (active), the user's
-    # persisted choice (user; differs from active only under a failover override) and a
-    # compact per-slot list for the profile bar. Names are user text — strip control chars,
-    # truncate, escape for JSON (same treatment as geo_matchall_warn above).
-    local pf_active pf_user pf_auto pf_name pf_list="" pf_failover=false
-    local _pfn _pfsep="" _pfnm _pfcfg _pffo
-    pf_active=$(profile_effective)
+    # Memory envelope at its floor (see mem_squeeze_state): the RUNNING daemon was launched
+    # with GOMEMLIMIT on the strict-overcommit floor and the live budget is still there,
+    # which OOM-aborts it under sustained inbound load and reads to the user as "the VPN
+    # drops every few minutes". The levers are box-side (swap / fewer memory consumers), so
+    # the page renders them. Only while the tunnel runs — the banner is about the daemon in
+    # service; the prediction for a stopped tunnel lives in diag/`mem` and the start log.
+    # mem_detail = "<GOMEMLIMIT MiB>|<pool cap>|<SwapTotal MiB>"; the page formats it, so
+    # the numbers stay machine-readable and the wording stays bilingual.
+    local mem_squeeze="" mem_detail="" _msq=""
+    [ "$running" = true ] && _msq=$(mem_squeeze_state)
+    if [ -n "$_msq" ]; then
+        mem_squeeze=${_msq%%|*}
+        mem_detail=${_msq#*|}
+    fi
+
+    # Config profiles for the UI: the slot the tunnel materializes (active — resolved above),
+    # the user's persisted choice (user; differs from active only under a VALID failover
+    # override) and a compact per-slot list for the profile bar, all from ONE pf_scan. Names
+    # arrive decoded and sanitized (no control bytes, no '<' '>') and EMPTY when unset — the page
+    # renders its own localized "unnamed" label with the ordinal; they are only JSON-escaped here.
+    # No byte cut any more: the old 48-byte cut split Cyrillic mid-character (the page caps
+    # names at 32 characters itself).
+    local pf_user pf_auto pf_name="" pf_list="" pf_failover=false
+    local _pfn _pfc _pff _pfnm _pfsep=""
     pf_user=$(profile_user)
     pf_auto=false
     [ "$pf_active" != "$pf_user" ] && pf_auto=true
-    pf_name=$(profile_name "$pf_active" | tr -d '\000-\037' | cut -c1-48 | sed 's/\\/\\\\/g; s/"/\\"/g')
-    _pfn=1
-    while [ "$_pfn" -le "$AWG_PF_MAX" ]; do
-        _pfnm=$(pf_slot_get "$_pfn" name | tr -d '\000-\037' | cut -c1-48 | sed 's/\\/\\\\/g; s/"/\\"/g')
-        _pfcfg=false; profile_configured "$_pfn" && _pfcfg=true
-        _pffo=true; [ "$(pf_slot_get "$_pfn" fo)" = "0" ] && _pffo=false
-        pf_list="${pf_list}${_pfsep}{\"n\":${_pfn},\"name\":\"${_pfnm}\",\"cfg\":${_pfcfg},\"fo\":${_pffo}}"
+    while IFS='	' read -r _pfn _pfc _pff _pfnm; do
+        [ -n "$_pfn" ] || continue
+        case "$_pfnm" in *[\\\"]*) _pfnm=$(printf '%s' "$_pfnm" | sed 's/\\/\\\\/g; s/"/\\"/g') ;; esac
+        [ "$_pfn" = "$pf_active" ] && pf_name=$_pfnm
+        if [ "$_pfc" = 1 ]; then _pfc=true; else _pfc=false; fi
+        if [ "$_pff" = 0 ]; then _pff=false; else _pff=true; fi
+        pf_list="${pf_list}${_pfsep}{\"n\":${_pfn},\"name\":\"${_pfnm}\",\"cfg\":${_pfc},\"fo\":${_pff}}"
         _pfsep=","
-        _pfn=$((_pfn + 1))
-    done
+    done <<EOF
+$(pf_scan)
+EOF
     [ "$(get_setting awg_failover)" = "1" ] && pf_failover=true
+
+    # An ACCEPTED profile switch is restarting (profile_switch_restart publishes it): the page's
+    # switch transition counts this as "in progress" even in the instants no start/stop flag is
+    # up. Ignored once older than 150 s (a switch restart that long has died), then 0.
+    local switch_req=0 _sq_slot="" _sq_at="" _sq_age
+    if [ -f "$SWITCH_REQ" ]; then
+        { read -r _sq_slot _sq_at < "$SWITCH_REQ"; } 2>/dev/null
+        case "$_sq_slot" in
+            [1-9]) case "$_sq_at" in
+                       ''|*[!0-9]*) ;;
+                       *) _sq_age=$(( $(date +%s) - _sq_at ))
+                          [ "$_sq_age" -ge 0 ] && [ "$_sq_age" -lt 150 ] && switch_req=$_sq_slot ;;
+                   esac ;;
+        esac
+    fi
 
     # Firmware UI language (preferred_lang nvram) so the page/widget can localize without a
     # round-trip. The frontend maps RU -> Russian, everything else -> English. Empty -> EN.
@@ -5953,9 +8316,13 @@ EOF
     # numeric-suffixed leftovers first (a crash/kill between cat and mv would otherwise strand
     # them in /www/user forever); the glob matches only "<status>.<digits>", never the live
     # awg_status.htm or awg_widget.js. The old ".tmp" is removed too in case an upgrade left one.
+    # Every '<' leaves as its JSON unicode escape (backslash-u003c — the same string after
+    # JSON.parse): this .htm is served through the firmware's ASP evaluator, and user text
+    # rides in it — device names, hand-written dnsmasq lines, syslog. One sed, whatever field a
+    # stray tag opener hides in.
     rm -f "${STATUS_FILE}.tmp" "${STATUS_FILE}".[0-9]* 2>/dev/null
-    cat > "${STATUS_FILE}.$$" << STATUSEOF
-{"running":${running},"starting":${starting},"stopping":${stopping},"version":"${AWG_VERSION}","lang":"${pref_lang}","public_key":"${pub_key}","listen_port":"${listen_port}","interface_addr":"${iface_addr}","peers":${peers_json},"no_handshake":${no_handshake},"conf_pending":${conf_pending},"awg3":${awg3_cap},"awg31":${awg31_cap},"conn_start":${conn_start},"conn_uptime":${conn_uptime},"conn_history":${conn_hist},"profile":{"active":${pf_active},"user":${pf_user},"auto":${pf_auto},"name":"${pf_name}","failover":${pf_failover},"list":[${pf_list}]},"default_policy":"${default_policy}","dpi_tool":"${dpi_tool}","killswitch":${killswitch},"agh":${agh},"coexist_warn":${coexist_warn},"xray_capture":${xray_capture},"xray_ctl":${xray_ctl},"fwvpn_state":"${fwvpn_state}","fwvpn_detail":"${fwvpn_detail}","ctf_block":${ctf_block},"kernel_unsup":${kernel_unsup},"dnsgeo_warn":"${dnsgeo_warn}","geo_matchall_warn":"${geo_matchall_warn}","clients":"${clients_data}","active_rules":${active_rules},"ipset_count":${ipset_count},"geo_domains":${geo_domains},"geo_stats":{${geo_stats}},"geo_downloaded":${geo_downloaded},"geo_busy":${geo_busy},"analyze_active":${analyze_active},"log":"${log_text}"}
+    sed 's/</\\u003c/g' > "${STATUS_FILE}.$$" << STATUSEOF
+{"running":${running},"starting":${starting},"stopping":${stopping},"version":"${AWG_VERSION}","lang":"${pref_lang}","public_key":"${pub_key}","listen_port":"${listen_port}","interface_addr":"${iface_addr}","peers":${peers_json},"no_handshake":${no_handshake},"conf_pending":${conf_pending},"awg3":${awg3_cap},"awg31":${awg31_cap},"conn_start":${conn_start},"conn_uptime":${conn_uptime},"conn_history":${conn_hist},"profile":{"active":${pf_active},"user":${pf_user},"auto":${pf_auto},"name":"${pf_name}","failover":${pf_failover},"list":[${pf_list}]},"switch_req":${switch_req},"default_policy":"${default_policy}","dpi_tool":"${dpi_tool}","killswitch":${killswitch},"agh":${agh},"coexist_warn":${coexist_warn},"xray_capture":${xray_capture},"xray_ctl":${xray_ctl},"fwvpn_state":"${fwvpn_state}","fwvpn_detail":"${fwvpn_detail}","ctf_block":${ctf_block},"mem_squeeze":"${mem_squeeze}","mem_detail":"${mem_detail}","kernel_unsup":${kernel_unsup},"dnsgeo_warn":"${dnsgeo_warn}","geo_matchall_warn":"${geo_matchall_warn}","clients":"${clients_data}","active_rules":${active_rules},"ipset_count":${ipset_count},"geo_domains":${geo_domains},"geo_stats":{${geo_stats}},"geo_downloaded":${geo_downloaded},"geo_busy":${geo_busy},"analyze_active":${analyze_active},"log":"${log_text}"}
 STATUSEOF
     mv "${STATUS_FILE}.$$" "$STATUS_FILE" 2>/dev/null
 }
@@ -6012,6 +8379,10 @@ analyze_dns_log_on(){
     if ! grep -qF "conf-file=$ANALYZE_DNS_CONF" "$DNSMASQ_INCLUDE" 2>/dev/null; then
         echo "conf-file=$ANALYZE_DNS_CONF" >> "$DNSMASQ_INCLUDE"
     fi
+    # The md5 skip covers only the geo conf: without this the restart that loads query logging
+    # was skipped whenever the geo rules were unchanged (same for turning it off below, where a
+    # skipped restart kept dnsmasq logging into the deleted file).
+    rm -f "$DNSRELOAD_SIG"
     reload_dnsmasq
 }
 
@@ -6022,6 +8393,7 @@ analyze_dns_log_off(){
     if [ -f "$DNSMASQ_INCLUDE" ] && grep -qF "$ANALYZE_DNS_CONF" "$DNSMASQ_INCLUDE" 2>/dev/null; then
         grep -vF "$ANALYZE_DNS_CONF" "$DNSMASQ_INCLUDE" > "${DNSMASQ_INCLUDE}.awgan.tmp" 2>/dev/null \
             && mv "${DNSMASQ_INCLUDE}.awgan.tmp" "$DNSMASQ_INCLUDE"
+        rm -f "$DNSRELOAD_SIG"
         reload_dnsmasq
     fi
     rm -f "$ANALYZE_DNS_LOG"
@@ -6048,7 +8420,10 @@ analyze_write(){
     local ip="$1" policy="$2" active="$3" started="${4:-0}" arr=""
     [ -f "$ANALYZE_ENTRIES" ] && arr=$(awk 'BEGIN{ORS=""} {if(NR>1)print ","; print}' "$ANALYZE_ENTRIES" 2>/dev/null)
     rm -f "${ANALYZE_FILE}.tmp" "${ANALYZE_FILE}".[0-9]* 2>/dev/null
-    cat > "${ANALYZE_FILE}.$$" <<ANEOF
+    # '<' as its JSON unicode escape, like the status file: a queried domain name is LAN-client
+    # text, and this .htm goes through the firmware's ASP evaluator (a stray tag opener livelocks
+    # httpd).
+    sed 's/</\\u003c/g' > "${ANALYZE_FILE}.$$" <<ANEOF
 {"active":${active},"device":"${ip}","policy":"${policy}","started":${started},"entries":[${arr}]}
 ANEOF
     mv "${ANALYZE_FILE}.$$" "$ANALYZE_FILE" 2>/dev/null
@@ -6217,10 +8592,23 @@ do_analyze_stop(){
 
 # --- Install/Mount/Uninstall ---
 
+# The pages' LIVE-STORE endpoint (1.5.26). A .htm under /www/user goes through the firmware's
+# ASP evaluator, so this 38-byte file's OUTPUT is the current custom_settings object between
+# two AWGCS markers — the client and server pages GET it right before every settings save
+# (conflict check: did another tab / the other page / SSH change the store since this page
+# loaded?) and right after it (did the firmware actually write this save?). Its template tag
+# is the ONE ASP-tag opener in this script and lives only in printf's ARGUMENT (a format
+# string would reinterpret the '%'): the same evaluator livelocks httpd on a stray opener in
+# any served file, which is why log_msg/diag/status all neutralize them. /www/user is tmpfs,
+# so it is re-published with every page copy (install_page, and mount_ui at each boot).
+awg_cs_publish(){
+    printf '%s' 'AWGCS<% get_custom_settings(); %>AWGCS' > /www/user/awg_cs.htm 2>/dev/null
+}
+
 do_install_page(){
     source /usr/sbin/helper.sh
     local _rcsup
-    _rcsup=$(nv get rc_support 2>/dev/null)
+    _rcsup=$(nv get rc_support)
     [ $? -eq 124 ] && { log_msg "ERROR: nvram get rc_support timed out — retry the install"; return 1; }
     case "$_rcsup" in *am_addons*) ;; *) log_msg "ERROR: Addons not supported"; return 1 ;; esac
 
@@ -6240,6 +8628,7 @@ do_install_page(){
     local cli_page="$am_webui_page"
 
     cp "$ADDON_DIR/amneziawg_page.asp" "/www/user/$cli_page"
+    awg_cs_publish
     # Publish the global header widget to the web root before binding the loader
     [ -f "$ADDON_DIR/amneziawg_widget.js" ] && cp "$ADDON_DIR/amneziawg_widget.js" /www/user/awg_widget.js 2>/dev/null
 
@@ -6252,6 +8641,7 @@ do_install_page(){
         if [ "$am_webui_page" != "none" ]; then
             srv_page="$am_webui_page"
             cp "$ADDON_DIR/amneziawg_server_page.asp" "/www/user/$srv_page"
+            awg_cs_publish
         else
             log_msg "WARNING: no free page slot for the AmneziaWG Server page — client page installed alone"
         fi
@@ -6354,6 +8744,7 @@ do_mount_ui(){
     if [ "$am_webui_page" != "none" ]; then
         local cli_page="$am_webui_page" srv_page=""
         cp "$ADDON_DIR/amneziawg_page.asp" "/www/user/$cli_page"
+        awg_cs_publish
         [ -f "$ADDON_DIR/amneziawg_widget.js" ] && cp "$ADDON_DIR/amneziawg_widget.js" /www/user/awg_widget.js 2>/dev/null
         # AWG-server role page (second slot) + the QR generator asset — mirrors do_install_page.
         if [ -f "$ADDON_DIR/amneziawg_server_page.asp" ]; then
@@ -6361,6 +8752,7 @@ do_mount_ui(){
             if [ "$am_webui_page" != "none" ]; then
                 srv_page="$am_webui_page"
                 cp "$ADDON_DIR/amneziawg_server_page.asp" "/www/user/$srv_page"
+                awg_cs_publish
             fi
         fi
         [ -f "$ADDON_DIR/awg_qr.js" ] && cp "$ADDON_DIR/awg_qr.js" /www/user/awg_qr.js 2>/dev/null
@@ -6412,7 +8804,7 @@ do_uninstall(){
         grep -q "AmneziaWG" "$page" 2>/dev/null && rm -f "$page"
     done
     rm -f "$STATUS_FILE" /www/user/awg_widget.js /www/user/v2fly_categories.htm /www/user/awg_changelog.htm /www/user/awg_update.htm /www/user/awg_log.htm /www/user/awg_diag.htm
-    rm -f /www/user/awg_qr.js /www/user/awgs_status.htm /www/user/awgs_log.htm
+    rm -f /www/user/awg_qr.js /www/user/awgs_status.htm /www/user/awgs_log.htm /www/user/awg_cs.htm
     rm -f "$ANALYZE_FILE" "$ANALYZE_DNS_CONF" "$ANALYZE_DNS_LOG" /tmp/.awg_analyze_*
 
     rm -f "$AWG_INCIDENTS"
@@ -6658,7 +9050,6 @@ heal_base_rules(){
 
 do_watchdog(){
     local AWG_WATCHDOG=1
-    [ -f "${LOCKDIR}.stopped" ] && return 0
     # Heartbeat FIRST (before any early return): proves in diag that the cron actually fires.
     # A watchdog that silently never runs is indistinguishable from a healthy one otherwise.
     date '+%Y-%m-%d %H:%M:%S' > /tmp/.awg_wd_beat 2>/dev/null
@@ -6676,7 +9067,7 @@ do_watchdog(){
     # gone — reclaim it (like a stale lock) and proceed. NB the long post-install geo re-download
     # runs AFTER the flag is cleared, so a slow box can't legitimately hold it that long.
     if [ -f /tmp/.awg_no_autostart ]; then
-        if [ -z "$(find /tmp/.awg_no_autostart -mmin +15 2>/dev/null)" ]; then
+        if ! file_older_than /tmp/.awg_no_autostart 900; then
             return 0   # fresh flag — a genuine update is in progress; stand down
         fi
         log_msg "WATCHDOG: stale update flag (>15 min) — updater likely died mid-flight; reclaiming"
@@ -6688,7 +9079,12 @@ do_watchdog(){
     # Cheap until it actually fires: one cat + kill -0 + two /proc reads.
     reap_stale_dnsreload
 
-    operation_lock_busy && return 0
+    # A deliberate user Stop is final until the next Start/reboot, even when its `cru d` could
+    # not remove this cron. Housekeeping above still runs; recovery below does not.
+    [ -f "${LOCKDIR}.stopped" ] && return 0
+
+    # Skip if another operation is mid-flight; a dead or wedged holder's lock is reclaimed.
+    operation_lock_busy WATCHDOG && return 0
 
     # DNS-interception coexistence reconcile (only while the tunnel is up). Our one-shot
     # decision at setup_firewall time goes stale when a DPI/proxy tool starts AFTER us, when
@@ -6696,11 +9092,22 @@ do_watchdog(){
     # cheap, idempotent — and catch the br0-side ":53 collision" that dns_ok (which probes
     # 127.0.0.1, bypassing the DNAT) can't see, WITHOUT a full VPN restart.
     if is_running; then
-        if dns_intercept_active && { zapret_active || fw_dns_redirect_active || [ "$(get_setting awg_no_dns_intercept)" = "1" ]; }; then
-            log_msg "WATCHDOG: co-resident DNS owner detected — removing our :53 interception (coexist)"
-            disable_tunnel_dns   # tunnel-DNS is intercept-gated — drop it together (no-op if off)
-            cleanup_dns_interception
-        elif ! dns_intercept_active && intercept_wanted && dns_ok; then
+        local _drop=0
+        if dns_intercept_active; then
+            if zapret_active || [ "$(get_setting awg_no_dns_intercept)" = "1" ]; then
+                _drop=1
+            else
+                # Only a CONFIRMED owner counts. A firmware flag read that timed out names an
+                # "unknown" one — no evidence, and dropping on it would also drop tunnel DNS,
+                # which the install branch below never restores. The next tick re-reads.
+                case "$(fw_dns_redirect_name)" in ''|unknown*) ;; *) _drop=1 ;; esac
+            fi
+            if [ "$_drop" = 1 ]; then
+                log_msg "WATCHDOG: co-resident DNS owner detected — removing our :53 interception (coexist)"
+                disable_tunnel_dns   # tunnel-DNS is intercept-gated — drop it together (no-op if off)
+                cleanup_dns_interception
+            fi
+        elif intercept_wanted && dns_ok; then
             # dns_ok gate: only (re)install the hijack when the router actually resolves —
             # otherwise this would flap against the DNS fail-open below (install → fail-open
             # remove → install) every 5 minutes while the resolver is broken.
@@ -6760,9 +9167,16 @@ do_watchdog(){
         # from "tunnel up but traffic misrouted" (fresh handshake, RX growing) in the report.
         is_running && log_msg "  awg show: $("$AWG_BIN" show "$IFACE" 2>&1 | grep -iE 'latest handshake|transfer' | tr '\n' '|' | sed 's/|$//')"
         printf '%s\n%s\n' "$((fails + 1))" "$now" > "$wd_state" 2>/dev/null
-        do_stop "" watchdog 2>/dev/null
+        # The start half carries the generation this stop wrote: a user Stop (or any other
+        # stop/start) landing in the gap wins — the watchdog must not resurrect a tunnel the
+        # user just stopped. A stop that could not take the lock (a live holder — an operation
+        # already acting on the tunnel) restarts nothing; the next tick re-evaluates.
+        local _wrc
+        do_stop "" watchdog 2>/dev/null; _wrc=$?
+        [ "$_wrc" = 0 ] || return
         wait_for_pid_exit amneziawg-go 10
-        do_start
+        do_start "$AWG_GEN_STOPPED"; _wrc=$?
+        [ "$_wrc" = 2 ] && log_msg "WATCHDOG: restart superseded by a newer stop/start — leaving the tunnel as that operation left it"
         return
     fi
     rm -f "$wd_state" 2>/dev/null   # healthy: reset backoff counter
@@ -6907,8 +9321,8 @@ check_update(){
 }
 
 # Install a ready .ipk at $1 (human label $2, e.g. "v1.2.3" or "uploaded package").
-# Shared by do_update (after a verified download) and do_manual_install (after a
-# verified upload). Preserves geo lists across the opkg upgrade, stops the VPN, installs,
+# Shared by do_update (after a verified download) and do_install_ipk (after a
+# verified local package). Preserves geo lists across the opkg upgrade, stops the VPN, installs,
 # restores geo, re-installs the web page from the new version and refreshes status.
 finalize_ipk_install(){
     local tmp="$1" label="$2"
@@ -6978,8 +9392,10 @@ finalize_ipk_install(){
     wait_for_pid_exit amneziawg-go 10
     # Let any PRE-update dnsmasq reload job settle before opkg runs the package prerm. Jobs
     # spawned after the defer window opened never take the lock (they mark PENDING and exit),
-    # and an older in-flight job retires itself at its next rc-settle check — so this normally
-    # clears in a second or two; the 60s cap only guards a job stuck mid-restart. (Rationale
+    # and an older in-flight job retires itself at its next rc-settle check or, in the geo
+    # pre-resolve, after its current lookup batch (1.5.27 — before, a pre-resolve never checked
+    # the defer window and opkg ran alongside its lookup fan-out) — so this normally clears in
+    # a second or two; the 60s cap only guards a job stuck mid-restart. (Rationale
     # unchanged: two concurrent `service restart_dnsmasq` storms during a memory-pressured
     # opkg can OOM/blackout the LAN on a low-RAM box — RT-AC68U, 256MB.)
     _i=0; while [ -d /tmp/.awg_dnsreload ] && [ $_i -lt 60 ]; do sleep 1; _i=$((_i + 1)); done
@@ -7065,80 +9481,55 @@ finalize_ipk_install(){
     return 0
 }
 
-# Manual install: assemble a base64-encoded .ipk uploaded chunk-by-chunk from the web UI
-# (see the awgupload service event), verify it, and install it. The browser cannot POST a
-# multi-MB binary through the firmware's apply path (httpd caps it and is line-oriented),
-# so the file arrives as base64 text appended to AWG_UPLOAD_B64; here we decode it once,
-# check the exact byte length the browser reported, validate the gzip CRC (an .ipk is a
-# tar.gz, so a corrupt/truncated upload fails this) and the opkg .ipk structure, then
-# hand off to finalize_ipk_install. Progress/result is written to AWG_UPLOAD_STATUS for
-# the UI to poll. Nothing is installed unless every check passes.
-do_manual_install(){
-    local b64="$AWG_UPLOAD_B64" tmp="/tmp/amneziawg_manual.ipk"
-    local want_len got_len tok
-    # Read the upload token BEFORE clearing the one-shot keys, and stamp it on every final
-    # status line (awg_man_status). The UI matches on this token, so a stale poller from a
-    # previous/aborted upload can never act on another run's result.
-    tok=$(get_setting awg_ipk_token)
-    tok=$(printf '%s' "$tok" | tr -cd 'A-Za-z0-9_-')
-    want_len=$(get_setting awg_ipk_len)
-    # One-shot keys: clear now so a stale chunk/length can never affect a later operation.
-    clear_setting awg_ipk_len
-    clear_setting awg_ipk_chunk
-    clear_setting awg_ipk_seq
-    clear_setting awg_ipk_first
-    clear_setting awg_ipk_token
-    rm -f "$AWG_UPLOAD_SEQ"
-    case "$want_len" in *[!0-9]*) want_len="" ;; esac
-
+# Install a local .ipk that the user copied to the router over SSH (WinSCP / scp -O) — CLI
+# `amneziawg.sh install_ipk <file>`, also `S99amneziawg install_ipk <file>`. This replaces the
+# web UI's "upload a file" mode (1.1.52-1.5.23), which could NEVER work on Asuswrt-Merlin: httpd
+# declares amng_custom CKN_STR8192 and discards a larger settings POST whole (nvram_check), and
+# each upload chunk was ~45 KB — so the very first one vanished and the router answered "bad seq".
+# At the firmware's real limits (<=2900 chars per value, <=8192 bytes per whole-store POST) a
+# 2-3 MB package would need ~1000 round trips, each rewriting custom_settings.txt on the JFFS
+# flash — not a transport worth keeping. Same safety as before: the whole gzip stream is
+# decompressed (trailing CRC32/length verified, so a truncated/corrupt copy is caught BEFORE opkg
+# is touched), it must be an opkg package (control.tar.gz member), and it goes through the same
+# install core as the in-app update (finalize_ipk_install: geo lists preserved, watchdog stood
+# down, page re-installed). Works on a private copy (finalize removes its input), so the user's
+# file is left where they put it. The operation log is printed to the terminal at the end.
+do_install_ipk(){
+    local src="$1" tmp="/tmp/.awg_install_ipk.$$" sz rc=0 err
+    if [ -z "$src" ] || [ ! -f "$src" ] || [ ! -s "$src" ]; then
+        echo "Usage: /opt/etc/init.d/S99amneziawg install_ipk /tmp/<package>.ipk"
+        echo "  Copy the package to the router first: WinSCP (file protocol SCP), or"
+        echo "  scp -O <package>.ipk <login>@<router>:/tmp/   (-O = legacy SCP, the router has no SFTP; drop -O if your scp rejects it)"
+        [ -n "$src" ] && echo "  ERROR: '$src' is not a file or is empty."
+        return 1
+    fi
+    # The install stops the VPN (and a running AWG server): an SSH session carried by it drops, and
+    # the SIGHUP must not kill opkg halfway through replacing the binaries.
+    trap '' HUP
     ui_log_reset
-    log_msg "Manual install: assembling uploaded package"
-    if [ ! -s "$b64" ]; then
-        log_msg "Manual install: ERROR no upload data received"
-        echo "{\"status\":\"install_err\",\"tok\":\"$tok\",\"code\":\"no_data\"}" > "$AWG_UPLOAD_STATUS"
-        rm -f "$b64"; update_status; return 1
+    echo "Installing $src — this stops the VPN for a moment; progress is also shown in the web UI log."
+    log_msg "Manual install: checking $src"
+    rm -f "$tmp"
+    if ! err=$(cp "$src" "$tmp" 2>&1); then
+        rm -f "$tmp"
+        log_msg "Manual install: ERROR could not copy $src to $tmp (${err:-is /tmp full?}) — nothing changed"
+        cat "$UI_LOG" 2>/dev/null; return 1
     fi
-
-    # Decode base64 text -> binary .ipk (busybox base64 -d, openssl fallback).
-    if ! base64 -d "$b64" > "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
-        if ! openssl base64 -d -A -in "$b64" -out "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
-            log_msg "Manual install: ERROR base64 decode failed"
-            echo "{\"status\":\"install_err\",\"tok\":\"$tok\",\"code\":\"decode_failed\"}" > "$AWG_UPLOAD_STATUS"
-            rm -f "$b64" "$tmp"; update_status; return 1
-        fi
-    fi
-    rm -f "$b64"
-
-    got_len=$(wc -c < "$tmp" 2>/dev/null)
-    if [ -n "$want_len" ] && [ "$got_len" != "$want_len" ]; then
-        log_msg "Manual install: ERROR size mismatch (got ${got_len}, expected ${want_len})"
-        echo "{\"status\":\"install_err\",\"tok\":\"$tok\",\"code\":\"size_mismatch\"}" > "$AWG_UPLOAD_STATUS"
-        rm -f "$tmp"; update_status; return 1
-    fi
-
-    # An .ipk is a gzip-compressed tar. Decompress the WHOLE stream (reads to EOF and
-    # verifies the trailing gzip CRC32/length), so any corruption or truncation that
-    # slipped through the upload is caught here, BEFORE we touch opkg. gzip/gunzip is
-    # always present (opkg itself needs it); try both applet spellings.
+    sz=$(wc -c < "$tmp" 2>/dev/null)
+    # gzip/gunzip is always present (opkg itself needs it); try both applet spellings.
     if ! gzip -dc "$tmp" > /dev/null 2>&1 && ! gunzip -c "$tmp" > /dev/null 2>&1; then
-        log_msg "Manual install: ERROR archive is corrupt (gzip CRC check failed)"
-        echo "{\"status\":\"install_err\",\"tok\":\"$tok\",\"code\":\"corrupt\"}" > "$AWG_UPLOAD_STATUS"
-        rm -f "$tmp"; update_status; return 1
+        log_msg "Manual install: ERROR $src is corrupt or not an .ipk (gzip check failed) — nothing changed"
+        rm -f "$tmp"; cat "$UI_LOG" 2>/dev/null; return 1
     fi
-    # Must be an opkg .ipk: a gzip tar that contains control.tar.gz (the last member, so a
-    # successful listing also proves the archive decompressed fully).
     if ! tar tzf "$tmp" 2>/dev/null | grep -q 'control\.tar\.gz'; then
-        log_msg "Manual install: ERROR not an opkg package (no control.tar.gz)"
-        echo "{\"status\":\"install_err\",\"tok\":\"$tok\",\"code\":\"not_ipk\"}" > "$AWG_UPLOAD_STATUS"
-        rm -f "$tmp"; update_status; return 1
+        log_msg "Manual install: ERROR $src is not an opkg package (no control.tar.gz) — nothing changed"
+        rm -f "$tmp"; cat "$UI_LOG" 2>/dev/null; return 1
     fi
-
-    log_msg "Manual install: package OK ($(human_size "$got_len")) — installing"
-    if finalize_ipk_install "$tmp" "uploaded package"; then
-        echo "{\"status\":\"installed\",\"tok\":\"$tok\"}" > "$AWG_UPLOAD_STATUS"
-    else
-        echo "{\"status\":\"install_err\",\"tok\":\"$tok\",\"code\":\"opkg_failed\"}" > "$AWG_UPLOAD_STATUS"
-    fi
+    log_msg "Manual install: package OK ($(human_size "$sz")) — installing"
+    finalize_ipk_install "$tmp" "local package $(basename "$src")" || rc=1
+    rm -f "$tmp" 2>/dev/null
+    cat "$UI_LOG" 2>/dev/null
+    return $rc
 }
 
 do_update(){
@@ -7365,6 +9756,50 @@ do_firewall_restart(){
 
 # --- Service event dispatcher ---
 
+# Publish one web diagnostic. Request IDs travel in the service-event name, not settings:
+# a stale page must never write its custom_settings snapshot just to collect a report.
+do_diag_publish(){
+    local _dtoken="$1" _dout="$DIAG_FILE" _dtmp _dold _dpid
+    if [ -n "$_dtoken" ]; then
+        # The token becomes a filename and a footer. Refuse paths, whitespace and unbounded
+        # input before touching files; the browser emits lowercase base36 with hyphens.
+        case "$_dtoken" in
+            *[!a-z0-9-]*) log_msg "ERROR: invalid diagnostic request token"; return 1 ;;
+        esac
+        [ "${#_dtoken}" -le 48 ] || { log_msg "ERROR: diagnostic request token is too long"; return 1; }
+        _dout="${DIAG_FILE%.htm}_${_dtoken}.htm"
+    else
+        # A tab left open before the update still sends bare awgdiag and polls DIAG_FILE.
+        _dtoken="legacy-$(date +%s)-$$"
+    fi
+    # Keep each request's result long enough for polling/retries, then reclaim RAM on the
+    # next collection. Distinct paths prevent a late old run from overwriting a newer one.
+    # Firmware find lacks -mmin/-maxdepth; use the shared date-based age helper.
+    for _dold in "${DIAG_FILE%.htm}_"*.htm; do
+        [ -f "$_dold" ] || continue
+        file_older_than "$_dold" 600 && rm -f "$_dold" 2>/dev/null
+    done
+    # $$ belongs to this dispatcher (not a detached subshell). Never unlink a live writer's
+    # temp: a slow collection may outlive the page's 45-second timeout and a subsequent retry.
+    for _dold in "${DIAG_FILE}".[0-9]* "${DIAG_FILE%.htm}_"*.htm.[0-9]*; do
+        [ -e "$_dold" ] || continue
+        _dpid=${_dold##*.}
+        [ -d "/proc/$_dpid" ] && continue
+        rm -f "$_dold" 2>/dev/null
+    done
+    _dtmp="${_dout}.$$"
+    # Sanitize ASP openers as a stream: httpd interprets them even in /www/user .htm files.
+    # A newline before the footer also handles a probe that emitted no trailing newline.
+    if do_diag 2>&1 | sed 's/<\([%#]\)/< \1/g' > "$_dtmp" &&
+        printf '\n[DIAG_DONE %s]\n[DIAG_DONE]\n' "$_dtoken" >> "$_dtmp" &&
+        mv "$_dtmp" "$_dout" 2>/dev/null; then
+        return 0
+    fi
+    log_msg "ERROR: diag dump could not be written or published to $_dout"
+    rm -f "$_dtmp" 2>/dev/null
+    return 1
+}
+
 do_service_event(){
     local event="$2"
     # AWG-server role events (awgsrv*) are owned by amneziawg_server.sh — hand the whole
@@ -7378,63 +9813,49 @@ do_service_event(){
             ;;
     esac
     case "$event" in
-        awgstart|awgstop|awgrestart|awgswitch|awgforceapply|awgsaveconf|awgupdategeo|awgdoupdate) ui_log_reset ;;
+        awgstart|awgstop|awgrestart|awgswitch|awgswitch[1-9]|awgforceapply|awgsaveconf|awgupdategeo|awgdoupdate) ui_log_reset ;;
     esac
     case "$event" in
-        # Manual upload: append one base64 chunk. Kept out of the ui_log_reset list above
-        # (it fires once per chunk — would wipe the log repeatedly). Idempotent by seq so a
-        # retried/duplicated POST never double-appends; ack is written for the UI to poll.
-        awgupload)
-            local seq first chunk tok st exp
-            seq=$(get_setting awg_ipk_seq)
-            first=$(get_setting awg_ipk_first)
-            chunk=$(get_setting awg_ipk_chunk)
-            tok=$(get_setting awg_ipk_token)
-            # Token identifies this upload run; the UI ignores acks whose token doesn't
-            # match, so a stale awg_upload.htm from a previous attempt can't be mistaken
-            # for a fresh ack. Keep only the safe charset (alnum/_/-) in the echoed JSON.
-            tok=$(printf '%s' "$tok" | tr -cd 'A-Za-z0-9_-')
-            case "$seq" in ''|*[!0-9]*)
-                echo "{\"status\":\"err\",\"tok\":\"$tok\",\"msg\":\"bad seq\"}" > "$AWG_UPLOAD_STATUS"; return ;;
-            esac
-            if [ "$first" = "1" ]; then : > "$AWG_UPLOAD_B64"; echo "-1" > "$AWG_UPLOAD_SEQ"; fi
-            st=$(cat "$AWG_UPLOAD_SEQ" 2>/dev/null)
-            case "$st" in ''|*[!0-9-]*) st="-1" ;; esac
-            exp=$((st + 1))
-            if [ "$seq" -le "$st" ]; then
-                : # duplicate -> re-ack current state, do not append again
-            elif [ "$seq" -eq "$exp" ]; then
-                # Guard the append: /tmp is a small tmpfs, and a silent short-write here
-                # would only surface much later as a confusing size mismatch. Fail fast.
-                if ! printf '%s' "$chunk" >> "$AWG_UPLOAD_B64"; then
-                    echo "{\"status\":\"err\",\"tok\":\"$tok\",\"msg\":\"write failed (disk full?)\"}" > "$AWG_UPLOAD_STATUS"
-                    return
-                fi
-                st="$seq"; echo "$st" > "$AWG_UPLOAD_SEQ"
-            else
-                echo "{\"status\":\"gap\",\"tok\":\"$tok\",\"have\":$st,\"got\":$seq}" > "$AWG_UPLOAD_STATUS"
-                return
-            fi
-            echo "{\"status\":\"ok\",\"tok\":\"$tok\",\"seq\":$st,\"bytes\":$(wc -c < "$AWG_UPLOAD_B64" 2>/dev/null)}" > "$AWG_UPLOAD_STATUS"
-            ;;
-        awgmanualinstall)
-            do_manual_install
-            ;;
+        # (awgupload / awgmanualinstall — the browser .ipk upload — are gone since 1.5.24: the
+        # firmware discards any settings POST over 8 KB, so it never worked. See do_install_ipk.)
         awgstart)       do_start ;;
         awgstop)        do_stop user ;;
         awgrestart)     do_restart ;;
-        awgswitch)
-            # Manual profile switch: the page POSTed the full settings (incl. the new
-            # awg_profile_active and any pending edits) in the SAME submit that fired this
-            # event. User intent beats any failover state — drop the override + circle so a
-            # later failure starts a fresh circle from the user's new primary. Settle-wait on
-            # the EFFECTIVE slot's key: the switch target is always a configured slot (the
-            # page only offers those), so an empty read means the POST hasn't landed yet.
-            rm -f "$PF_OVERRIDE" "$FAILOVER_STATE"
-            local _wt=0; while [ $_wt -lt 5 ] && [ -z "$(pf_get iface_p1)" ]; do sleep 1; _wt=$((_wt+1)); done
-            log_msg "Switching to config profile $(profile_effective) ($(profile_name "$(profile_effective)"))"
-            do_restart switch
+        awgswitch|awgswitch[1-9])
+            # Manual profile switch. The page's POST stored the new awg_profile_active (plus any
+            # pending edits) BEFORE the firmware fired this event (validate_apply writes the store,
+            # THEN notify_rc), and since 1.5.26 the event names its target slot
+            # (start_awgswitch<SLOT>). A switch whose save never reached the store — discarded by
+            # the firmware's 8 KB cap, or overwritten by another page saving at the same moment —
+            # is therefore REFUSED here instead of restarting whatever profile the store still
+            # points at (the old settle-wait could not tell those cases apart, and a restart of
+            # the CURRENT profile read to the user as "the switch worked"). Bare `awgswitch`
+            # (older pages) restarts onto the stored pointer as before. The failover override +
+            # circle are dropped by do_stop's `switch` token, under the lock.
+            local _sw="${event#awgswitch}"
+            if [ -n "$_sw" ]; then
+                if ! profile_configured "$_sw"; then
+                    log_msg "WARNING: switch target is not configured — nothing switched"
+                    update_status
+                    return 0
+                fi
+                if [ "$(profile_user)" != "$_sw" ]; then
+                    log_msg "WARNING: the profile switch did not reach the router's settings store (another page saved at the same moment, or the firmware discarded the save) — nothing switched"
+                    update_status
+                    return 0
+                fi
+            else
+                _sw=$(profile_user)
+            fi
+            profile_switch_restart "$_sw" ""
             ensure_geo   # download configured-but-missing geo lists (bg), then re-apply
+            ;;
+        awgpfsave)
+            # The page saved the profile LIST (an immediate delete) — no tunnel change, no
+            # journal reset; just refresh the status so the bar reflects the store.
+            profile_info 1
+            log_msg "Config profiles saved ($AWG_PI_COUNT configured)"
+            update_status
             ;;
         awgforceapply)
             # Force Apply: persist settings, then full restart (re-runs setconf +
@@ -7445,14 +9866,33 @@ do_service_event(){
             ;;
         awgsaveconf)
             local _wt=0; while [ $_wt -lt 5 ] && [ -z "$(pf_get iface_p1)" ]; do sleep 1; _wt=$((_wt+1)); done
-            generate_config
-            # Apply WITHOUT a VPN restart, but under the operation lock so this rebuild can't
-            # race the firewall-start hook's do_firewall_restart, and with the LAN deadman
-            # armed so a config that kills dnsmasq still rolls back (same net as do_start).
-            if is_running && acquire_lock; then
-                arm_lan_deadman "$(pidof amneziawg-go 2>/dev/null | awk '{print $1}')"
-                setup_firewall
+            # Apply WITHOUT a VPN restart, under the operation lock — taken BEFORE generate_config
+            # now, so a start/stop/switch in flight can't have the conf regenerated under it —
+            # and with the LAN deadman armed so a config that kills dnsmasq still rolls back
+            # (same net as do_start).
+            # While the tunnel runs, $CONF (and the awg0.addr/awg0.dns side-files) must keep
+            # describing the RUNNING daemon: do_stop reads the endpoint route from it and
+            # tunnel_dns_ips the resolver. So regenerate only when the effective profile is still
+            # the one running — the Apply's edits then show as "pending restart" (conf_pending).
+            # When it differs (a switch saved but its restart dropped, an override that stopped
+            # matching) say so and apply only the firewall/policy side.
+            if acquire_lock; then
+                if is_running; then
+                    local _rs="" _rx=""
+                    [ -f "$RUNNING_PF" ] && { read -r _rs _rx < "$RUNNING_PF"; } 2>/dev/null
+                    if [ -z "$_rs" ] || [ "$(profile_effective)" = "$_rs" ]; then
+                        generate_config
+                    else
+                        log_msg "Profile saved but not applied yet — the tunnel still runs profile $(profile_desc "$_rs"); press «Перезапустить» (Restart) to switch"
+                    fi
+                    arm_lan_deadman "$(pidof amneziawg-go 2>/dev/null | awk '{print $1}')"
+                    setup_firewall
+                else
+                    generate_config
+                fi
                 release_lock
+            else
+                log_msg "Settings are saved, but applying them was skipped: another operation holds the lock — press «Применить» (Apply) again in a moment"
             fi
             ensure_geo   # download configured-but-missing geo lists (bg), then re-apply
             update_status
@@ -7471,13 +9911,7 @@ do_service_event(){
         awgdoupdate)
             do_update
             ;;
-        awgdiag)
-            # Diagnostic dump into a SEPARATE file — does NOT touch the on-page log. The UI
-            # shows it in a modal and can copy it together with the log. The [DIAG_DONE] marker
-            # tells the UI the (possibly multi-second) dump has finished.
-            do_diag > "$DIAG_FILE" 2>&1
-            echo "[DIAG_DONE]" >> "$DIAG_FILE"
-            ;;
+        awgdiag*) do_diag_publish "${event#awgdiag}" ;;
         awganalyzestart) do_analyze_start ;;
         awganalyzestop)  do_analyze_stop ;;
         awgxraystop)     do_xray_stop ;;
@@ -7501,6 +9935,11 @@ migrate_field_names
 # Normalize a space-separated watchdog-hosts value (pre-1.2.54 saves) to commas before the
 # page can read a truncated copy back and re-save it without the tail hosts.
 migrate_watchdog_hosts
+# Same rescue for the AWG-server peer store (whitespace in a peer name cut the WHOLE store on
+# the pages' read-back; chunks a pre-1.5.26 page sized by characters read back cut) and for raw
+# spaced profile names (migrate_profile_names — its detection shares this one awk pass). Every
+# server-page event passes through this dispatch first (awgsrv*).
+migrate_server_peers
 
 # Geo ipset name is configurable (so it can be shared with other connections/tools). Default
 # awg_dst; sanitize to a valid ipset name (letters/digits/_.-, <=31 chars), else keep default.
@@ -7522,7 +9961,7 @@ case "$1" in
     update_geo)     update_geo_lists; do_firewall_restart; update_status ;;
     check_update)   check_update ;;
     update)         do_update "$2" ;;
-    manual_install) do_manual_install ;;
+    install_ipk)    do_install_ipk "$2" ;;
     watchdog)       do_watchdog ;;
     install_page)   do_install_page ;;
     mount_ui)       do_mount_ui ;;
@@ -7546,14 +9985,17 @@ case "$1" in
     ensure_geo)     ensure_geo ;;
     analyze_start)  do_analyze_start ;;
     analyze_stop)   do_analyze_stop ;;
+    mem|memory)     do_mem_report ;;
     ctf_status)     ctf_active && echo "CTF active (ctf_disable=$(nv get ctf_disable 2>/dev/null))" || echo "CTF not active" ;;
     ctf_disable)    do_ctf_disable ;;
     profile)
+        # N = the N-th configured profile (the number the page and `profile list` show);
+        # slot:S = the stable storage slot (for scripts — ordinals shift when a profile is deleted).
         case "$2" in
-            ''|list)     profile_cli_list ;;
-            next|[0-9]*) profile_cli_switch "$2" ;;
-            *)           echo "Usage: $0 profile [list|<1-$AWG_PF_MAX>|next]" ;;
+            ''|list)             profile_cli_list ;;
+            next|[0-9]*|slot:*)  profile_cli_switch "$2" ;;
+            *)                   echo "Usage: $0 profile [list|<N>|slot:<1-$AWG_PF_MAX>|next]" ;;
         esac
         ;;
-    *)              echo "Usage: $0 {start|stop|restart|status|diag|profile [list|N|next]|update_geo|download_geo|install_page|uninstall}" ;;
+    *)              echo "Usage: $0 {start|stop|restart|status|diag|mem|profile [list|N|slot:S|next]|update [version]|install_ipk <file.ipk>|update_geo|download_geo|install_page|uninstall}" ;;
 esac

@@ -201,11 +201,16 @@ case "$1" in
     update)
         /jffs/addons/amneziawg/amneziawg.sh update "$2"
         ;;
+    install_ipk)
+        # Install a local .ipk copied to the router (WinSCP / scp -O) — the web UI can't upload
+        # a package: the firmware discards any addon settings save over 8 KB.
+        /jffs/addons/amneziawg/amneziawg.sh install_ipk "$2"
+        ;;
     diag)
         /jffs/addons/amneziawg/amneziawg.sh diag
         ;;
     *)
-        echo "Usage: $0 {start|stop|restart|server <cmd>|update [version]|diag}"
+        echo "Usage: $0 {start|stop|restart|server <cmd>|update [version]|install_ipk <file.ipk>|diag}"
         exit 1
         ;;
 esac
